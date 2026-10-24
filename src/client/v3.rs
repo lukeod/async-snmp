@@ -47,7 +47,7 @@ impl Drop for DiscoveryLeaderGuard {
 }
 
 struct EncodedV3Request {
-    data: Vec<u8>,
+    data: Bytes,
     authoritative_engine_id: Bytes,
     context_engine_id: Bytes,
     context_name: Bytes,
@@ -515,7 +515,7 @@ impl<T: RequestTransport> Client<T> {
             let discovery_exchange =
                 self.inner
                     .transport
-                    .request_with(&discovery_data, registration, |packet| {
+                    .request_with(discovery_data, registration, |packet| {
                         let (data, info, prepared) = packet.into_prepared();
                         let source = info.peer_addr();
                         let mut prepared = prepared.filter(|p| p.matches(&data));
@@ -798,7 +798,7 @@ impl<T: RequestTransport> Client<T> {
 
         Ok(EncodedV3Request {
             authoritative_engine_id: engine.state.engine_id().clone(),
-            data,
+            data: Bytes::from(data),
             context_engine_id,
             context_name,
         })
@@ -1241,18 +1241,19 @@ impl<T: RequestTransport> Client<T> {
             // Register, write and validate under one absolute exchange deadline;
             // reliable transports keep framing independent of this future.
             let exchange_result = {
-                let request_exchange =
-                    self.inner
-                        .transport
-                        .request_with(&request.data, registration, |packet| {
-                            self.validate_v3_candidate(
-                                packet,
-                                &msg_id_window,
-                                &request,
-                                pdu.request_id,
-                                security_level,
-                            )
-                        });
+                let request_exchange = self.inner.transport.request_with(
+                    request.data.clone(),
+                    registration,
+                    |packet| {
+                        self.validate_v3_candidate(
+                            packet,
+                            &msg_id_window,
+                            &request,
+                            pdu.request_id,
+                            security_level,
+                        )
+                    },
+                );
                 tokio::pin!(request_exchange);
                 let exchange_result = tokio::select! {
                     biased;
@@ -1860,14 +1861,17 @@ mod tests {
     }
 
     impl RequestTransport for TestTransport {
-        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Ok(()))
         }
 
         fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: RequestRegistration,
             _validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2118,7 +2122,7 @@ mod tests {
         let encoded = client
             .build_v3_message(&pdu, 456, None)
             .expect("v3 message should encode");
-        let decoded = V3Message::decode(Bytes::from(encoded.data), crate::DecodeConfig::default())
+        let decoded = V3Message::decode(encoded.data, crate::DecodeConfig::default())
             .expect("v3 message should decode")
             .value;
         let scoped = match decoded.data {
@@ -2208,13 +2212,16 @@ mod tests {
     }
 
     impl RequestTransport for RetryTestTransport {
-        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> impl std::future::Future<Output = Result<()>> + Send {
             ready(Ok(()))
         }
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2271,14 +2278,17 @@ mod tests {
     }
 
     impl RequestTransport for DiscoveryLimitTransport {
-        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Ok(()))
         }
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2366,13 +2376,13 @@ mod tests {
     }
 
     impl RequestTransport for GatedDiscoveryTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             Ok(())
         }
 
         async fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             registration: RequestRegistration,
             mut validate: F,
         ) -> Result<T>
@@ -2708,12 +2718,15 @@ mod tests {
         }
 
         impl RequestTransport for AlwaysTimeoutTransport {
-            fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+            fn send(
+                &self,
+                _data: bytes::Bytes,
+            ) -> impl std::future::Future<Output = Result<()>> + Send {
                 ready(Ok(()))
             }
             fn request_with<T, F>(
                 &self,
-                data: &[u8],
+                data: bytes::Bytes,
                 registration: RequestRegistration,
                 validate: F,
             ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2777,13 +2790,13 @@ mod tests {
         }
 
         impl RequestTransport for PendingDiscoveryTransport {
-            async fn send(&self, _data: &[u8]) -> Result<()> {
+            async fn send(&self, _data: bytes::Bytes) -> Result<()> {
                 Ok(())
             }
 
             async fn request_with<T, F>(
                 &self,
-                _data: &[u8],
+                _data: bytes::Bytes,
                 _registration: RequestRegistration,
                 _validate: F,
             ) -> Result<T>
@@ -2836,13 +2849,13 @@ mod tests {
     }
 
     impl RequestTransport for SingleFlightFailureTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             Ok(())
         }
 
         async fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -3041,13 +3054,13 @@ mod tests {
     }
 
     impl RequestTransport for ImmediateTimeoutTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             Ok(())
         }
 
         async fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -3180,13 +3193,13 @@ mod tests {
     }
 
     impl RequestTransport for StructuredFailureTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             Ok(())
         }
 
         async fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -3314,7 +3327,10 @@ mod response_validation_tests {
     }
 
     impl RequestTransport for CannedTransport {
-        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Ok(()))
         }
@@ -3329,7 +3345,7 @@ mod response_validation_tests {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -3384,13 +3400,13 @@ mod response_validation_tests {
     }
 
     impl RequestTransport for DeferredUpdateTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             Ok(())
         }
 
         async fn request_with<U, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             _registration: RequestRegistration,
             mut validate: F,
         ) -> Result<U>
@@ -3399,7 +3415,7 @@ mod response_validation_tests {
             F: FnMut(crate::ReceivedPacket) -> Result<Candidate<U>> + Send,
         {
             let response_number = self.response_number.fetch_add(1, Ordering::SeqCst);
-            let response = build_deferred_update_response(data, response_number);
+            let response = build_deferred_update_response(&data, response_number);
             let info = crate::ReceivedMessageInfo::udp(
                 crate::EndpointId::new(),
                 self.local_addr(),
@@ -3452,13 +3468,13 @@ mod response_validation_tests {
     }
 
     impl RequestTransport for RediscoveryRaceTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             Ok(())
         }
 
         async fn request_with<U, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             _registration: RequestRegistration,
             mut validate: F,
         ) -> Result<U>
@@ -3466,10 +3482,12 @@ mod response_validation_tests {
             U: Send,
             F: FnMut(crate::ReceivedPacket) -> Result<Candidate<U>> + Send,
         {
-            let request =
-                V3Message::decode(Bytes::copy_from_slice(data), crate::DecodeConfig::default())
-                    .unwrap()
-                    .value;
+            let request = V3Message::decode(
+                Bytes::copy_from_slice(&data),
+                crate::DecodeConfig::default(),
+            )
+            .unwrap()
+            .value;
             let usm = UsmSecurityParams::decode(
                 request.security_params.clone(),
                 crate::DecodeConfig::default(),
@@ -3975,7 +3993,7 @@ mod response_validation_tests {
 
         let pdu = Pdu::get_request(123, &[oid!(1, 3, 6, 1, 1)]);
         let request = client.build_v3_message(&pdu, 1, None).unwrap();
-        let msg = V3Message::decode(Bytes::from(request.data), crate::DecodeConfig::default())
+        let msg = V3Message::decode(request.data, crate::DecodeConfig::default())
             .unwrap()
             .value;
         assert_eq!(

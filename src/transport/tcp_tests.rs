@@ -29,7 +29,7 @@ impl TcpTransport {
         data: &[u8],
         registration: RequestRegistration,
     ) -> Result<(Bytes, SocketAddr)> {
-        self.request_with(data, registration, |packet| {
+        self.request_with(Bytes::copy_from_slice(data), registration, |packet| {
             let (bytes, info) = packet.into_parts();
             Ok(Candidate::Accept((bytes, info.peer_addr())))
         })
@@ -156,7 +156,7 @@ async fn receive_advertisement_and_send_capacity_are_independent() {
 
     let mut oversized = request.clone();
     oversized.push(0);
-    let error = transport.send(&oversized).await.unwrap_err();
+    let error = transport.send(oversized.clone().into()).await.unwrap_err();
     assert!(matches!(
         *error,
         Error::OutboundMessageTooLarge { size, limit }
@@ -165,7 +165,7 @@ async fn receive_advertisement_and_send_capacity_are_independent() {
     inspect_tx.send(()).unwrap();
     inspected_rx.await.unwrap();
 
-    transport.send(&request).await.unwrap();
+    transport.send(request.clone().into()).await.unwrap();
     assert_eq!(server.await.unwrap(), request);
 }
 
@@ -494,7 +494,7 @@ async fn tcp_validator_rejection_keeps_exchange_for_later_frame() {
     );
     let mut candidates = 0;
     let response = transport
-        .request_with(&build_request_with_id(78), registration, |packet| {
+        .request_with((build_request_with_id(78)).into(), registration, |packet| {
             let (data, _) = packet.into_parts();
             candidates += 1;
             if candidates == 1 {
@@ -764,13 +764,17 @@ async fn concurrent_requests_are_written_before_any_response_and_correlated_out_
         let transport = running.transport();
         async move {
             let response = transport
-                .request_with(&build_request_with_id(id), registration(id), |packet| {
-                    let (bytes, info) = packet.into_parts();
-                    assert_eq!(info.session_id(), Some(session));
-                    assert_eq!(info.endpoint_id(), endpoint);
-                    assert_eq!(info.received_len(), bytes.len());
-                    Ok(Candidate::Accept(bytes))
-                })
+                .request_with(
+                    (build_request_with_id(id)).into(),
+                    registration(id),
+                    |packet| {
+                        let (bytes, info) = packet.into_parts();
+                        assert_eq!(info.session_id(), Some(session));
+                        assert_eq!(info.endpoint_id(), endpoint);
+                        assert_eq!(info.received_len(), bytes.len());
+                        Ok(Candidate::Accept(bytes))
+                    },
+                )
                 .await
                 .unwrap();
             assert_eq!(extract_request_id(&response), Some(id));
@@ -887,13 +891,73 @@ async fn in_flight_bound_queues_under_absolute_deadline_without_sending() {
 }
 
 #[tokio::test]
+async fn queued_write_retains_encoded_allocation_and_output_admission() {
+    for shared in [false, true] {
+        let (sender, _receiver) = mpsc::channel(1);
+        let service_budget = Arc::new(BufferBudget::new(1508));
+        let mut builder = TcpTransport::builder()
+            .max_message_size(484)
+            .send_capacity(1024)
+            .max_buffered_bytes(1508);
+        if shared {
+            builder = builder.ingress(
+                super::super::ingress::ApplicationIngress {
+                    admission_hook: None,
+                    sender,
+                    disabled: CancellationToken::new(),
+                    capacity: Arc::new(Semaphore::new(1)),
+                    budget: service_budget.clone(),
+                    overload_timeout: Duration::from_secs(1),
+                    drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                    session: None,
+                },
+                crate::EndpointId::new(),
+            );
+        }
+        let (prepared, _peer) = pair(builder).await;
+        let (transport, mut runner) = prepared.into_parts();
+        let encoded = Bytes::from(vec![0x42; 128]);
+        let allocation = encoded.as_ptr();
+        let mut send = Box::pin(transport.send(encoded));
+        assert!(futures::poll!(send.as_mut()).is_pending());
+        let command = runner.writes.try_recv().unwrap();
+        assert_eq!(command.bytes.as_ptr(), allocation);
+        assert_eq!(
+            transport.inner.state.budget.outbound.available_permits(),
+            896
+        );
+        if shared {
+            assert_eq!(service_budget.outbound.available_permits(), 896);
+        }
+        drop(send);
+        assert!(command.cancelled.is_cancelled());
+        // The queued frame owns its admission even after the caller cancels.
+        assert_eq!(
+            transport.inner.state.budget.outbound.available_permits(),
+            896
+        );
+        drop(command);
+        assert_eq!(
+            transport.inner.state.budget.outbound.available_permits(),
+            1024
+        );
+        if shared {
+            assert_eq!(service_budget.outbound.available_permits(), 1024);
+        }
+    }
+}
+
+#[tokio::test]
 async fn queued_cancellation_and_prestart_deadline_write_nothing() {
     let (prepared, mut peer) = pair(TcpTransport::builder().write_queue_capacity(1)).await;
     let (transport, runner) = prepared.into_parts();
     let first = transport.clone();
     let pending = tokio::spawn(async move {
         first
-            .send_with_timeout(b"cancelled", Duration::from_secs(1))
+            .send_with_timeout(
+                bytes::Bytes::from_static(b"cancelled"),
+                Duration::from_secs(1),
+            )
             .await
     });
     while transport.inner.writes.capacity() != 0 {
@@ -902,12 +966,18 @@ async fn queued_cancellation_and_prestart_deadline_write_nothing() {
     pending.abort();
     let _ = pending.await;
     let error = transport
-        .send_with_timeout(b"expired", Duration::from_millis(10))
+        .send_with_timeout(
+            bytes::Bytes::from_static(b"expired"),
+            Duration::from_millis(10),
+        )
         .await
         .unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::Timeout);
     let task = tokio::spawn(runner.run());
-    transport.send(b"ok").await.unwrap();
+    transport
+        .send(bytes::Bytes::from_static(b"ok"))
+        .await
+        .unwrap();
     let mut bytes = [0; 2];
     peer.read_exact(&mut bytes).await.unwrap();
     assert_eq!(&bytes, b"ok");
@@ -938,7 +1008,11 @@ async fn cleanup_on_unpolled_runner_future_and_task_abort() {
             .await
             .unwrap();
         assert_eq!(
-            transport.send(b"closed").await.unwrap_err().kind(),
+            transport
+                .send(bytes::Bytes::from_static(b"closed"))
+                .await
+                .unwrap_err()
+                .kind(),
             crate::ErrorKind::Closed
         );
         assert_eq!(
@@ -1033,7 +1107,11 @@ async fn invalid_complete_message_is_skipped_and_framing_failure_is_terminal() {
     running.control().wait_closed().await;
     assert!(matches!(running.control().status(), TcpStatus::Failed(_)));
     assert_eq!(
-        running.send(b"closed").await.unwrap_err().kind(),
+        running
+            .send(bytes::Bytes::from_static(b"closed"))
+            .await
+            .unwrap_err()
+            .kind(),
         crate::ErrorKind::Decode
     );
     assert!(running.join().await.is_err());
@@ -1186,7 +1264,10 @@ async fn accepted_session_can_initiate_an_exchange_and_closed_handle_is_not_repl
     let (replacement, _peer) = pair(TcpTransport::builder()).await;
     assert_ne!(first_id, replacement.transport.session_id());
     assert_eq!(
-        old.send(b"closed").await.unwrap_err().kind(),
+        old.send(bytes::Bytes::from_static(b"closed"))
+            .await
+            .unwrap_err()
+            .kind(),
         crate::ErrorKind::Closed
     );
 }
@@ -1203,10 +1284,14 @@ async fn validation_error_and_rejected_candidates_leave_session_aligned() {
         }
     });
     let error = running
-        .request_with(&build_request_with_id(1), registration(1), |packet| {
-            let (_, _) = packet.into_parts();
-            Err::<Candidate<()>, _>(Error::Config("validator error".into()).boxed())
-        })
+        .request_with(
+            (build_request_with_id(1)).into(),
+            registration(1),
+            |packet| {
+                let (_, _) = packet.into_parts();
+                Err::<Candidate<()>, _>(Error::Config("validator error".into()).boxed())
+            },
+        )
         .await
         .unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::Config);
@@ -1225,11 +1310,15 @@ async fn frame_larger_than_udp_capacity_is_received_with_exact_length() {
     let handle = running.transport();
     let pending = tokio::spawn(async move {
         handle
-            .request_with(&build_request_with_id(1), registration(1), |packet| {
-                let (data, info) = packet.into_parts();
-                assert_eq!(info.received_len(), data.len());
-                Ok(Candidate::Accept(data.len()))
-            })
+            .request_with(
+                (build_request_with_id(1)).into(),
+                registration(1),
+                |packet| {
+                    let (data, info) = packet.into_parts();
+                    assert_eq!(info.received_len(), data.len());
+                    Ok(Candidate::Accept(data.len()))
+                },
+            )
             .await
     });
     let address = peer.peer_addr().unwrap();
@@ -1273,14 +1362,14 @@ async fn cancelling_started_write_finishes_frame_before_next_message() {
     let mut peer = accepted.unwrap().0;
     let payload = vec![b'X'; 1024 * 1024];
     let sender = running.transport();
-    let sending = tokio::spawn(async move { sender.send(&payload).await });
+    let sending = tokio::spawn(async move { sender.send(payload.clone().into()).await });
     let mut first = [0; 1024];
     peer.read_exact(&mut first).await.unwrap();
     assert!(first.iter().all(|&byte| byte == b'X'));
     sending.abort();
     let _ = sending.await;
     let sender = running.transport();
-    let next = tokio::spawn(async move { sender.send(b"END").await });
+    let next = tokio::spawn(async move { sender.send(bytes::Bytes::from_static(b"END")).await });
     let mut remainder = vec![0; 1024 * 1024 - first.len() + 3];
     timeout(Duration::from_secs(4), peer.read_exact(&mut remainder))
         .await
@@ -1395,7 +1484,7 @@ fn supplied_stream_prepares_outside_runtime_and_runs_on_another_runtime() {
     let running = prepared.spawn_on(execution.handle());
     execution.block_on(async {
         let mut peer = peer;
-        let send = running.send(b"hello");
+        let send = running.send(bytes::Bytes::from_static(b"hello"));
         let receive = async {
             let mut bytes = [0; 5];
             peer.read_exact(&mut bytes).await.unwrap();
@@ -1479,11 +1568,15 @@ async fn receive_permit_is_held_during_validation_and_released_on_acceptance() {
         peer.write_all(&build_response_with_id(1)).await.unwrap();
     });
     let bytes = running
-        .request_with(&build_request_with_id(1), registration(1), |packet| {
-            let (data, _) = packet.into_parts();
-            assert!(budget.available_permits() <= 484 - data.len());
-            Ok(Candidate::Accept(data))
-        })
+        .request_with(
+            (build_request_with_id(1)).into(),
+            registration(1),
+            |packet| {
+                let (data, _) = packet.into_parts();
+                assert!(budget.available_permits() <= 484 - data.len());
+                Ok(Candidate::Accept(data))
+            },
+        )
         .await
         .unwrap();
     server.await.unwrap();
@@ -1518,7 +1611,7 @@ async fn zero_deadline_and_invalid_duration_do_not_send_or_close_session() {
     let running = prepared.spawn();
     assert_eq!(
         running
-            .send_with_timeout(b"invalid", Duration::MAX)
+            .send_with_timeout(bytes::Bytes::from_static(b"invalid"), Duration::MAX)
             .await
             .unwrap_err()
             .kind(),
@@ -1526,7 +1619,7 @@ async fn zero_deadline_and_invalid_duration_do_not_send_or_close_session() {
     );
     assert_eq!(
         running
-            .send_with_timeout(b"zero", Duration::ZERO)
+            .send_with_timeout(bytes::Bytes::from_static(b"zero"), Duration::ZERO)
             .await
             .unwrap_err()
             .kind(),

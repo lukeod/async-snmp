@@ -981,10 +981,10 @@ mod tests {
     }
 
     impl RequestTransport for BulkTooBigTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+        fn send(&self, data: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(&data).unwrap_or(1);
             let msg = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
+                Bytes::copy_from_slice(&data),
                 crate::DecodeConfig::default(),
             )
             .unwrap()
@@ -1002,7 +1002,7 @@ mod tests {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1145,10 +1145,10 @@ mod tests {
     }
 
     impl RequestTransport for EmptyWalkTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+        fn send(&self, data: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(&data).unwrap_or(1);
             let msg = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
+                Bytes::copy_from_slice(&data),
                 crate::DecodeConfig::default(),
             )
             .unwrap()
@@ -1164,7 +1164,7 @@ mod tests {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1515,9 +1515,9 @@ mod tests {
     }
 
     impl RequestTransport for ScriptedWalkTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn send(&self, data: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send {
             let message = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
+                Bytes::copy_from_slice(&data),
                 crate::DecodeConfig::default(),
             )
             .unwrap()
@@ -1535,7 +1535,7 @@ mod tests {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send

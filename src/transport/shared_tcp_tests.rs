@@ -308,7 +308,7 @@ async fn collision_rejection_and_identical_ids_are_session_scoped() {
         pending.push(tokio::spawn(async move {
             session
                 .request_with(
-                    &community(crate::Pdu::get_request(41, &[oid()])),
+                    community(crate::Pdu::get_request(41, &[oid()])),
                     registration(41),
                     move |packet| {
                         let (bytes, _) = packet.into_parts();
@@ -396,7 +396,7 @@ async fn full_shared_notification_queue_closes_session_and_fails_pending_with_id
     let request = tokio::spawn(async move {
         handle
             .request_with(
-                &community(crate::Pdu::get_request(42, &[oid()])),
+                community(crate::Pdu::get_request(42, &[oid()])),
                 registration(42),
                 |_| Ok(Candidate::Accept(())),
             )
@@ -613,7 +613,7 @@ async fn encrypted_collision_preserves_role_and_failure_ownership() {
     );
     let pending = tokio::spawn(async move {
         session
-            .request_with(&outgoing, registration, move |packet| {
+            .request_with(outgoing.clone(), registration, move |packet| {
                 let (_, _) = packet.into_parts();
                 if count.fetch_add(1, Ordering::SeqCst) == 0 {
                     Ok(Candidate::Reject)
@@ -796,7 +796,7 @@ async fn shared_tcp_response_above_one_megabyte_retains_exact_metadata() {
     let pending = tokio::spawn(async move {
         session
             .request_with(
-                &community(crate::Pdu::get_request(42, &[oid()])),
+                community(crate::Pdu::get_request(42, &[oid()])),
                 registration(42),
                 |packet| Ok(Candidate::Accept(packet.into_parts())),
             )
@@ -857,7 +857,7 @@ async fn configured_sessions_share_connection_budget_and_owned_stream_source() {
         .unwrap();
     assert!(
         configured
-            .send(&community(crate::Pdu::get_request(3, &[oid()])))
+            .send(community(crate::Pdu::get_request(3, &[oid()])))
             .await
             .is_err()
     );
@@ -1166,8 +1166,9 @@ async fn mixed_session_survives_command_closure_during_admission() {
         }
         assert_eq!(disposition, MessageDisposition::Disabled, "mode {mode}");
         let request = community(crate::Pdu::get_request(41, &[oid()]));
-        let exchange =
-            transport.request_with(&request, registration(41), |_| Ok(Candidate::Accept(())));
+        let exchange = transport.request_with(request.clone(), registration(41), |_| {
+            Ok(Candidate::Accept(()))
+        });
         let remote = async {
             assert_eq!(read(&mut peer).await, request);
             peer.write_all(&community(crate::Pdu::response(41, 0, 0, vec![])))

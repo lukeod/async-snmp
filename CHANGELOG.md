@@ -41,8 +41,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits and exposes terminal status. Driver termination closes all sends and
   requests, including when the runner is dropped before its first poll.
 
-- **Breaking:** The client exchange trait is named `RequestTransport`; validators
-  receive a `ReceivedPacket` containing the original bytes and `ReceivedMessageInfo`.
+- **Breaking:** The client exchange trait is named `RequestTransport`. Its send
+  and request methods take owned `Bytes`, allowing queued TCP writes to retain
+  encoded storage without copying it; clone `Bytes` when retaining a request.
+  Validators receive a `ReceivedPacket` containing the original bytes and `ReceivedMessageInfo`.
   Custom transports construct it with `ReceivedPacket::new(bytes, info)`; validators
   can use `packet.into_parts()` to take both values. Notification results
   and acceptance envelopes expose `receive_info` instead of `source`. Use

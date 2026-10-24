@@ -35,7 +35,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
-use super::framing::{BerFramer, BufferBudget, BufferedFrame};
+use super::framing::{BerFramer, BufferBudget};
 use super::udp_core::UdpCore;
 use super::{Candidate, CorrelationEnvelope, RequestRegistration, RequestTransport};
 use crate::error::{ConstructionStage, Error, Result};
@@ -705,14 +705,14 @@ impl TcpTransport {
         }
     }
 
-    pub(crate) async fn write_before(&self, data: &[u8], deadline: Instant) -> Result<()> {
+    pub(crate) async fn write_before(&self, data: bytes::Bytes, deadline: Instant) -> Result<()> {
         let state = &self.inner.state;
         let started = Instant::now();
         crate::message_size::enforce_outbound_size(data.len(), state.options.send_capacity)?;
         let cancelled = CancellationToken::new();
         let _cancel_on_drop = cancelled.clone().drop_guard();
         self.before(deadline, async {
-            // Reserve a queue slot and byte budget before copying caller data.
+            // Reserve a queue slot and byte budget before transferring encoded storage.
             let slot = self
                 .inner
                 .writes
@@ -740,13 +740,10 @@ impl TcpTransport {
             } else {
                 None
             };
-            let bytes = Bytes::from_owner(BufferedFrame {
-                bytes: data.to_vec(),
-                _permit: super::framing::BufferPermits {
-                    _local: budget,
-                    _shared: shared,
-                },
-            });
+            let buffers = super::framing::BufferPermits {
+                _local: budget,
+                _shared: shared,
+            };
             let (complete, result) = oneshot::channel();
             {
                 let admission = state.admission.lock().unwrap();
@@ -757,7 +754,8 @@ impl TcpTransport {
                     return Err(timeout_error(state.target, started.elapsed()));
                 }
                 slot.send(WriteCommand {
-                    bytes,
+                    bytes: data,
+                    _buffers: buffers,
                     started,
                     deadline,
                     cancelled,
@@ -777,17 +775,17 @@ impl TcpTransport {
 }
 
 impl RequestTransport for TcpTransport {
-    async fn send(&self, data: &[u8]) -> Result<()> {
+    async fn send(&self, data: bytes::Bytes) -> Result<()> {
         self.send_with_timeout(data, self.inner.state.options.write_timeout)
             .await
     }
-    async fn send_with_timeout(&self, data: &[u8], duration: Duration) -> Result<()> {
+    async fn send_with_timeout(&self, data: bytes::Bytes, duration: Duration) -> Result<()> {
         let deadline = tcp_deadline(duration, "TCP send timeout")?;
         self.write_before(data, deadline).await
     }
     async fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         registration: RequestRegistration,
         validate: F,
     ) -> Result<T>
@@ -864,6 +862,7 @@ impl RequestTransport for TcpTransport {
 
 struct WriteCommand {
     bytes: Bytes,
+    _buffers: super::framing::BufferPermits,
     started: Instant,
     deadline: Instant,
     cancelled: CancellationToken,

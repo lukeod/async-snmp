@@ -250,7 +250,11 @@ impl ReplyRoute {
         }
     }
 
-    pub(crate) async fn send_before(&self, data: &[u8], deadline: Instant) -> std::io::Result<()> {
+    pub(crate) async fn send_before(
+        &self,
+        data: bytes::Bytes,
+        deadline: Instant,
+    ) -> std::io::Result<()> {
         if Instant::now() >= deadline {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -274,7 +278,7 @@ impl ReplyRoute {
             } => {
                 let send = responder.send_to_admitted(
                     socket,
-                    data,
+                    &data,
                     received.source,
                     received.destination,
                     admission.as_ref().map(|(gate, _)| gate.as_ref()),

@@ -1017,7 +1017,7 @@ impl super::Agent {
         tokio::select! {
             biased;
             () = self.inner.cancel.cancelled() => return Err(Error::Config("agent notification originator stopped".into()).boxed()),
-            result = sink.peer.send_with_timeout(&data, sink.trap_send_timeout) => result?,
+            result = sink.peer.send_with_timeout(data, sink.trap_send_timeout) => result?,
         }
 
         Ok(())

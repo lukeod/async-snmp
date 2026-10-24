@@ -1064,13 +1064,13 @@ impl ScriptedTransport {
 }
 
 impl RequestTransport for ScriptedTransport {
-    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, _data: bytes::Bytes) -> async_snmp::Result<()> {
         Ok(())
     }
 
     async fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         registration: async_snmp::RequestRegistration,
         mut validate: F,
     ) -> async_snmp::Result<T>
@@ -1083,7 +1083,7 @@ impl RequestTransport for ScriptedTransport {
             .0
             .state
             .handle_request(
-                Bytes::copy_from_slice(data),
+                Bytes::copy_from_slice(&data),
                 self.0.local,
                 Some(request_id),
                 &self.0.engine,

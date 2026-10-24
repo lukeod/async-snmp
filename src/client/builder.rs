@@ -1504,7 +1504,7 @@ mod tests {
     }
 
     impl RequestTransport for CustomTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
@@ -1512,7 +1512,7 @@ mod tests {
 
         async fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<T>

@@ -226,7 +226,7 @@ impl super::NotificationProcessor {
                         let response_bytes = finalized
                             .into_bytes()
                             .expect("non-dropped response contains bytes");
-                        match self.send_response(&response_bytes, &route).await {
+                        match self.send_response(response_bytes, &route).await {
                             Ok(()) => {
                                 tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id }, "sent Inform response");
                                 InformAckOutcome::Sent
@@ -334,7 +334,7 @@ impl super::NotificationProcessor {
                 // is diagnosable at the default log level.
                 tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.failure = ?failure }, "USM processing failed for inbound message");
                 if let Some(report) = report {
-                    if let Err(e) = self.send_response(&report, &route).await {
+                    if let Err(e) = self.send_response(report, &route).await {
                         tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, error = %e }, "failed to send USM report");
                     } else {
                         tracing::debug!(target: "async_snmp::notification", { snmp.source = %source }, "sent USM report");
@@ -479,7 +479,7 @@ impl super::NotificationProcessor {
                         let response_bytes = finalized
                             .into_bytes()
                             .expect("non-dropped response contains bytes");
-                        match self.send_response(&response_bytes, &route).await {
+                        match self.send_response(response_bytes, &route).await {
                             Ok(()) => {
                                 tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, snmp.request_id = request_id, snmp.security_level = ?security_level }, "sent V3 Inform response");
                                 InformAckOutcome::Sent

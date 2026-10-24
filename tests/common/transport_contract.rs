@@ -2,13 +2,13 @@
 struct ContractTransport;
 
 impl RequestTransport for ContractTransport {
-    async fn send(&self, _data: &[u8]) -> Result<()> {
+    async fn send(&self, _data: bytes::Bytes) -> Result<()> {
         Ok(())
     }
 
     async fn request_with<T, F>(
         &self,
-        _data: &[u8],
+        _data: bytes::Bytes,
         _registration: RequestRegistration,
         _validate: F,
     ) -> Result<T>
@@ -40,8 +40,8 @@ fn compile_default_and_generic_surface<T: RequestTransport>(transport: &T) {
         tokio::time::Instant::now() + std::time::Duration::from_secs(1),
     );
 
-    assert_send(transport.send(b"request"));
-    assert_send(transport.request_with(b"request", registration, |packet| {
+    assert_send(transport.send(bytes::Bytes::from_static(b"request")));
+    assert_send(transport.request_with(bytes::Bytes::from_static(b"request"), registration, |packet| {
                     let (data, source) = packet.into_parts();
         Result::Ok(Candidate::Accept((data, source)))
     }));

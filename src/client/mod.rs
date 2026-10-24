@@ -797,7 +797,7 @@ impl<T: RequestTransport> Client<T> {
             snmp.elapsed_ms = tracing::field::Empty,
         )
     )]
-    async fn send_and_recv(&self, request_id: i32, data: &[u8]) -> Result<DecodedResponse> {
+    async fn send_and_recv(&self, request_id: i32, data: bytes::Bytes) -> Result<DecodedResponse> {
         self.enforce_outbound_size(data.len(), None)?;
         let start = Instant::now();
         let exchange_deadline = self.start_exchange_deadline()?;
@@ -841,7 +841,7 @@ impl<T: RequestTransport> Client<T> {
             match self
                 .inner
                 .transport
-                .request_with(data, registration, |packet| {
+                .request_with(data.clone(), registration, |packet| {
                     let (response_data, info) = packet.into_parts();
                     let source = info.peer_addr();
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response candidate");
@@ -951,7 +951,7 @@ impl<T: RequestTransport> Client<T> {
             pdu,
         )?;
         let data = message.encode()?;
-        let response = self.send_and_recv(request_id, &data).await?;
+        let response = self.send_and_recv(request_id, data).await?;
 
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu.pdu_type(), snmp.varbind_count = response.pdu.varbinds.len(), snmp.error_status = response.pdu.error_status(), snmp.error_index = response.pdu.error_index() }, "received {} response", response.pdu.pdu_type());
 
@@ -1252,7 +1252,7 @@ impl<T: RequestTransport> Client<T> {
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.varbind_count = pdu.as_raw().varbinds().len(), snmp.bytes = data.len() }, "sending V3 trap");
             self.inner
                 .transport
-                .send_with_timeout(&data, self.inner.config.send_timeout)
+                .send_with_timeout(data.into(), self.inner.config.send_timeout)
                 .await?;
         } else {
             let message = CommunityMessage::new(
@@ -1265,7 +1265,7 @@ impl<T: RequestTransport> Client<T> {
             tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV2", snmp.bytes = data.len() }, "sending v2c trap");
             self.inner
                 .transport
-                .send_with_timeout(&data, self.inner.config.send_timeout)
+                .send_with_timeout(data, self.inner.config.send_timeout)
                 .await?;
         }
 
@@ -1313,7 +1313,7 @@ impl<T: RequestTransport> Client<T> {
         tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = "TrapV1", snmp.bytes = data.len() }, "sending v1 trap");
         self.inner
             .transport
-            .send_with_timeout(&data, self.inner.config.send_timeout)
+            .send_with_timeout(data, self.inner.config.send_timeout)
             .await?;
 
         Ok(())
@@ -1670,9 +1670,9 @@ mod tests {
     }
 
     impl RequestTransport for TruncatingTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn send(&self, data: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send {
             // Decode the sent request to extract the request_id.
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+            let request_id = crate::transport::extract_request_id(&data).unwrap_or(1);
             {
                 let mut q = self.pending.lock().unwrap();
                 q.push_back(request_id);
@@ -1682,7 +1682,7 @@ mod tests {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1720,13 +1720,13 @@ mod tests {
     }
 
     impl RequestTransport for ImmediateTimeoutTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             Ok(())
         }
 
         async fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -2044,15 +2044,15 @@ mod tests {
     }
 
     impl RequestTransport for ScriptedResponseTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+        fn send(&self, data: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(&data).unwrap_or(1);
             self.pending.lock().unwrap().push_back(request_id);
             async { Ok(()) }
         }
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -2119,18 +2119,18 @@ mod tests {
     }
 
     impl RequestTransport for SendTimeoutProbe {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             panic!("client trap sending must use the bounded send contract")
         }
 
-        async fn send_with_timeout(&self, _data: &[u8], timeout: Duration) -> Result<()> {
+        async fn send_with_timeout(&self, _data: bytes::Bytes, timeout: Duration) -> Result<()> {
             self.timeouts.lock().unwrap().push(timeout);
             Ok(())
         }
 
         async fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -2204,13 +2204,13 @@ mod tests {
     }
 
     impl RequestTransport for CapacityTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             Ok(())
         }
 
         async fn request_with<U, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<U>
@@ -2297,14 +2297,17 @@ mod tests {
     }
 
     impl RequestTransport for CountingTransport {
-        fn send(&self, _data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn send(
+            &self,
+            _data: bytes::Bytes,
+        ) -> impl std::future::Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             async { Ok(()) }
         }
 
         async fn request_with<T, F>(
             &self,
-            _data: &[u8],
+            _data: bytes::Bytes,
             _registration: crate::transport::RequestRegistration,
             _validate: F,
         ) -> Result<T>
@@ -3042,11 +3045,11 @@ mod tests {
     }
 
     impl RequestTransport for TooBigTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+        fn send(&self, data: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(&data).unwrap_or(1);
             // Decode the message to count varbinds
             let msg = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
+                Bytes::copy_from_slice(&data),
                 crate::DecodeConfig::default(),
             )
             .unwrap()
@@ -3061,7 +3064,7 @@ mod tests {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -3148,9 +3151,9 @@ mod tests {
     }
 
     impl RequestTransport for InformMetadataTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
+        fn send(&self, data: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send {
             let message = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
+                Bytes::copy_from_slice(&data),
                 crate::DecodeConfig::default(),
             )
             .unwrap()
@@ -3164,7 +3167,7 @@ mod tests {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -3455,15 +3458,15 @@ mod tests {
     }
 
     impl RequestTransport for AdversarialTransport {
-        fn send(&self, data: &[u8]) -> impl std::future::Future<Output = Result<()>> + Send {
-            let request_id = crate::transport::extract_request_id(data).unwrap_or(1);
+        fn send(&self, data: bytes::Bytes) -> impl std::future::Future<Output = Result<()>> + Send {
+            let request_id = crate::transport::extract_request_id(&data).unwrap_or(1);
             self.pending.lock().unwrap().push_back(request_id);
             async { Ok(()) }
         }
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: crate::transport::RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send

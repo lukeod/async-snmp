@@ -472,10 +472,10 @@ mod tests {
     }
 
     impl RequestTransport for ScriptTransport {
-        fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send {
+        fn send(&self, data: bytes::Bytes) -> impl Future<Output = Result<()>> + Send {
             self.sends.fetch_add(1, Ordering::Relaxed);
             let message = CommunityMessage::decode(
-                Bytes::copy_from_slice(data),
+                Bytes::copy_from_slice(&data),
                 crate::DecodeConfig::default(),
             )
             .unwrap()
@@ -499,7 +499,7 @@ mod tests {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: RequestRegistration,
             validate: F,
         ) -> impl Future<Output = Result<T>> + Send

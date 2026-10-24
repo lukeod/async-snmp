@@ -76,14 +76,14 @@ impl From<TcpTransport> for BuiltinTransport {
 }
 
 impl RequestTransport for BuiltinTransport {
-    async fn send(&self, data: &[u8]) -> Result<()> {
+    async fn send(&self, data: bytes::Bytes) -> Result<()> {
         match self {
             Self::Udp(transport) => transport.send(data).await,
             Self::Tcp(transport) => transport.send(data).await,
         }
     }
 
-    async fn send_with_timeout(&self, data: &[u8], timeout: Duration) -> Result<()> {
+    async fn send_with_timeout(&self, data: bytes::Bytes, timeout: Duration) -> Result<()> {
         match self {
             Self::Udp(transport) => transport.send_with_timeout(data, timeout).await,
             Self::Tcp(transport) => transport.send_with_timeout(data, timeout).await,
@@ -92,7 +92,7 @@ impl RequestTransport for BuiltinTransport {
 
     async fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         registration: RequestRegistration,
         validate: F,
     ) -> Result<T>
@@ -180,7 +180,7 @@ mod tests {
         assert!(transport.alloc_request_id() > 0);
 
         let sent = request(1);
-        transport.send(&sent).await.unwrap();
+        transport.send(sent.clone().into()).await.unwrap();
         let mut buffer = [0; 64];
         let (length, source) = server.recv_from(&mut buffer).await.unwrap();
         assert_eq!(&buffer[..length], sent);
@@ -192,10 +192,11 @@ mod tests {
             server.send_to(&response(4), source).await.unwrap();
         };
         let request_data = request(4);
-        let client_exchange = transport.request_with(&request_data, registration(4), |packet| {
-            let (data, source) = packet.into_parts();
-            Ok(Candidate::Accept((data, source)))
-        });
+        let client_exchange =
+            transport.request_with(request_data.clone().into(), registration(4), |packet| {
+                let (data, source) = packet.into_parts();
+                Ok(Candidate::Accept((data, source)))
+            });
         let ((), result) = tokio::join!(server_exchange, client_exchange);
         let (data, info) = result.unwrap();
         assert_eq!(data.as_ref(), response(4));
@@ -215,7 +216,7 @@ mod tests {
         };
         let request_data = request(5);
         let client_exchange =
-            transport.request_with(&request_data, registration(5), reject_first());
+            transport.request_with(request_data.clone().into(), registration(5), reject_first());
         let ((), result) = tokio::join!(server_exchange, client_exchange);
         assert_eq!(result.unwrap().as_ref(), alternate_response(5));
     }
@@ -239,7 +240,7 @@ mod tests {
         assert_eq!(transport.receive_limits().advertised().as_usize(), 8192);
         assert!(transport.alloc_request_id() > 0);
 
-        transport.send(&request(1)).await.unwrap();
+        transport.send((request(1)).into()).await.unwrap();
         assert_eq!(read_frame(&mut server).await, request(1));
 
         let server_exchange = async {
@@ -247,10 +248,11 @@ mod tests {
             server.write_all(&response(4)).await.unwrap();
         };
         let request_data = request(4);
-        let client_exchange = transport.request_with(&request_data, registration(4), |packet| {
-            let (data, source) = packet.into_parts();
-            Ok(Candidate::Accept((data, source)))
-        });
+        let client_exchange =
+            transport.request_with(request_data.clone().into(), registration(4), |packet| {
+                let (data, source) = packet.into_parts();
+                Ok(Candidate::Accept((data, source)))
+            });
         let ((), result) = tokio::join!(server_exchange, client_exchange);
         let (data, info) = result.unwrap();
         assert_eq!(data.as_ref(), response(4));
@@ -266,7 +268,7 @@ mod tests {
         };
         let request_data = request(5);
         let client_exchange =
-            transport.request_with(&request_data, registration(5), reject_first());
+            transport.request_with(request_data.clone().into(), registration(5), reject_first());
         let ((), result) = tokio::join!(server_exchange, client_exchange);
         assert_eq!(result.unwrap().as_ref(), alternate_response(5));
     }
@@ -287,14 +289,22 @@ mod tests {
         let first_task = tokio::spawn(async move {
             let request = large_frame(11);
             first
-                .request_with(&request, registration(11), reject_first_matching(11))
+                .request_with(
+                    request.clone().into(),
+                    registration(11),
+                    reject_first_matching(11),
+                )
                 .await
         });
         tokio::task::yield_now().await;
         let second_task = tokio::spawn(async move {
             let request = large_frame(12);
             second
-                .request_with(&request, registration(12), reject_first_matching(12))
+                .request_with(
+                    request.clone().into(),
+                    registration(12),
+                    reject_first_matching(12),
+                )
                 .await
         });
 

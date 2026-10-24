@@ -48,13 +48,13 @@ impl ExternalTransport {
 }
 
 impl RequestTransport for ExternalTransport {
-    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, _data: bytes::Bytes) -> async_snmp::Result<()> {
         Ok(())
     }
 
     async fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         registration: RequestRegistration,
         mut validate: F,
     ) -> async_snmp::Result<T>
@@ -172,7 +172,7 @@ impl ImmediateResponseTransport {
 }
 
 impl RequestTransport for ImmediateResponseTransport {
-    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, _data: bytes::Bytes) -> async_snmp::Result<()> {
         let Some(pending) = self.inner.pending.lock().unwrap().take() else {
             self.inner
                 .unmatched_responses
@@ -186,7 +186,7 @@ impl RequestTransport for ImmediateResponseTransport {
 
     async fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         registration: RequestRegistration,
         mut validate: F,
     ) -> async_snmp::Result<T>
@@ -293,10 +293,14 @@ async fn complete_exchange_registers_before_an_immediate_response() {
     );
 
     let received = transport
-        .request_with(b"request", registration, |packet| {
-            let (data, source) = packet.into_parts();
-            Ok(Candidate::Accept((data, source)))
-        })
+        .request_with(
+            bytes::Bytes::from_static(b"request"),
+            registration,
+            |packet| {
+                let (data, source) = packet.into_parts();
+                Ok(Candidate::Accept((data, source)))
+            },
+        )
         .await
         .unwrap();
 
@@ -322,14 +326,14 @@ struct ReadyReceiveTransport {
 }
 
 impl RequestTransport for ReadyReceiveTransport {
-    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, _data: bytes::Bytes) -> async_snmp::Result<()> {
         self.sends.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     async fn request_with<T, F>(
         &self,
-        _data: &[u8],
+        _data: bytes::Bytes,
         _registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>
@@ -367,7 +371,7 @@ async fn complete_exchange_can_return_local_error_without_sending() {
 
     let error = transport
         .request_with(
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             RequestRegistration::v3(1, deadline_after(Duration::from_secs(1))),
             |packet| Ok(Candidate::Accept(packet.into_parts())),
         )
@@ -382,14 +386,14 @@ async fn complete_exchange_can_return_local_error_without_sending() {
 struct SlowExchangeTransport;
 
 impl RequestTransport for SlowExchangeTransport {
-    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, _data: bytes::Bytes) -> async_snmp::Result<()> {
         tokio::time::sleep(Duration::from_secs(4)).await;
         Ok(())
     }
 
     async fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>
@@ -429,7 +433,7 @@ impl RequestTransport for SlowExchangeTransport {
 #[tokio::test(start_paused = true)]
 async fn complete_exchange_deadline_includes_send_and_receive() {
     let request = SlowExchangeTransport.request_with(
-        b"request",
+        bytes::Bytes::from_static(b"request"),
         RequestRegistration::v3(1, deadline_after(Duration::from_secs(5))),
         |packet| Ok(Candidate::Accept(packet.into_parts())),
     );
@@ -458,7 +462,7 @@ struct FiniteCapacityTransport {
 }
 
 impl RequestTransport for FiniteCapacityTransport {
-    async fn send(&self, data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, data: bytes::Bytes) -> async_snmp::Result<()> {
         if data.len() > self.send_capacity() {
             return Err(Error::OutboundMessageTooLarge {
                 size: data.len(),
@@ -472,7 +476,7 @@ impl RequestTransport for FiniteCapacityTransport {
 
     async fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         _registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>
@@ -518,10 +522,14 @@ async fn complete_exchange_rejects_capacity_before_receive_setup() {
     let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(1)));
 
     let error = transport
-        .request_with(b"12345", registration, |packet| {
-            let (data, source) = packet.into_parts();
-            Ok(Candidate::Accept((data, source)))
-        })
+        .request_with(
+            bytes::Bytes::from_static(b"12345"),
+            registration,
+            |packet| {
+                let (data, source) = packet.into_parts();
+                Ok(Candidate::Accept((data, source)))
+            },
+        )
         .await
         .unwrap_err();
     assert!(matches!(
@@ -536,13 +544,13 @@ async fn complete_exchange_rejects_capacity_before_receive_setup() {
 struct PendingSendTransport;
 
 impl RequestTransport for PendingSendTransport {
-    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, _data: bytes::Bytes) -> async_snmp::Result<()> {
         std::future::pending().await
     }
 
     async fn request_with<T, F>(
         &self,
-        _data: &[u8],
+        _data: bytes::Bytes,
         _registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>
@@ -568,8 +576,10 @@ impl RequestTransport for PendingSendTransport {
 
 #[tokio::test(start_paused = true)]
 async fn custom_transport_inherits_bounded_standalone_send() {
-    let mut send =
-        Box::pin(PendingSendTransport.send_with_timeout(b"notification", Duration::from_secs(5)));
+    let mut send = Box::pin(PendingSendTransport.send_with_timeout(
+        bytes::Bytes::from_static(b"notification"),
+        Duration::from_secs(5),
+    ));
     assert!(futures::poll!(send.as_mut()).is_pending());
 
     tokio::time::advance(Duration::from_secs(5)).await;
@@ -587,7 +597,7 @@ async fn custom_transport_inherits_bounded_standalone_send() {
 #[tokio::test]
 async fn zero_standalone_send_timeout_is_immediate() {
     let error = PendingSendTransport
-        .send_with_timeout(b"notification", Duration::ZERO)
+        .send_with_timeout(bytes::Bytes::from_static(b"notification"), Duration::ZERO)
         .await
         .unwrap_err();
     assert!(matches!(
@@ -603,7 +613,7 @@ async fn zero_standalone_send_timeout_is_immediate() {
 #[tokio::test]
 async fn unrepresentable_standalone_send_timeout_is_rejected() {
     let error = PendingSendTransport
-        .send_with_timeout(b"notification", Duration::MAX)
+        .send_with_timeout(bytes::Bytes::from_static(b"notification"), Duration::MAX)
         .await
         .unwrap_err();
     assert!(matches!(*error, Error::Config(_)));
@@ -632,15 +642,19 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
     );
     let mut candidates = 0;
     let accepted = exact
-        .request_with(b"request", registration, |packet| {
-            let (_, source) = packet.into_parts();
-            candidates += 1;
-            if candidates == 1 {
-                Ok(Candidate::Reject)
-            } else {
-                Ok(Candidate::Accept(source))
-            }
-        })
+        .request_with(
+            bytes::Bytes::from_static(b"request"),
+            registration,
+            |packet| {
+                let (_, source) = packet.into_parts();
+                candidates += 1;
+                if candidates == 1 {
+                    Ok(Candidate::Reject)
+                } else {
+                    Ok(Candidate::Accept(source))
+                }
+            },
+        )
         .await
         .unwrap();
     assert_eq!(accepted.peer_addr(), peer);
@@ -658,7 +672,7 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
     );
     let accepted = target_only
         .request_with(
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             RequestRegistration::community(
                 8,
                 deadline_after(timeout),
@@ -682,7 +696,7 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
     let any_source = ExternalTransport::new(peer, vec![(v2c_response(9, b"rewritten"), other)]);
     let accepted = any_source
         .request_with(
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             RequestRegistration::community(
                 9,
                 deadline_after(timeout),
@@ -800,13 +814,13 @@ struct RegistrationPolicyProbe {
 }
 
 impl RequestTransport for RegistrationPolicyProbe {
-    async fn send(&self, _data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, _data: bytes::Bytes) -> async_snmp::Result<()> {
         Ok(())
     }
 
     async fn request_with<T, F>(
         &self,
-        _data: &[u8],
+        _data: bytes::Bytes,
         registration: RequestRegistration,
         _validate: F,
     ) -> async_snmp::Result<T>

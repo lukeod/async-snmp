@@ -380,7 +380,7 @@ async fn runner_abort_wakes_pending_informs_and_blocks_external_peer_traps() {
     external
         .handle(target.local_addr().unwrap())
         .unwrap()
-        .send(b"external")
+        .send(bytes::Bytes::from_static(b"external"))
         .await
         .unwrap();
     tokio::time::timeout(WAIT, target.recv_from(&mut [0; 32]))

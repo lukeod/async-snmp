@@ -1015,16 +1015,16 @@ impl UdpHandle {
 }
 
 impl RequestTransport for UdpHandle {
-    async fn send(&self, data: &[u8]) -> Result<()> {
+    async fn send(&self, data: bytes::Bytes) -> Result<()> {
         crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let _operation = self.inner.operations.read().await;
         self.ensure_open()?;
-        self.send_datagram(data).await
+        self.send_datagram(&data).await
     }
 
     async fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         mut registration: RequestRegistration,
         validate: F,
     ) -> Result<T>
@@ -1095,7 +1095,7 @@ impl RequestTransport for UdpHandle {
                 tracing::debug!(target: "async_snmp::transport::udp", { request_id = registration.request_id(), target = %self.target }, "transport timeout during UDP send");
                 return Err(registration.timeout_error(self.target));
             }
-            result = self.send_datagram(data) => result?,
+            result = self.send_datagram(&data) => result?,
         }
         self.recv_registered_with(&registration, validate).await
     }
@@ -1252,8 +1252,11 @@ mod tests {
         let window = super::super::CorrelationWindow::new();
         let first = RequestRegistration::v3(1, deadline_after(Duration::from_secs(3)))
             .with_correlation_window(window.clone());
-        let mut pending =
-            Box::pin(handle.request_with(b"first", first, |_| Ok(Candidate::Accept(()))));
+        let mut pending = Box::pin(handle.request_with(
+            bytes::Bytes::from_static(b"first"),
+            first,
+            |_| Ok(Candidate::Accept(())),
+        ));
         let mut buffer = [0; 64];
         tokio::select! {
             result = &mut pending => panic!("request completed before peer received it: {result:?}"),
@@ -1263,7 +1266,7 @@ mod tests {
         assert_eq!(service.inner.request_admission.available_permits(), 0);
         let error = handle
             .request_with(
-                b"blocked",
+                bytes::Bytes::from_static(b"blocked"),
                 RequestRegistration::v3(2, deadline_after(Duration::from_millis(20))),
                 |_| Ok(Candidate::Accept(())),
             )
@@ -1275,8 +1278,11 @@ mod tests {
             .with_correlation_window(window.clone())
             .with_aliases([1])
             .unwrap();
-        let mut retrying =
-            Box::pin(handle.request_with(b"retry", retry, |_| Ok(Candidate::Accept(()))));
+        let mut retrying = Box::pin(handle.request_with(
+            bytes::Bytes::from_static(b"retry"),
+            retry,
+            |_| Ok(Candidate::Accept(())),
+        ));
         let n = tokio::select! {
             result = &mut retrying => panic!("retry completed before peer received it: {result:?}"),
             result = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut buffer)) => result.unwrap().unwrap(),
@@ -1427,13 +1433,16 @@ mod tests {
             endpoint.control().wait_closed().await;
             assert!(endpoint.control().is_shutdown());
             assert!(matches!(
-                *handle.send(b"data").await.unwrap_err(),
+                *handle
+                    .send(bytes::Bytes::from_static(b"data"))
+                    .await
+                    .unwrap_err(),
                 Error::Closed { .. }
             ));
             assert!(matches!(
                 *handle
                     .request_with(
-                        b"data",
+                        bytes::Bytes::from_static(b"data"),
                         RequestRegistration::v3(1, deadline_after(Duration::from_secs(1))),
                         |_| Ok(Candidate::Accept(()))
                     )
@@ -1470,7 +1479,7 @@ mod tests {
         let handle = endpoint.handle(peer.local_addr().unwrap()).unwrap();
         let error = handle
             .request_with(
-                b"data",
+                bytes::Bytes::from_static(b"data"),
                 RequestRegistration::v3(1, deadline_after(Duration::from_millis(10))),
                 |_| Ok(Candidate::Accept(())),
             )
@@ -1491,7 +1500,7 @@ mod tests {
         let pending = tokio::spawn(async move {
             pending_handle
                 .request_with(
-                    b"request",
+                    bytes::Bytes::from_static(b"request"),
                     RequestRegistration::v3(1, deadline_after(Duration::from_secs(30))),
                     |_| Ok(Candidate::Accept(())),
                 )
@@ -1506,7 +1515,10 @@ mod tests {
             Error::Closed { .. }
         ));
         assert!(matches!(
-            *handle.send(b"after abort").await.unwrap_err(),
+            *handle
+                .send(bytes::Bytes::from_static(b"after abort"))
+                .await
+                .unwrap_err(),
             Error::Closed { .. }
         ));
         assert!(service.join().await.is_err());
@@ -1526,7 +1538,10 @@ mod tests {
         assert!(control.is_shutdown());
         control.wait_closed().await;
         assert!(matches!(
-            *handle.send(b"data").await.unwrap_err(),
+            *handle
+                .send(bytes::Bytes::from_static(b"data"))
+                .await
+                .unwrap_err(),
             Error::Closed { .. }
         ));
     }
@@ -1544,7 +1559,10 @@ mod tests {
         assert!(matches!(*error, Error::Network { .. }));
         assert!(matches!(control.status(), UdpStatus::Failed(_)));
         assert!(matches!(
-            *handle.send(b"data").await.unwrap_err(),
+            *handle
+                .send(bytes::Bytes::from_static(b"data"))
+                .await
+                .unwrap_err(),
             Error::Closed { .. }
         ));
     }
@@ -1755,12 +1773,18 @@ mod tests {
         assert_eq!(handle.receive_limits().advertised().as_usize(), 4096);
         assert_eq!(handle.send_capacity(), 4);
 
-        handle.send(&[1, 2, 3, 4]).await.unwrap();
+        handle
+            .send(bytes::Bytes::from_static(&[1, 2, 3, 4]))
+            .await
+            .unwrap();
         let mut received = [0; 8];
         let (length, _) = server.recv_from(&mut received).await.unwrap();
         assert_eq!(&received[..length], &[1, 2, 3, 4]);
 
-        let error = handle.send(&[1, 2, 3, 4, 5]).await.unwrap_err();
+        let error = handle
+            .send(bytes::Bytes::from_static(&[1, 2, 3, 4, 5]))
+            .await
+            .unwrap_err();
         assert!(matches!(
             *error,
             Error::OutboundMessageTooLarge { size: 5, limit: 4 }
@@ -1875,7 +1899,7 @@ mod tests {
         let started = std::time::Instant::now();
         let error = handle
             .request_with(
-                b"request",
+                bytes::Bytes::from_static(b"request"),
                 RequestRegistration::test_unchecked(42, Duration::from_millis(20)),
                 |_| Ok(Candidate::Accept(())),
             )
@@ -1900,7 +1924,7 @@ mod tests {
 
         let error = handle
             .request_with(
-                b"request",
+                bytes::Bytes::from_static(b"request"),
                 RequestRegistration::test_unchecked(43, Duration::ZERO),
                 |_| Ok(Candidate::Accept(())),
             )
@@ -1928,7 +1952,7 @@ mod tests {
         let request = async {
             handle
                 .request_with(
-                    b"request",
+                    bytes::Bytes::from_static(b"request"),
                     RequestRegistration::v3(44, deadline_after(Duration::from_secs(2))),
                     |packet| {
                         let (data, source) = packet.into_parts();
@@ -1949,7 +1973,7 @@ mod tests {
         let pending = tokio::spawn(async move {
             fatal_handle
                 .request_with(
-                    b"request",
+                    bytes::Bytes::from_static(b"request"),
                     RequestRegistration::v3(45, deadline_after(Duration::from_secs(30))),
                     |packet| {
                         let (data, source) = packet.into_parts();
@@ -2008,7 +2032,7 @@ mod tests {
         let waiter = tokio::spawn(async move {
             handle
                 .request_with(
-                    b"request",
+                    bytes::Bytes::from_static(b"request"),
                     RequestRegistration::v3(42, deadline_after(Duration::from_secs(30))),
                     |packet| {
                         let (data, source) = packet.into_parts();
@@ -2123,11 +2147,14 @@ mod tests {
         control.shutdown().await;
         let stats = control.stats();
 
-        let send_error = handle.send(b"must not be sent").await.unwrap_err();
+        let send_error = handle
+            .send(bytes::Bytes::from_static(b"must not be sent"))
+            .await
+            .unwrap_err();
         assert!(matches!(*send_error, Error::Closed { .. }));
         let request_error = handle
             .request_with(
-                b"must not be sent",
+                bytes::Bytes::from_static(b"must not be sent"),
                 RequestRegistration::v3(101, deadline_after(Duration::from_secs(30))),
                 |packet| {
                     let (data, source) = packet.into_parts();
@@ -2161,7 +2188,7 @@ mod tests {
 
         let err = handle
             .request_with(
-                b"request",
+                bytes::Bytes::from_static(b"request"),
                 RequestRegistration::v3(42, deadline_after(Duration::from_secs(30))),
                 |packet| {
                     let (data, source) = packet.into_parts();
@@ -2183,7 +2210,7 @@ mod tests {
 
         let err = handle
             .request_with(
-                b"request",
+                bytes::Bytes::from_static(b"request"),
                 RequestRegistration::v3(42, tokio::time::Instant::now()),
                 |packet| {
                     let (data, source) = packet.into_parts();
@@ -2214,7 +2241,7 @@ mod tests {
 
         let oversized = vec![0u8; 1473];
         let err = handle
-            .request_with(&oversized, registration, |packet| {
+            .request_with(oversized.clone().into(), registration, |packet| {
                 let (data, source) = packet.into_parts();
                 Ok(Candidate::Accept((data, source.peer_addr())))
             })
@@ -2253,7 +2280,7 @@ mod tests {
 
         let error = handle
             .request_with(
-                b"must not be sent",
+                bytes::Bytes::from_static(b"must not be sent"),
                 RequestRegistration::v3(61, deadline_after(Duration::from_secs(30)))
                     .with_aliases([60])
                     .unwrap(),
@@ -2284,10 +2311,14 @@ mod tests {
             .with_aliases([68, 69])
             .unwrap();
 
-        let request = handle.request_with(b"request", registration, |packet| {
-            let (data, source) = packet.into_parts();
-            Ok(Candidate::Accept((data, source.peer_addr())))
-        });
+        let request = handle.request_with(
+            bytes::Bytes::from_static(b"request"),
+            registration,
+            |packet| {
+                let (data, source) = packet.into_parts();
+                Ok(Candidate::Accept((data, source.peer_addr())))
+            },
+        );
         assert_eq!(transport.inner.core.pending_counts(), (0, 0));
         drop(request);
         assert_eq!(transport.inner.core.pending_counts(), (0, 0));
@@ -2310,10 +2341,14 @@ mod tests {
             let request_handle = handle.clone();
             let task = tokio::spawn(async move {
                 request_handle
-                    .request_with(b"request", registration, |packet| {
-                        let (data, source) = packet.into_parts();
-                        Ok(Candidate::Accept((data, source.peer_addr())))
-                    })
+                    .request_with(
+                        bytes::Bytes::from_static(b"request"),
+                        registration,
+                        |packet| {
+                            let (data, source) = packet.into_parts();
+                            Ok(Candidate::Accept((data, source.peer_addr())))
+                        },
+                    )
                     .await
             });
 

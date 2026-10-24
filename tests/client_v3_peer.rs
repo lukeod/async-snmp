@@ -3537,7 +3537,7 @@ async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
 
     let (actual, _) = RequestTransport::request_with(
         &transport,
-        &request,
+        request.clone(),
         async_snmp::RequestRegistration::v3(
             999,
             tokio::time::Instant::now() + Duration::from_secs(5),
@@ -3568,7 +3568,7 @@ async fn report_builder_uses_reporting_engine_context() {
 
     let (response, _) = RequestTransport::request_with(
         &transport,
-        &request,
+        request.clone(),
         async_snmp::RequestRegistration::v3(
             41,
             tokio::time::Instant::now() + Duration::from_secs(5),

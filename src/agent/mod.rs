@@ -2542,7 +2542,7 @@ impl Agent {
 impl AgentProcessor {
     async fn send_response(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         route: &crate::transport::ReplyRoute,
     ) -> std::io::Result<()> {
         let deadline = tokio::time::Instant::now()

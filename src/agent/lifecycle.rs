@@ -417,7 +417,7 @@ impl AgentRunner {
             let InboundWork { message, _admission, _session, _buffers } = work;
             let request = async {
                 match processor.handle_prepared_request_with_lifecycle(message.bytes, message.info.peer_addr(), lifecycle, message.prepared).await {
-                    Ok(Some(bytes)) => { let _ = processor.send_response(&bytes, &message.reply).await; },
+                    Ok(Some(bytes)) => { let _ = processor.send_response(bytes, &message.reply).await; },
                     Ok(None) => {},
                     Err(error) => tracing::debug!(%error, "agent request rejected"),
                 }

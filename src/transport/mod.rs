@@ -543,7 +543,7 @@ pub enum Candidate<T> {
 /// struct IncompleteTransport;
 ///
 /// impl RequestTransport for IncompleteTransport {
-///     async fn send(&self, _data: &[u8]) -> Result<()> { Ok(()) }
+///     async fn send(&self, _data: bytes::Bytes) -> Result<()> { Ok(()) }
 ///
 ///     fn peer_addr(&self) -> SocketAddr {
 ///         SocketAddr::from((Ipv4Addr::LOCALHOST, 161))
@@ -557,27 +557,28 @@ pub enum Candidate<T> {
 /// }
 /// ```
 pub trait RequestTransport: Send + Sync {
-    /// Send request data to the target.
+    /// Send owned encoded data to the target.
     ///
+    /// Ownership lets queued stream writers retain the encoded allocation without
+    /// copying it. Clone [`Bytes`] when retaining a request for another attempt.
     /// Implementations that return a finite [`send_capacity`](Self::send_capacity)
     /// must reject larger data with
     /// [`Error::OutboundMessageTooLarge`]
     /// before performing transport I/O. This applies to direct `send` calls;
     /// [`request_with`](Self::request_with) implementations must enforce the
     /// same check for request/response exchanges.
-    fn send(&self, data: &[u8]) -> impl Future<Output = Result<()>> + Send;
+    fn send(&self, data: bytes::Bytes) -> impl Future<Output = Result<()>> + Send;
 
     /// Send data under one total timeout.
     ///
     /// The timeout starts when this future is first polled and includes any
     /// transport-internal queueing as well as the actual write. The default
-    /// implementation preserves compatibility for custom transports by
-    /// applying a deadline around [`send`](Self::send). Stream transports may
+    /// implementation applies a deadline around [`send`](Self::send). Stream transports may
     /// override this to distinguish expiry before stream I/O from expiry after
     /// a partially completed write.
     fn send_with_timeout(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         timeout: Duration,
     ) -> impl Future<Output = Result<()>> + Send {
         async move {
@@ -612,7 +613,7 @@ pub trait RequestTransport: Send + Sync {
         }
     }
 
-    /// Send request data and wait until the validator accepts a response.
+    /// Send owned encoded request data and wait until the validator accepts a response.
     ///
     /// This is the required complete request/response extension hook. The
     /// implementation must install the primary identity and every alias before
@@ -634,7 +635,7 @@ pub trait RequestTransport: Send + Sync {
     /// frame under its existing deadline or make the connection unusable.
     fn request_with<T, F>(
         &self,
-        data: &[u8],
+        data: bytes::Bytes,
         registration: RequestRegistration,
         validate: F,
     ) -> impl Future<Output = Result<T>> + Send
@@ -696,7 +697,7 @@ pub trait RequestTransport: Send + Sync {
 #[cfg(test)]
 pub(crate) async fn request_with_scripted<T, F, R, S, U>(
     transport: &U,
-    data: &[u8],
+    data: bytes::Bytes,
     registration: RequestRegistration,
     script: R,
     mut validate: F,
@@ -841,7 +842,7 @@ mod cfg_test_transport_contract {
         let starts = Arc::clone(&source_starts);
         let error = request_with_scripted(
             &ContractTransport,
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             RequestRegistration::test_unchecked(1, Duration::ZERO),
             move |_| {
                 futures_util::stream::once(async move {
@@ -860,7 +861,7 @@ mod cfg_test_transport_contract {
         let starts = Arc::clone(&source_starts);
         let receive = request_with_scripted(
             &ContractTransport,
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             RequestRegistration::test_unchecked(2, Duration::from_secs(5)),
             move |_| {
                 starts.fetch_add(1, Ordering::Relaxed);
@@ -909,7 +910,7 @@ mod cfg_test_transport_contract {
 
         let accepted = request_with_scripted(
             &ContractTransport,
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             registration,
             move |_| futures_util::stream::iter(candidates),
             |packet| {
@@ -948,7 +949,7 @@ mod cfg_test_transport_contract {
 
         let error = request_with_scripted(
             &ContractTransport,
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             RequestRegistration::test_unchecked(3, Duration::from_secs(1)),
             move |_| futures_util::stream::iter(candidates),
             move |packet| {
@@ -980,7 +981,7 @@ mod cfg_test_transport_contract {
         let started = tokio::time::Instant::now();
         let receive = tokio::spawn(request_with_scripted(
             &ContractTransport,
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             RequestRegistration::test_unchecked(4, configured_timeout),
             move |_| {
                 futures_util::stream::once(async {
@@ -1021,7 +1022,7 @@ mod cfg_test_transport_contract {
         let source_dropped = Arc::clone(&dropped);
         let mut receive = Box::pin(request_with_scripted(
             &ContractTransport,
-            b"request",
+            bytes::Bytes::from_static(b"request"),
             RequestRegistration::test_unchecked(5, Duration::from_secs(30)),
             move |_| {
                 source_started.store(true, Ordering::Relaxed);
@@ -1049,7 +1050,7 @@ mod cfg_test_transport_contract {
     }
 
     impl RequestTransport for ScriptedRequestTransport {
-        async fn send(&self, _data: &[u8]) -> Result<()> {
+        async fn send(&self, _data: bytes::Bytes) -> Result<()> {
             assert!(self.registered.load(Ordering::Relaxed));
             self.sent.store(true, Ordering::Relaxed);
             Ok(())
@@ -1057,7 +1058,7 @@ mod cfg_test_transport_contract {
 
         fn request_with<T, F>(
             &self,
-            data: &[u8],
+            data: bytes::Bytes,
             registration: RequestRegistration,
             validate: F,
         ) -> impl std::future::Future<Output = Result<T>> + Send
@@ -1104,7 +1105,7 @@ mod cfg_test_transport_contract {
         };
         let response = transport
             .request_with(
-                b"request",
+                bytes::Bytes::from_static(b"request"),
                 RequestRegistration::test_unchecked(6, Duration::from_secs(1)),
                 |packet| {
                     let (data, source) = packet.into_parts();

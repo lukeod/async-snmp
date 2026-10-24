@@ -105,17 +105,6 @@ impl From<OwnedSemaphorePermit> for BufferPermits {
     }
 }
 
-/// Outbound owned storage retains byte admission until write completion.
-pub(super) struct BufferedFrame {
-    pub(super) bytes: Vec<u8>,
-    pub(super) _permit: BufferPermits,
-}
-impl AsRef<[u8]> for BufferedFrame {
-    fn as_ref(&self) -> &[u8] {
-        &self.bytes
-    }
-}
-
 /// Inbound budget transfers to the dispatcher/candidate queue and lasts through
 /// protocol validation. Successful application values may borrow `bytes` after
 /// admission accounting ends; caller-retained results are not transport buffers.

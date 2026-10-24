@@ -551,7 +551,7 @@ async fn colliding_informs_blocked_in_ack_leave_response_allowance_available() {
                 .unwrap();
         handle
             .request_with(
-                &request,
+                request.clone(),
                 RequestRegistration::community(
                     1,
                     tokio::time::Instant::now() + Duration::from_secs(5),

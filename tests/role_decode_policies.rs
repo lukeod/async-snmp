@@ -33,9 +33,9 @@ impl CommunityPolicyTransport {
 }
 
 impl RequestTransport for CommunityPolicyTransport {
-    async fn send(&self, data: &[u8]) -> async_snmp::Result<()> {
+    async fn send(&self, data: bytes::Bytes) -> async_snmp::Result<()> {
         let request = async_snmp::message::CommunityMessage::decode(
-            Bytes::copy_from_slice(data),
+            Bytes::copy_from_slice(&data),
             DecodeConfig::default(),
         )?
         .value;
@@ -56,7 +56,7 @@ impl RequestTransport for CommunityPolicyTransport {
 
     async fn request_with<T, F>(
         &self,
-        request: &[u8],
+        request: bytes::Bytes,
         registration: RequestRegistration,
         mut validate: F,
     ) -> async_snmp::Result<T>
