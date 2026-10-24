@@ -841,7 +841,8 @@ impl<T: RequestTransport> Client<T> {
             match self
                 .inner
                 .transport
-                .request_with(data, registration, |response_data, info| {
+                .request_with(data, registration, |packet| {
+                    let (response_data, info) = packet.into_parts();
                     let source = info.peer_addr();
                     tracing::trace!(target: "async_snmp::client", { snmp.bytes = response_data.len() }, "received response candidate");
                     let Ok(decoded) = Message::decode_bounded_with_target(
@@ -1687,8 +1688,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -1732,8 +1732,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(Error::Timeout {
@@ -2059,8 +2058,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -2138,8 +2136,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             panic!("send-timeout probe does not receive responses")
         }
@@ -2219,8 +2216,7 @@ mod tests {
         ) -> Result<U>
         where
             U: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<U>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<U>> + Send,
         {
             self.requests.fetch_add(1, Ordering::Relaxed);
             Err(Error::Config("capacity boundary reached transport".into()).boxed())
@@ -2314,8 +2310,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             panic!("receive must not be reached after encode failure")
         }
@@ -3072,8 +3067,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -3176,8 +3170,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -3476,8 +3469,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,

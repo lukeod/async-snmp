@@ -1030,7 +1030,7 @@ impl RequestTransport for UdpHandle {
     ) -> Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+        F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
     {
         crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
         let _operation = self.inner.operations.read().await;
@@ -1196,7 +1196,8 @@ impl UdpHandle {
         &self,
         registration: &super::udp_core::UdpRegistration,
     ) -> Result<(Bytes, SocketAddr)> {
-        self.recv_registered_with(registration, |data, source| {
+        self.recv_registered_with(registration, |packet| {
+            let (data, source) = packet.into_parts();
             Ok(Candidate::Accept((data, source.peer_addr())))
         })
         .await
@@ -1208,7 +1209,7 @@ impl UdpHandle {
         mut validate: F,
     ) -> Result<T>
     where
-        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>>,
+        F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>>,
     {
         let request_id = registration.request_id();
         tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.request_id = request_id }, "UDP recv waiting");
@@ -1216,13 +1217,13 @@ impl UdpHandle {
         let result = self
             .inner
             .core
-            .wait_for_response_with(registration, self.target, |data, info| {
-                let source = info.peer_addr();
+            .wait_for_response_with(registration, self.target, |packet| {
+                let source = packet.info().peer_addr();
                 if self.inner.config.warn_on_source_mismatch && source != self.target {
                     tracing::warn!(target: "async_snmp::transport", { snmp.request_id = request_id, snmp.target = %self.target, snmp.source = %source }, "response source address mismatch");
                 }
-                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.source = %source, snmp.bytes = data.len() }, "UDP recv candidate");
-                validate(data, info)
+                tracing::trace!(target: "async_snmp::transport", { snmp.target = %self.target, snmp.source = %source, snmp.bytes = packet.bytes().len() }, "UDP recv candidate");
+                validate(packet)
             })
             .await;
 
@@ -1252,7 +1253,7 @@ mod tests {
         let first = RequestRegistration::v3(1, deadline_after(Duration::from_secs(3)))
             .with_correlation_window(window.clone());
         let mut pending =
-            Box::pin(handle.request_with(b"first", first, |_, _| Ok(Candidate::Accept(()))));
+            Box::pin(handle.request_with(b"first", first, |_| Ok(Candidate::Accept(()))));
         let mut buffer = [0; 64];
         tokio::select! {
             result = &mut pending => panic!("request completed before peer received it: {result:?}"),
@@ -1264,7 +1265,7 @@ mod tests {
             .request_with(
                 b"blocked",
                 RequestRegistration::v3(2, deadline_after(Duration::from_millis(20))),
-                |_, _| Ok(Candidate::Accept(())),
+                |_| Ok(Candidate::Accept(())),
             )
             .await
             .unwrap_err();
@@ -1275,7 +1276,7 @@ mod tests {
             .with_aliases([1])
             .unwrap();
         let mut retrying =
-            Box::pin(handle.request_with(b"retry", retry, |_, _| Ok(Candidate::Accept(()))));
+            Box::pin(handle.request_with(b"retry", retry, |_| Ok(Candidate::Accept(()))));
         let n = tokio::select! {
             result = &mut retrying => panic!("retry completed before peer received it: {result:?}"),
             result = tokio::time::timeout(Duration::from_secs(1), peer.recv(&mut buffer)) => result.unwrap().unwrap(),
@@ -1434,7 +1435,7 @@ mod tests {
                     .request_with(
                         b"data",
                         RequestRegistration::v3(1, deadline_after(Duration::from_secs(1))),
-                        |_, _| Ok(Candidate::Accept(()))
+                        |_| Ok(Candidate::Accept(()))
                     )
                     .await
                     .unwrap_err(),
@@ -1471,7 +1472,7 @@ mod tests {
             .request_with(
                 b"data",
                 RequestRegistration::v3(1, deadline_after(Duration::from_millis(10))),
-                |_, _| Ok(Candidate::Accept(())),
+                |_| Ok(Candidate::Accept(())),
             )
             .await
             .unwrap_err();
@@ -1492,7 +1493,7 @@ mod tests {
                 .request_with(
                     b"request",
                     RequestRegistration::v3(1, deadline_after(Duration::from_secs(30))),
-                    |_, _| Ok(Candidate::Accept(())),
+                    |_| Ok(Candidate::Accept(())),
                 )
                 .await
         });
@@ -1876,7 +1877,7 @@ mod tests {
             .request_with(
                 b"request",
                 RequestRegistration::test_unchecked(42, Duration::from_millis(20)),
-                |_, _| Ok(Candidate::Accept(())),
+                |_| Ok(Candidate::Accept(())),
             )
             .await
             .expect_err("stalled send must time out");
@@ -1901,7 +1902,7 @@ mod tests {
             .request_with(
                 b"request",
                 RequestRegistration::test_unchecked(43, Duration::ZERO),
-                |_, _| Ok(Candidate::Accept(())),
+                |_| Ok(Candidate::Accept(())),
             )
             .await
             .expect_err("zero-timeout request must time out");
@@ -1929,7 +1930,10 @@ mod tests {
                 .request_with(
                     b"request",
                     RequestRegistration::v3(44, deadline_after(Duration::from_secs(2))),
-                    |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
+                    |packet| {
+                        let (data, source) = packet.into_parts();
+                        Ok(Candidate::Accept((data, source.peer_addr())))
+                    },
                 )
                 .await
         };
@@ -1947,7 +1951,10 @@ mod tests {
                 .request_with(
                     b"request",
                     RequestRegistration::v3(45, deadline_after(Duration::from_secs(30))),
-                    |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
+                    |packet| {
+                        let (data, source) = packet.into_parts();
+                        Ok(Candidate::Accept((data, source.peer_addr())))
+                    },
                 )
                 .await
         });
@@ -2003,7 +2010,10 @@ mod tests {
                 .request_with(
                     b"request",
                     RequestRegistration::v3(42, deadline_after(Duration::from_secs(30))),
-                    |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
+                    |packet| {
+                        let (data, source) = packet.into_parts();
+                        Ok(Candidate::Accept((data, source.peer_addr())))
+                    },
                 )
                 .await
         });
@@ -2119,7 +2129,10 @@ mod tests {
             .request_with(
                 b"must not be sent",
                 RequestRegistration::v3(101, deadline_after(Duration::from_secs(30))),
-                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
+                |packet| {
+                    let (data, source) = packet.into_parts();
+                    Ok(Candidate::Accept((data, source.peer_addr())))
+                },
             )
             .await
             .unwrap_err();
@@ -2150,7 +2163,10 @@ mod tests {
             .request_with(
                 b"request",
                 RequestRegistration::v3(42, deadline_after(Duration::from_secs(30))),
-                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
+                |packet| {
+                    let (data, source) = packet.into_parts();
+                    Ok(Candidate::Accept((data, source.peer_addr())))
+                },
             )
             .await
             .expect_err("recv on closed transport should fail");
@@ -2169,7 +2185,10 @@ mod tests {
             .request_with(
                 b"request",
                 RequestRegistration::v3(42, tokio::time::Instant::now()),
-                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
+                |packet| {
+                    let (data, source) = packet.into_parts();
+                    Ok(Candidate::Accept((data, source.peer_addr())))
+                },
             )
             .await
             .expect_err("zero-deadline receive should fail");
@@ -2195,7 +2214,8 @@ mod tests {
 
         let oversized = vec![0u8; 1473];
         let err = handle
-            .request_with(&oversized, registration, |data, source| {
+            .request_with(&oversized, registration, |packet| {
+                let (data, source) = packet.into_parts();
                 Ok(Candidate::Accept((data, source.peer_addr())))
             })
             .await
@@ -2237,7 +2257,10 @@ mod tests {
                 RequestRegistration::v3(61, deadline_after(Duration::from_secs(30)))
                     .with_aliases([60])
                     .unwrap(),
-                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
+                |packet| {
+                    let (data, source) = packet.into_parts();
+                    Ok(Candidate::Accept((data, source.peer_addr())))
+                },
             )
             .await
             .unwrap_err();
@@ -2261,7 +2284,8 @@ mod tests {
             .with_aliases([68, 69])
             .unwrap();
 
-        let request = handle.request_with(b"request", registration, |data, source| {
+        let request = handle.request_with(b"request", registration, |packet| {
+            let (data, source) = packet.into_parts();
             Ok(Candidate::Accept((data, source.peer_addr())))
         });
         assert_eq!(transport.inner.core.pending_counts(), (0, 0));
@@ -2286,7 +2310,8 @@ mod tests {
             let request_handle = handle.clone();
             let task = tokio::spawn(async move {
                 request_handle
-                    .request_with(b"request", registration, |data, source| {
+                    .request_with(b"request", registration, |packet| {
+                        let (data, source) = packet.into_parts();
                         Ok(Candidate::Accept((data, source.peer_addr())))
                     })
                     .await

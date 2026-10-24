@@ -2590,13 +2590,27 @@ impl AgentProcessor {
         .await
     }
 
+    #[cfg(test)]
     async fn handle_request_with_lifecycle(
         &self,
         data: Bytes,
         source: SocketAddr,
         lifecycle: RequestLifecycle,
     ) -> Result<Option<Bytes>> {
-        let result = self.handle_request_inner(data, source, lifecycle).await;
+        self.handle_prepared_request_with_lifecycle(data, source, lifecycle, None)
+            .await
+    }
+
+    async fn handle_prepared_request_with_lifecycle(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        lifecycle: RequestLifecycle,
+        prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
+    ) -> Result<Option<Bytes>> {
+        let result = self
+            .handle_request_inner(data, source, lifecycle, prepared)
+            .await;
         if matches!(
             &result,
             Err(error) if matches!(
@@ -2623,6 +2637,7 @@ impl AgentProcessor {
         data: Bytes,
         source: SocketAddr,
         lifecycle: RequestLifecycle,
+        prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
     ) -> Result<Option<Bytes>> {
         match crate::message::peek_version(data.clone(), source)? {
             Version::V1 => self.handle_v1_with_lifecycle(data, source, lifecycle).await,
@@ -2630,7 +2645,10 @@ impl AgentProcessor {
                 self.handle_v2c_with_lifecycle(data, source, lifecycle)
                     .await
             }
-            Version::V3 => self.handle_v3_with_lifecycle(data, source, lifecycle).await,
+            Version::V3 => {
+                self.handle_prepared_v3_with_lifecycle(data, source, lifecycle, prepared)
+                    .await
+            }
         }
     }
 

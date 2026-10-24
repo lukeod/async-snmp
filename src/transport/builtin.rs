@@ -1,6 +1,7 @@
 use super::{Candidate, RequestRegistration, RequestTransport, TcpTransport, UdpHandle};
 use crate::error::Result;
 use crate::message_size::ReceiveLimits;
+#[cfg(test)]
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -97,7 +98,7 @@ impl RequestTransport for BuiltinTransport {
     ) -> Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+        F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
     {
         match self {
             Self::Udp(transport) => transport.request_with(data, registration, validate).await,
@@ -191,10 +192,10 @@ mod tests {
             server.send_to(&response(4), source).await.unwrap();
         };
         let request_data = request(4);
-        let client_exchange =
-            transport.request_with(&request_data, registration(4), |data, source| {
-                Ok(Candidate::Accept((data, source)))
-            });
+        let client_exchange = transport.request_with(&request_data, registration(4), |packet| {
+            let (data, source) = packet.into_parts();
+            Ok(Candidate::Accept((data, source)))
+        });
         let ((), result) = tokio::join!(server_exchange, client_exchange);
         let (data, info) = result.unwrap();
         assert_eq!(data.as_ref(), response(4));
@@ -246,10 +247,10 @@ mod tests {
             server.write_all(&response(4)).await.unwrap();
         };
         let request_data = request(4);
-        let client_exchange =
-            transport.request_with(&request_data, registration(4), |data, source| {
-                Ok(Candidate::Accept((data, source)))
-            });
+        let client_exchange = transport.request_with(&request_data, registration(4), |packet| {
+            let (data, source) = packet.into_parts();
+            Ok(Candidate::Accept((data, source)))
+        });
         let ((), result) = tokio::join!(server_exchange, client_exchange);
         let (data, info) = result.unwrap();
         assert_eq!(data.as_ref(), response(4));
@@ -325,10 +326,10 @@ mod tests {
         RequestRegistration::test_unchecked(request_id, TEST_TIMEOUT)
     }
 
-    fn reject_first()
-    -> impl FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<Bytes>> + Send {
+    fn reject_first() -> impl FnMut(crate::ReceivedPacket) -> Result<Candidate<Bytes>> + Send {
         let mut candidates = 0;
-        move |data, _| {
+        move |packet| {
+            let (data, _) = packet.into_parts();
             candidates += 1;
             if candidates == 1 {
                 Ok(Candidate::Reject)
@@ -340,9 +341,10 @@ mod tests {
 
     fn reject_first_matching(
         expected: u8,
-    ) -> impl FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<u8>> + Send {
+    ) -> impl FnMut(crate::ReceivedPacket) -> Result<Candidate<u8>> + Send {
         let mut candidates = 0;
-        move |_data, _| {
+        move |packet| {
+            let (_data, _) = packet.into_parts();
             candidates += 1;
             if candidates == 1 {
                 Ok(Candidate::Reject)

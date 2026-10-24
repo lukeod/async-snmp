@@ -559,7 +559,8 @@ async fn colliding_informs_blocked_in_ack_leave_response_allowance_available() {
                     "public",
                     CommunityResponsePolicy::Exact,
                 ),
-                |data, _| {
+                |packet| {
+                    let (data, _) = packet.into_parts();
                     assert_eq!(
                         crate::message::CommunityMessage::decode(
                             data,

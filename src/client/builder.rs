@@ -1518,11 +1518,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(
-                    bytes::Bytes,
-                    crate::ReceivedMessageInfo,
-                ) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             self.calls
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

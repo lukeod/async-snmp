@@ -856,6 +856,8 @@ impl PrivKey {
         engine_time: u32,
         priv_params: &[u8],
     ) -> PrivacyResult<Bytes> {
+        #[cfg(test)]
+        crate::v3::prepared::test_counts::record(|counts| counts.decrypt += 1);
         if priv_params.len() != 8 {
             tracing::debug!(target: "async_snmp::crypto", { expected = 8, actual = priv_params.len() }, "invalid privParameters length");
             return Err(PrivacyError::InvalidPrivParamsLength {

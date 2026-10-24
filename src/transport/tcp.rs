@@ -793,7 +793,7 @@ impl RequestTransport for TcpTransport {
     ) -> Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+        F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
     {
         let started = Instant::now();
         let result = async {
@@ -960,9 +960,12 @@ async fn read_loop(
         } else if let Some(envelope) = CorrelationEnvelope::parse(&frame)
             && let Some(id) = envelope.request_id(&frame)
         {
-            state
-                .core
-                .deliver_parsed_buffered(id, envelope, frame, info, permit);
+            state.core.deliver_parsed_buffered(
+                id,
+                envelope,
+                crate::ReceivedPacket::new(frame, info),
+                permit,
+            );
         } else {
             state
                 .observation

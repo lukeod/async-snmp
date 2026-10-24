@@ -1008,8 +1008,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -1171,8 +1170,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -1543,8 +1541,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<crate::transport::Candidate<T>>
-                + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<crate::transport::Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,

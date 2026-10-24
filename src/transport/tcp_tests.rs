@@ -29,7 +29,8 @@ impl TcpTransport {
         data: &[u8],
         registration: RequestRegistration,
     ) -> Result<(Bytes, SocketAddr)> {
-        self.request_with(data, registration, |bytes, info| {
+        self.request_with(data, registration, |packet| {
+            let (bytes, info) = packet.into_parts();
             Ok(Candidate::Accept((bytes, info.peer_addr())))
         })
         .await
@@ -493,7 +494,8 @@ async fn tcp_validator_rejection_keeps_exchange_for_later_frame() {
     );
     let mut candidates = 0;
     let response = transport
-        .request_with(&build_request_with_id(78), registration, |data, _| {
+        .request_with(&build_request_with_id(78), registration, |packet| {
+            let (data, _) = packet.into_parts();
             candidates += 1;
             if candidates == 1 {
                 Ok(Candidate::Reject)
@@ -762,16 +764,13 @@ async fn concurrent_requests_are_written_before_any_response_and_correlated_out_
         let transport = running.transport();
         async move {
             let response = transport
-                .request_with(
-                    &build_request_with_id(id),
-                    registration(id),
-                    |bytes, info| {
-                        assert_eq!(info.session_id(), Some(session));
-                        assert_eq!(info.endpoint_id(), endpoint);
-                        assert_eq!(info.received_len(), bytes.len());
-                        Ok(Candidate::Accept(bytes))
-                    },
-                )
+                .request_with(&build_request_with_id(id), registration(id), |packet| {
+                    let (bytes, info) = packet.into_parts();
+                    assert_eq!(info.session_id(), Some(session));
+                    assert_eq!(info.endpoint_id(), endpoint);
+                    assert_eq!(info.received_len(), bytes.len());
+                    Ok(Candidate::Accept(bytes))
+                })
                 .await
                 .unwrap();
             assert_eq!(extract_request_id(&response), Some(id));
@@ -1204,7 +1203,8 @@ async fn validation_error_and_rejected_candidates_leave_session_aligned() {
         }
     });
     let error = running
-        .request_with(&build_request_with_id(1), registration(1), |_, _| {
+        .request_with(&build_request_with_id(1), registration(1), |packet| {
+            let (_, _) = packet.into_parts();
             Err::<Candidate<()>, _>(Error::Config("validator error".into()).boxed())
         })
         .await
@@ -1225,7 +1225,8 @@ async fn frame_larger_than_udp_capacity_is_received_with_exact_length() {
     let handle = running.transport();
     let pending = tokio::spawn(async move {
         handle
-            .request_with(&build_request_with_id(1), registration(1), |data, info| {
+            .request_with(&build_request_with_id(1), registration(1), |packet| {
+                let (data, info) = packet.into_parts();
                 assert_eq!(info.received_len(), data.len());
                 Ok(Candidate::Accept(data.len()))
             })
@@ -1478,7 +1479,8 @@ async fn receive_permit_is_held_during_validation_and_released_on_acceptance() {
         peer.write_all(&build_response_with_id(1)).await.unwrap();
     });
     let bytes = running
-        .request_with(&build_request_with_id(1), registration(1), |data, _| {
+        .request_with(&build_request_with_id(1), registration(1), |packet| {
+            let (data, _) = packet.into_parts();
             assert!(budget.available_permits() <= 484 - data.len());
             Ok(Candidate::Accept(data))
         })

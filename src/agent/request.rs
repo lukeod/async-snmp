@@ -9,7 +9,9 @@ use crate::error::Result;
 use crate::handler::{RequestContext, RequestLifecycle};
 use crate::message::CommunityMessage;
 use crate::pdu::{PduType, ResponsePdu};
-use crate::v3::process::{MpdCounters, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
+use crate::v3::process::{
+    MpdCounters, V3Inbound, V3LocalContext, V3Role, process_prepared_v3_inbound,
+};
 use crate::version::{CommunityVersion, Version};
 
 use std::sync::atomic::Ordering;
@@ -174,18 +176,30 @@ impl AgentProcessor {
     /// Handle `SNMPv3` request.
     ///
     /// USM processing (RFC 3414 Section 3.2) runs in the shared
-    /// [`process_v3_inbound`] core in the authoritative role.
+    /// [`process_prepared_v3_inbound`] core in the authoritative role.
     #[cfg(test)]
     pub(super) async fn handle_v3(&self, data: Bytes, source: SocketAddr) -> Result<Option<Bytes>> {
         self.handle_v3_with_lifecycle(data, source, RequestLifecycle::standalone())
             .await
     }
 
+    #[cfg(test)]
     pub(super) async fn handle_v3_with_lifecycle(
         &self,
         data: Bytes,
         source: SocketAddr,
         lifecycle: RequestLifecycle,
+    ) -> Result<Option<Bytes>> {
+        self.handle_prepared_v3_with_lifecycle(data, source, lifecycle, None)
+            .await
+    }
+
+    pub(super) async fn handle_prepared_v3_with_lifecycle(
+        &self,
+        data: Bytes,
+        source: SocketAddr,
+        lifecycle: RequestLifecycle,
+        prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
     ) -> Result<Option<Bytes>> {
         let limits = lifecycle.endpoint_limits;
         let state = &self.inner.state;
@@ -208,12 +222,13 @@ impl AgentProcessor {
             source,
         };
 
-        let inbound = match process_v3_inbound(data, &usm_ctx, &V3Role::Authoritative)? {
-            V3Inbound::Failed { report, .. } => return Ok(report),
-            // Step 7b does not apply to the authoritative role.
-            V3Inbound::RemoteNotInTimeWindow => return Ok(None),
-            V3Inbound::Message(inbound) => inbound,
-        };
+        let inbound =
+            match process_prepared_v3_inbound(data, &usm_ctx, &V3Role::Authoritative, prepared)? {
+                V3Inbound::Failed { report, .. } => return Ok(report),
+                // Step 7b does not apply to the authoritative role.
+                V3Inbound::RemoteNotInTimeWindow => return Ok(None),
+                V3Inbound::Message(inbound) => inbound,
+            };
         let global_data = &inbound.global_data;
         let usm_params = &inbound.usm_params;
         let scoped_pdu = &inbound.scoped_pdu;

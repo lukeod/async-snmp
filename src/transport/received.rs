@@ -6,6 +6,49 @@ use tokio::time::Instant;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+/// One original response candidate and its complete-input receive metadata.
+///
+/// Custom transports construct this value once per candidate. Built-in transports
+/// may retain private parsing work alongside the original bytes; consumers still
+/// perform their own security, policy and exchange acceptance checks.
+pub struct ReceivedPacket {
+    bytes: bytes::Bytes,
+    info: ReceivedMessageInfo,
+    pub(crate) prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
+}
+impl ReceivedPacket {
+    /// Wrap original input bytes and metadata captured once at receipt.
+    /// `info.received_len()` must equal `bytes.len()`.
+    pub fn new(bytes: bytes::Bytes, info: ReceivedMessageInfo) -> Self {
+        Self {
+            bytes,
+            info,
+            prepared: None,
+        }
+    }
+    /// Borrow the complete original SNMP input, before decoding or decryption.
+    pub fn bytes(&self) -> &bytes::Bytes {
+        &self.bytes
+    }
+    /// Return the original complete-input metadata and reception identity.
+    pub fn info(&self) -> ReceivedMessageInfo {
+        self.info
+    }
+    /// Take the original bytes and metadata for custom validation.
+    pub fn into_parts(self) -> (bytes::Bytes, ReceivedMessageInfo) {
+        (self.bytes, self.info)
+    }
+    pub(crate) fn into_prepared(
+        self,
+    ) -> (
+        bytes::Bytes,
+        ReceivedMessageInfo,
+        Option<Box<crate::v3::prepared::PreparedV3>>,
+    ) {
+        (self.bytes, self.info, self.prepared)
+    }
+}
+
 /// Process-local endpoint identity, independent of its bound address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct EndpointId(u64);
@@ -267,8 +310,24 @@ pub(crate) struct ReceivedMessage {
     pub(crate) bytes: bytes::Bytes,
     pub(crate) info: ReceivedMessageInfo,
     pub(crate) reply: ReplyRoute,
+    pub(crate) prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
 }
 impl ReceivedMessage {
+    pub(crate) fn discard_cached_plaintext(&mut self) {
+        if let Some(crypto) = self.prepared.as_mut().and_then(|p| p.crypto.as_mut()) {
+            crypto.plaintext = None;
+        }
+    }
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.bytes.len() + self.prepared.as_ref().map_or(0, |p| p.plaintext_len())
+    }
+    pub(crate) fn into_packet(self) -> ReceivedPacket {
+        ReceivedPacket {
+            bytes: self.bytes,
+            info: self.info,
+            prepared: self.prepared,
+        }
+    }
     pub(crate) fn observe(&self, disposition: super::MessageDisposition) {
         self.reply.observation().disposition(self.info, disposition);
     }
@@ -297,6 +356,7 @@ impl ReceivedMessage {
         Self {
             bytes,
             info,
+            prepared: None,
             reply: ReplyRoute {
                 kind: ReplyKind::Tcp(transport),
                 limits,
@@ -317,6 +377,7 @@ impl ReceivedMessage {
         Self {
             bytes,
             info,
+            prepared: None,
             reply: ReplyRoute {
                 kind: ReplyKind::Udp {
                     socket,

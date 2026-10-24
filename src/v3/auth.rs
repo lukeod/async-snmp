@@ -601,6 +601,8 @@ pub fn verify_message(
     auth_offset: usize,
     auth_len: usize,
 ) -> CryptoResult<bool> {
+    #[cfg(test)]
+    crate::v3::prepared::test_counts::record(|counts| counts.auth += 1);
     const MAX_MAC_LEN: usize = 48; // SHA-512
 
     // No supported protocol produces a MAC longer than MAX_MAC_LEN; a larger

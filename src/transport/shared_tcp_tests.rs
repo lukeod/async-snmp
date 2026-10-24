@@ -310,7 +310,8 @@ async fn collision_rejection_and_identical_ids_are_session_scoped() {
                 .request_with(
                     &community(crate::Pdu::get_request(41, &[oid()])),
                     registration(41),
-                    move |bytes, _| {
+                    move |packet| {
+                        let (bytes, _) = packet.into_parts();
                         let pdu = crate::message::CommunityMessage::decode(
                             bytes,
                             crate::DecodeConfig::DEFAULT,
@@ -397,7 +398,7 @@ async fn full_shared_notification_queue_closes_session_and_fails_pending_with_id
             .request_with(
                 &community(crate::Pdu::get_request(42, &[oid()])),
                 registration(42),
-                |_, _| Ok(Candidate::Accept(())),
+                |_| Ok(Candidate::Accept(())),
             )
             .await
     });
@@ -612,7 +613,8 @@ async fn encrypted_collision_preserves_role_and_failure_ownership() {
     );
     let pending = tokio::spawn(async move {
         session
-            .request_with(&outgoing, registration, move |_, _| {
+            .request_with(&outgoing, registration, move |packet| {
+                let (_, _) = packet.into_parts();
                 if count.fetch_add(1, Ordering::SeqCst) == 0 {
                     Ok(Candidate::Reject)
                 } else {
@@ -796,7 +798,7 @@ async fn shared_tcp_response_above_one_megabyte_retains_exact_metadata() {
             .request_with(
                 &community(crate::Pdu::get_request(42, &[oid()])),
                 registration(42),
-                |bytes, info| Ok(Candidate::Accept((bytes, info))),
+                |packet| Ok(Candidate::Accept(packet.into_parts())),
             )
             .await
     });
@@ -1165,7 +1167,7 @@ async fn mixed_session_survives_command_closure_during_admission() {
         assert_eq!(disposition, MessageDisposition::Disabled, "mode {mode}");
         let request = community(crate::Pdu::get_request(41, &[oid()]));
         let exchange =
-            transport.request_with(&request, registration(41), |_, _| Ok(Candidate::Accept(())));
+            transport.request_with(&request, registration(41), |_| Ok(Candidate::Accept(())));
         let remote = async {
             assert_eq!(read(&mut peer).await, request);
             peer.write_all(&community(crate::Pdu::response(41, 0, 0, vec![])))

@@ -45,6 +45,7 @@ mod config;
 mod crypto;
 pub(crate) mod encode;
 mod engine;
+pub(crate) mod prepared;
 #[cfg_attr(
     not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),
     doc(hidden)

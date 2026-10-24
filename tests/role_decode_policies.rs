@@ -62,7 +62,7 @@ impl RequestTransport for CommunityPolicyTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
         let peer = self.peer_addr();
         let started = tokio::time::Instant::now();
@@ -89,7 +89,8 @@ impl RequestTransport for CommunityPolicyTransport {
                 tokio::time::Instant::now(),
                 data.len(),
             );
-            if let Candidate::Accept(value) = validate(data, info)? {
+            if let Candidate::Accept(value) = validate(async_snmp::ReceivedPacket::new(data, info))?
+            {
                 return Ok(value);
             }
         }

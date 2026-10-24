@@ -619,12 +619,15 @@ pub trait RequestTransport: Send + Sync {
     /// sending, use [`RequestRegistration::deadline`] across queueing, write,
     /// candidate rejection, and response wait, and remove all registration
     /// state on every completion or cancellation path. Identity-correlated
-    /// candidates must pass through `validate` with their original receive metadata;
-    /// `received_len()` must equal the delivered bytes length. Capture the timestamp
+    /// candidates must pass through `validate` as a [`ReceivedPacket`] retaining
+    /// their original bytes and receive metadata; `packet.info().received_len()`
+    /// must equal `packet.bytes().len()`. Capture the timestamp
     /// at complete-message receipt, before correlation or validation. Construct
     /// receive metadata once per input and preserve its reception identity when
     /// passing the same candidate through different processing stages. Custom
-    /// transports construct [`ReceivedMessageInfo`] without internal reply capabilities.
+    /// transports construct [`ReceivedMessageInfo`] and wrap the original bytes
+    /// with [`ReceivedPacket::new`], without internal reply capabilities.
+    /// Validators may use [`ReceivedPacket::into_parts`] to take both values.
     /// Rejection continues under the
     /// same deadline. Reliable transports must retain independent framing
     /// ownership when a caller is cancelled. A started write must finish its
@@ -637,7 +640,7 @@ pub trait RequestTransport: Send + Sync {
     ) -> impl Future<Output = Result<T>> + Send
     where
         T: Send,
-        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send;
+        F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send;
 
     /// The peer address for this transport.
     fn peer_addr(&self) -> SocketAddr;
@@ -700,7 +703,7 @@ pub(crate) async fn request_with_scripted<T, F, R, S, U>(
 ) -> Result<T>
 where
     T: Send,
-    F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+    F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
     R: FnOnce(RequestRegistration) -> S + Send,
     S: futures_core::Stream<Item = Result<(Bytes, SocketAddr)>> + Send,
     U: RequestTransport + ?Sized,
@@ -772,7 +775,7 @@ where
             tokio::time::Instant::now(),
             data.len(),
         );
-        match validate(data, info)? {
+        match validate(crate::ReceivedPacket::new(data, info))? {
             Candidate::Accept(value) => return Ok(value),
             Candidate::Reject => {}
         }
@@ -781,8 +784,9 @@ where
 
 #[cfg(test)]
 mod cfg_test_transport_contract {
-    use super::{Candidate, RequestRegistration, RequestTransport, request_with_scripted};
-    use crate::ReceivedMessageInfo;
+    use super::{
+        Candidate, ReceivedPacket, RequestRegistration, RequestTransport, request_with_scripted,
+    };
     use crate::{DecodeError, DecodeErrorKind, Error, Result};
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr};
@@ -845,7 +849,7 @@ mod cfg_test_transport_contract {
                     Ok((Bytes::from_static(b"ready"), target()))
                 })
             },
-            |_, _| Ok(Candidate::Accept(())),
+            |_| Ok(Candidate::Accept(())),
         )
         .await
         .unwrap_err();
@@ -862,7 +866,7 @@ mod cfg_test_transport_contract {
                 starts.fetch_add(1, Ordering::Relaxed);
                 futures_util::stream::pending::<Result<(Bytes, SocketAddr)>>()
             },
-            |_, _| Ok(Candidate::Accept(())),
+            |_| Ok(Candidate::Accept(())),
         );
         tokio::pin!(receive);
 
@@ -908,7 +912,8 @@ mod cfg_test_transport_contract {
             b"request",
             registration,
             move |_| futures_util::stream::iter(candidates),
-            |data, _| {
+            |packet| {
+                let (data, _) = packet.into_parts();
                 validations += 1;
                 if validations == 1 {
                     Ok(Candidate::Reject)
@@ -946,7 +951,8 @@ mod cfg_test_transport_contract {
             b"request",
             RequestRegistration::test_unchecked(3, Duration::from_secs(1)),
             move |_| futures_util::stream::iter(candidates),
-            move |_, _| {
+            move |packet| {
+                let (_, _) = packet.into_parts();
                 was_validated.store(true, Ordering::Relaxed);
                 Ok(Candidate::Accept(()))
             },
@@ -982,7 +988,7 @@ mod cfg_test_transport_contract {
                     Ok((Bytes::from_static(b"rejected"), target()))
                 })
             },
-            |_, _| Ok::<_, Box<Error>>(Candidate::<()>::Reject),
+            |_| Ok::<_, Box<Error>>(Candidate::<()>::Reject),
         ));
 
         tokio::task::yield_now().await;
@@ -1025,7 +1031,7 @@ mod cfg_test_transport_contract {
                     std::future::pending::<Result<(Bytes, SocketAddr)>>().await
                 })
             },
-            |_, _| Ok(Candidate::Accept(())),
+            |_| Ok(Candidate::Accept(())),
         ));
 
         assert!(futures::poll!(receive.as_mut()).is_pending());
@@ -1057,7 +1063,7 @@ mod cfg_test_transport_contract {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             let registered = Arc::clone(&self.registered);
             let sent = Arc::clone(&self.sent);
@@ -1100,7 +1106,10 @@ mod cfg_test_transport_contract {
             .request_with(
                 b"request",
                 RequestRegistration::test_unchecked(6, Duration::from_secs(1)),
-                |data, source| Ok(Candidate::Accept((data, source.peer_addr()))),
+                |packet| {
+                    let (data, source) = packet.into_parts();
+                    Ok(Candidate::Accept((data, source.peer_addr())))
+                },
             )
             .await
             .unwrap();

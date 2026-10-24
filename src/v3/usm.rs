@@ -262,6 +262,8 @@ impl UsmSecurityParams {
         target: SocketAddr,
         config: DecodeConfig,
     ) -> Result<DecodeOutcome<Self>> {
+        #[cfg(test)]
+        crate::v3::prepared::test_counts::record(|counts| counts.usm += 1);
         let anomalies = std::cell::RefCell::new(Vec::new());
         let mut decoder = Decoder::with_context(data, base_offset, Some(target))
             .with_decode_config(config)

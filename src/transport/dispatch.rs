@@ -97,7 +97,7 @@ impl DispatchRoles {
     }
     pub(crate) fn dispatch(
         self: &Arc<Self>,
-        message: ReceivedMessage,
+        mut message: ReceivedMessage,
         core: Arc<UdpCore>,
         tasks: &mut JoinSet<()>,
     ) {
@@ -170,14 +170,19 @@ impl DispatchRoles {
         } else {
             None
         };
+        let mut buffers = super::framing::BufferPermits {
+            _local: buffer,
+            _shared: peer_buffer,
+        };
         let roles = self.clone();
         tasks.spawn(async move {
             let mut client_context = candidate;
             let class = roles.classify(
-                &message,
+                &mut message,
                 registration.as_ref(),
                 envelope,
                 &mut client_context,
+                &mut buffers,
             );
             let is_response = matches!(class, Ok(Some(PduType::Response | PduType::Report)));
             if is_response || (client_context && !matches!(class, Ok(Some(_)))) {
@@ -185,16 +190,7 @@ impl DispatchRoles {
                     && let Some(envelope) = envelope
                     && let Some(id) = envelope.request_id(&message.bytes)
                 {
-                    core.deliver_parsed_buffered(
-                        id,
-                        envelope,
-                        message.bytes,
-                        message.info,
-                        super::framing::BufferPermits {
-                            _local: buffer,
-                            _shared: peer_buffer,
-                        },
-                    );
+                    core.deliver_parsed_buffered(id, envelope, message.into_packet(), buffers);
                 } else {
                     message.observe(super::MessageDisposition::Unmatched);
                 }
@@ -211,18 +207,24 @@ impl DispatchRoles {
                 let Ok(app_buffer) = roles
                     .application_bytes
                     .clone()
-                    .try_acquire_many_owned(message.bytes.len() as u32)
+                    .try_acquire_many_owned(message.buffered_len() as u32)
+                    .or_else(|_| {
+                        message.discard_cached_plaintext();
+                        roles
+                            .application_bytes
+                            .clone()
+                            .try_acquire_many_owned(message.bytes.len() as u32)
+                    })
                 else {
                     message.observe(super::MessageDisposition::Overloaded);
                     roles.note_drop();
                     return;
                 };
                 drop(slot);
-                drop(buffer);
-                drop(peer_buffer);
-                (app_slot, app_buffer)
+                drop(buffers);
+                (app_slot, app_buffer.into())
             } else {
-                (slot, buffer)
+                (slot, buffers)
             };
             let commands = roles
                 .commands
@@ -271,8 +273,8 @@ impl DispatchRoles {
     /// framing deadlines. Mixed-role sessions fail immediately on app overload.
     pub(crate) async fn dispatch_tcp(
         self: &Arc<Self>,
-        message: ReceivedMessage,
-        buffers: super::framing::BufferPermits,
+        mut message: ReceivedMessage,
+        mut buffers: super::framing::BufferPermits,
         core: Arc<UdpCore>,
         ingress: &ApplicationIngress,
         tasks: &mut JoinSet<()>,
@@ -289,10 +291,11 @@ impl DispatchRoles {
         };
         let mut client_context = registration.is_some();
         let class = self.classify(
-            &message,
+            &mut message,
             registration.as_ref(),
             envelope,
             &mut client_context,
+            &mut buffers,
         );
         if matches!(class, Ok(Some(PduType::Response | PduType::Report)))
             || (client_context && !matches!(class, Ok(Some(_))))
@@ -301,7 +304,7 @@ impl DispatchRoles {
                 && let Some(envelope) = envelope
                 && let Some(id) = envelope.request_id(&message.bytes)
             {
-                core.deliver_parsed_buffered(id, envelope, message.bytes, message.info, buffers);
+                core.deliver_parsed_buffered(id, envelope, message.into_packet(), buffers);
             } else {
                 message.observe(super::MessageDisposition::Unmatched);
             }
@@ -400,15 +403,15 @@ impl DispatchRoles {
     }
     fn classify(
         &self,
-        message: &ReceivedMessage,
+        message: &mut ReceivedMessage,
         registration: Option<&RequestRegistration>,
         envelope: Option<CorrelationEnvelope>,
         client_context: &mut bool,
+        buffers: &mut super::framing::BufferPermits,
     ) -> Result<Option<PduType>> {
-        let decode = crate::DecodeConfig {
-            malformed_exception_payloads: true,
-            ..crate::DecodeConfig::DEFAULT
-        };
+        // Scoped classification reads only tags; exception-payload policy is
+        // irrelevant here. Match default header policy to enable exact reuse.
+        let decode = crate::DecodeConfig::DEFAULT;
         let source = message.info.peer_addr();
         let version = match envelope {
             Some(envelope) => envelope.version,
@@ -427,80 +430,123 @@ impl DispatchRoles {
                     message.reply.limits.receive.accepted(),
                     source,
                     decode,
-                )?
-                .value;
+                )?;
                 let usm = UsmSecurityParams::decode_with_context(
-                    raw.security_params.clone(),
-                    raw.security_params_offset,
+                    raw.value.security_params.clone(),
+                    raw.value.security_params_offset,
                     source,
                     decode,
-                )?
-                .value;
-                let level = raw.security_level();
-                // Failure ownership follows the pending exchange's security
-                // identity, including its known authoritative engine. Sharing a
-                // user's keys does not turn a rejected response into a request.
-                *client_context = registration.is_some_and(|registration| {
-                    registration
-                        .classification_security
-                        .as_ref()
-                        .is_none_or(|context| {
-                            context.usm.username() == &usm.username
-                                && context
-                                    .engine_id
-                                    .as_ref()
-                                    .is_none_or(|id| id == &usm.engine_id)
-                        })
-                });
-                // Plaintext only supplies an untrusted class; the selected role
-                // performs all security checks before user-visible acceptance.
-                if let RawMsgData::Plaintext { data, offset } = &raw.msg_data {
-                    return scoped_pdu_class(data.clone(), *offset, source);
-                }
-                let keys = if let Some(user) = self.users.get(&usm.username) {
-                    user.derive_keys(&usm.engine_id)
-                } else if let Some(config) = registration
-                    .and_then(|r| r.classification_security.as_ref())
-                    .map(|context| &context.usm)
-                    .filter(|c| c.username() == &usm.username)
-                {
-                    config.derive_keys_inner(&usm.engine_id)
-                } else {
-                    *client_context = registration.is_some();
-                    return Ok(None);
-                }
-                .map_err(|_| Error::Auth { target: source }.boxed())?;
-                let auth = keys
-                    .auth_key
-                    .as_ref()
-                    .ok_or_else(|| Error::Auth { target: source }.boxed())?;
-                let (offset, length) = UsmSecurityParams::find_auth_params_offset(&message.bytes)
-                    .ok_or_else(|| Error::Auth { target: source }.boxed())?;
-                let envelope = envelope.ok_or_else(|| Error::Auth { target: source }.boxed())?;
-                if !level.requires_auth()
-                    || !crate::v3::auth::verify_message(
-                        auth,
-                        &message.bytes[..envelope.content_end],
-                        offset,
-                        length,
-                    )
-                    .map_err(|_| Error::Auth { target: source }.boxed())?
-                {
-                    return Err(Error::Auth { target: source }.boxed());
-                }
-                let key = keys
-                    .priv_key
-                    .as_ref()
-                    .ok_or_else(|| Error::Auth { target: source }.boxed())?;
-                let RawMsgData::Encrypted(data) = &raw.msg_data else {
-                    unreachable!()
-                };
-                let decrypted = key
-                    .decrypt(data, usm.engine_boots, usm.engine_time, &usm.priv_params)
-                    .map_err(|_| Error::Auth { target: source }.boxed())?;
-                scoped_pdu_class(decrypted, 0, source)
+                )?;
+                let mut prepared = Box::new(crate::v3::prepared::PreparedV3::new(
+                    message.bytes.clone(),
+                    decode,
+                    raw,
+                    usm,
+                ));
+                let result = self.classify_v3(
+                    &message.bytes,
+                    source,
+                    registration,
+                    envelope,
+                    client_context,
+                    buffers,
+                    &mut prepared,
+                );
+                message.prepared = Some(prepared);
+                result
             }
         }
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn classify_v3(
+        &self,
+        bytes: &Bytes,
+        source: SocketAddr,
+        registration: Option<&RequestRegistration>,
+        envelope: Option<CorrelationEnvelope>,
+        client_context: &mut bool,
+        buffers: &mut super::framing::BufferPermits,
+        prepared: &mut crate::v3::prepared::PreparedV3,
+    ) -> Result<Option<PduType>> {
+        let raw = &prepared.raw.as_ref().unwrap().value;
+        let usm = &prepared.usm.as_ref().unwrap().value;
+        let level = raw.security_level();
+        *client_context = registration.is_some_and(|registration| {
+            registration
+                .classification_security
+                .as_ref()
+                .is_none_or(|context| {
+                    context.usm.username() == &usm.username
+                        && context
+                            .engine_id
+                            .as_ref()
+                            .is_none_or(|id| id == &usm.engine_id)
+                })
+        });
+        if let RawMsgData::Plaintext { data, offset } = &raw.msg_data {
+            return scoped_pdu_class(data.clone(), *offset, source);
+        }
+        let (keys, identity) = if let Some(user) = self.users.get(&usm.username) {
+            (user.derive_keys(&usm.engine_id), user.credential_identity())
+        } else if let Some(config) = registration
+            .and_then(|r| r.classification_security.as_ref())
+            .map(|context| &context.usm)
+            .filter(|c| c.username() == &usm.username)
+        {
+            (
+                config.derive_keys_inner(&usm.engine_id),
+                config.credential_identity(),
+            )
+        } else {
+            *client_context = registration.is_some();
+            return Ok(None);
+        };
+        let keys = keys.map_err(|_| Error::Auth { target: source }.boxed())?;
+        let auth = keys
+            .auth_key
+            .as_ref()
+            .ok_or_else(|| Error::Auth { target: source }.boxed())?;
+        let (offset, length) = UsmSecurityParams::find_auth_params_offset(bytes)
+            .ok_or_else(|| Error::Auth { target: source }.boxed())?;
+        let envelope = envelope.ok_or_else(|| Error::Auth { target: source }.boxed())?;
+        if !level.requires_auth()
+            || !crate::v3::auth::verify_message(
+                auth,
+                &bytes[..envelope.content_end],
+                offset,
+                length,
+            )
+            .map_err(|_| Error::Auth { target: source }.boxed())?
+        {
+            return Err(Error::Auth { target: source }.boxed());
+        }
+        let key = keys
+            .priv_key
+            .as_ref()
+            .ok_or_else(|| Error::Auth { target: source }.boxed())?;
+        let RawMsgData::Encrypted(data) = &raw.msg_data else {
+            unreachable!()
+        };
+        let decrypted = key
+            .decrypt(data, usm.engine_boots, usm.engine_time, &usm.priv_params)
+            .map_err(|_| Error::Auth { target: source }.boxed());
+        let (class, plaintext) = match decrypted {
+            Ok(decrypted) => {
+                let class = scoped_pdu_class(decrypted.clone(), 0, source);
+                // Retention is optional: one-input budgets remain usable and
+                // cache admission must never await another frame's release.
+                let plaintext = buffers.try_extend(decrypted.len()).then_some(decrypted);
+                (class, plaintext)
+            }
+            Err(error) => (Err(error), None),
+        };
+        prepared.crypto = Some(crate::v3::prepared::PreparedCrypto {
+            identity,
+            engine_id: usm.engine_id.clone(),
+            keys,
+            plaintext,
+        });
+        class
     }
 }
 
@@ -553,3 +599,7 @@ async fn acquire_tcp(
             .map_err(|_| Error::Config("TCP application admission closed".into()).boxed())
     }
 }
+
+#[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+#[path = "dispatch_prepared_tests.rs"]
+mod prepared_tests;

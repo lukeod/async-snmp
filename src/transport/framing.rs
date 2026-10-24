@@ -66,6 +66,36 @@ pub(crate) struct BufferPermits {
     pub(crate) _local: OwnedSemaphorePermit,
     pub(crate) _shared: Option<OwnedSemaphorePermit>,
 }
+impl BufferPermits {
+    /// Best-effort retention never waits for a second input-sized reservation.
+    pub(crate) fn try_extend(&mut self, bytes: usize) -> bool {
+        let Ok(local) = self
+            ._local
+            .semaphore()
+            .clone()
+            .try_acquire_many_owned(bytes as u32)
+        else {
+            return false;
+        };
+        let shared = if let Some(current) = &self._shared {
+            let Ok(extra) = current
+                .semaphore()
+                .clone()
+                .try_acquire_many_owned(bytes as u32)
+            else {
+                return false;
+            };
+            Some(extra)
+        } else {
+            None
+        };
+        self._local.merge(local);
+        if let Some(extra) = shared {
+            self._shared.as_mut().unwrap().merge(extra);
+        }
+        true
+    }
+}
 impl From<OwnedSemaphorePermit> for BufferPermits {
     fn from(permit: OwnedSemaphorePermit) -> Self {
         Self {

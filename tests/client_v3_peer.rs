@@ -3542,7 +3542,7 @@ async fn scripted_transport_returns_arbitrary_bytes_without_id_filtering() {
             999,
             tokio::time::Instant::now() + Duration::from_secs(5),
         ),
-        |data, source| Ok(async_snmp::Candidate::Accept((data, source))),
+        |packet| Ok(async_snmp::Candidate::Accept(packet.into_parts())),
     )
     .await
     .unwrap();
@@ -3573,7 +3573,7 @@ async fn report_builder_uses_reporting_engine_context() {
             41,
             tokio::time::Instant::now() + Duration::from_secs(5),
         ),
-        |data, source| Ok(async_snmp::Candidate::Accept((data, source))),
+        |packet| Ok(async_snmp::Candidate::Accept(packet.into_parts())),
     )
     .await
     .unwrap();

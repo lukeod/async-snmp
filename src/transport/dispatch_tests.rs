@@ -262,7 +262,8 @@ async fn colliding_community_ids_deliver_each_role_for_same_and_distinct_peers()
                 .request_with(
                     &community(crate::Pdu::get_request(41, &[get_oid()])),
                     registration(41),
-                    move |bytes, _| {
+                    move |packet| {
+                        let (bytes, _) = packet.into_parts();
                         count.fetch_add(1, Ordering::Relaxed);
                         let decoded =
                             CommunityMessage::decode(bytes, crate::DecodeConfig::DEFAULT)?
@@ -341,7 +342,7 @@ async fn role_closure_and_root_abort_propagate_to_their_own_scope() {
             .request_with(
                 &community(crate::Pdu::get_request(4, &[get_oid()])),
                 registration(4),
-                |_, _| Ok(Candidate::Accept(())),
+                |_| Ok(Candidate::Accept(())),
             )
             .await
     });
@@ -559,7 +560,8 @@ async fn encrypted_collisions_select_commands_informs_and_remote_traps_without_c
         let count = calls.clone();
         let request = tokio::spawn(async move {
             handle
-                .request_with(&bytes, registration, move |_, _| {
+                .request_with(&bytes, registration, move |packet| {
+                    let (_, _) = packet.into_parts();
                     count.fetch_add(1, Ordering::Relaxed);
                     Ok(Candidate::Accept(()))
                 })
@@ -665,7 +667,8 @@ async fn failed_client_security_never_reenters_application_or_publishes_reports(
         let count = calls.clone();
         let pending = tokio::spawn(async move {
             handle
-                .request_with(&data, registration, move |_, _| {
+                .request_with(&data, registration, move |packet| {
+                    let (_, _) = packet.into_parts();
                     if count.fetch_add(1, Ordering::Relaxed) == 0 {
                         Ok(Candidate::Reject)
                     } else {
@@ -876,7 +879,7 @@ async fn one_peers_parked_candidates_leave_response_bytes_for_other_peers() {
     let mut pending = Vec::new();
     for id in 1..=80 {
         let mut exchange = Box::pin(
-            handle.request_with(&request, registration(id), |_, _| Ok(Candidate::Accept(()))),
+            handle.request_with(&request, registration(id), |_| Ok(Candidate::Accept(()))),
         );
         tokio::select! {
             result = &mut exchange => panic!("request completed before peer received it: {result:?}"),
@@ -914,7 +917,7 @@ async fn one_peers_parked_candidates_leave_response_bytes_for_other_peers() {
             .request_with(
                 &community(crate::Pdu::get_request(90, &[get_oid()])),
                 registration(90),
-                |_, _| Ok(Candidate::Accept(())),
+                |_| Ok(Candidate::Accept(())),
             )
             .await
     });
@@ -991,7 +994,7 @@ async fn root_abort_ends_attached_consumer_and_pending_exchange() {
             .request_with(
                 &community(crate::Pdu::get_request(1, &[get_oid()])),
                 registration(1),
-                |_, _| Ok(Candidate::Accept(())),
+                |_| Ok(Candidate::Accept(())),
             )
             .await
     });

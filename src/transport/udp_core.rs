@@ -93,6 +93,7 @@ impl RegistrationOwner {
 struct ResponseCandidate {
     data: Bytes,
     info: crate::ReceivedMessageInfo,
+    prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
     // Retained through validation; accepted public values are caller-owned and
     // no longer count against transport buffering.
     _permit: Option<super::framing::BufferPermits>,
@@ -456,6 +457,7 @@ impl UdpCore {
             ResponseCandidate {
                 data,
                 info,
+                prepared: None,
                 _permit: None,
             },
         )
@@ -474,6 +476,7 @@ impl UdpCore {
             ResponseCandidate {
                 data,
                 info,
+                prepared: None,
                 _permit: None,
             },
         )
@@ -483,16 +486,17 @@ impl UdpCore {
         &self,
         request_id: i32,
         envelope: CorrelationEnvelope,
-        data: Bytes,
-        info: crate::ReceivedMessageInfo,
+        packet: crate::ReceivedPacket,
         permit: super::framing::BufferPermits,
     ) -> bool {
+        let (data, info, prepared) = packet.into_prepared();
         self.deliver_with_envelope(
             request_id,
             Some(envelope),
             ResponseCandidate {
                 data,
                 info,
+                prepared,
                 _permit: Some(permit),
             },
         )
@@ -532,6 +536,7 @@ impl UdpCore {
         let ResponseCandidate {
             data,
             info,
+            prepared,
             _permit,
         } = candidate;
         let source = info.peer_addr();
@@ -608,6 +613,7 @@ impl UdpCore {
             slot.responses.push_back(ResponseCandidate {
                 data,
                 info,
+                prepared,
                 _permit,
             });
             let notify = slot.owner.notify.clone();
@@ -677,7 +683,7 @@ impl UdpCore {
         mut validate: F,
     ) -> Result<T>
     where
-        F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>>,
+        F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>>,
     {
         let request_id = registration.primary;
         let shard = self.shard(request_id);
@@ -728,11 +734,14 @@ impl UdpCore {
             if let Some(ResponseCandidate {
                 data,
                 info,
+                prepared,
                 _permit,
             }) = response
             {
                 let source = info.peer_addr();
-                let validation = validate(data, info);
+                let mut packet = crate::ReceivedPacket::new(data, info);
+                packet.prepared = prepared;
+                let validation = validate(packet);
                 self.observation.disposition(
                     info,
                     if matches!(validation, Ok(Candidate::Accept(_))) {
@@ -773,7 +782,8 @@ impl UdpCore {
         registration: &UdpRegistration,
         target: SocketAddr,
     ) -> Result<(Bytes, SocketAddr)> {
-        self.wait_for_response_with(registration, target, |data, source| {
+        self.wait_for_response_with(registration, target, |packet| {
+            let (data, source) = packet.into_parts();
             Ok(Candidate::Accept((data, source.peer_addr())))
         })
         .await
@@ -992,7 +1002,8 @@ mod tests {
         assert!(core.deliver(8, Bytes::from_static(b"accept"), addr));
 
         let accepted = core
-            .wait_for_response_with(&registration, addr, |data, _| {
+            .wait_for_response_with(&registration, addr, |packet| {
+                let (data, _) = packet.into_parts();
                 if data.as_ref() == b"accept" {
                     Ok(Candidate::Accept(data))
                 } else {
@@ -1203,7 +1214,8 @@ mod tests {
 
         let mut validations = 0;
         let error = core
-            .wait_for_response_with(&registration, target, |data, source| {
+            .wait_for_response_with(&registration, target, |packet| {
+                let (data, source) = packet.into_parts();
                 validations += 1;
                 Ok(Candidate::Accept((data, source.peer_addr())))
             })

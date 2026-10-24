@@ -1076,11 +1076,7 @@ impl RequestTransport for ScriptedTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(
-                Bytes,
-                async_snmp::ReceivedMessageInfo,
-            ) -> async_snmp::Result<async_snmp::Candidate<T>>
-            + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<async_snmp::Candidate<T>> + Send,
     {
         let request_id = registration.request_id();
         let (request, step) = self
@@ -1109,7 +1105,9 @@ impl RequestTransport for ScriptedTransport {
                         tokio::time::Instant::now(),
                         reply.len(),
                     );
-                    if let async_snmp::Candidate::Accept(value) = validate(reply, info)? {
+                    if let async_snmp::Candidate::Accept(value) =
+                        validate(async_snmp::ReceivedPacket::new(reply, info))?
+                    {
                         return Ok(value);
                     }
                 }
@@ -1130,7 +1128,7 @@ impl RequestTransport for ScriptedTransport {
                     tokio::time::Instant::now(),
                     reply.len(),
                 );
-                match validate(reply, info)? {
+                match validate(async_snmp::ReceivedPacket::new(reply, info))? {
                     async_snmp::Candidate::Accept(value) => Ok(value),
                     async_snmp::Candidate::Reject => Err(Error::Timeout {
                         target: self.0.peer,

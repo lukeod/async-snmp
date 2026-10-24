@@ -60,7 +60,7 @@ impl RequestTransport for ExternalTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
         self.inner.deadlines_armed.fetch_add(1, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
@@ -112,7 +112,7 @@ impl RequestTransport for ExternalTransport {
                 tokio::time::Instant::now(),
                 data.len(),
             );
-            match validate(data, info)? {
+            match validate(async_snmp::ReceivedPacket::new(data, info))? {
                 Candidate::Accept(value) => return Ok(value),
                 Candidate::Reject => continue,
             }
@@ -192,7 +192,7 @@ impl RequestTransport for ImmediateResponseTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
         let (sender, receiver) = oneshot::channel();
         assert!(self.inner.pending.lock().unwrap().replace(sender).is_none());
@@ -235,7 +235,7 @@ impl RequestTransport for ImmediateResponseTransport {
             tokio::time::Instant::now(),
             data.len(),
         );
-        match validate(data, info)? {
+        match validate(async_snmp::ReceivedPacket::new(data, info))? {
             Candidate::Accept(value) => Ok(value),
             Candidate::Reject => Err(Error::MalformedResponse {
                 target: self.inner.peer,
@@ -293,7 +293,8 @@ async fn complete_exchange_registers_before_an_immediate_response() {
     );
 
     let received = transport
-        .request_with(b"request", registration, |data, source| {
+        .request_with(b"request", registration, |packet| {
+            let (data, source) = packet.into_parts();
             Ok(Candidate::Accept((data, source)))
         })
         .await
@@ -334,7 +335,7 @@ impl RequestTransport for ReadyReceiveTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
         if self.error {
             Err(Error::Config("immediate receive error".into()).boxed())
@@ -368,7 +369,7 @@ async fn complete_exchange_can_return_local_error_without_sending() {
         .request_with(
             b"request",
             RequestRegistration::v3(1, deadline_after(Duration::from_secs(1))),
-            |data, source| Ok(Candidate::Accept((data, source))),
+            |packet| Ok(Candidate::Accept(packet.into_parts())),
         )
         .await
         .unwrap_err();
@@ -394,7 +395,7 @@ impl RequestTransport for SlowExchangeTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
         let started = tokio::time::Instant::now();
         tokio::time::timeout_at(registration.deadline(), async {
@@ -430,7 +431,7 @@ async fn complete_exchange_deadline_includes_send_and_receive() {
     let request = SlowExchangeTransport.request_with(
         b"request",
         RequestRegistration::v3(1, deadline_after(Duration::from_secs(5))),
-        |data, source| Ok(Candidate::Accept((data, source))),
+        |packet| Ok(Candidate::Accept(packet.into_parts())),
     );
     tokio::pin!(request);
     assert!(futures::poll!(request.as_mut()).is_pending());
@@ -477,7 +478,7 @@ impl RequestTransport for FiniteCapacityTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
         if data.len() > self.send_capacity() {
             return Err(Error::OutboundMessageTooLarge {
@@ -517,7 +518,8 @@ async fn complete_exchange_rejects_capacity_before_receive_setup() {
     let registration = RequestRegistration::v3(1, deadline_after(Duration::from_secs(1)));
 
     let error = transport
-        .request_with(b"12345", registration, |data, source| {
+        .request_with(b"12345", registration, |packet| {
+            let (data, source) = packet.into_parts();
             Ok(Candidate::Accept((data, source)))
         })
         .await
@@ -546,7 +548,7 @@ impl RequestTransport for PendingSendTransport {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
         panic!("receive is unused by the standalone-send test")
     }
@@ -630,7 +632,8 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
     );
     let mut candidates = 0;
     let accepted = exact
-        .request_with(b"request", registration, |_, source| {
+        .request_with(b"request", registration, |packet| {
+            let (_, source) = packet.into_parts();
             candidates += 1;
             if candidates == 1 {
                 Ok(Candidate::Reject)
@@ -663,7 +666,7 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
                 Bytes::from_static(b"public"),
                 CommunityResponsePolicy::AllowMismatchFromTarget,
             ),
-            |data, source| Ok(Candidate::Accept((data, source))),
+            |packet| Ok(Candidate::Accept(packet.into_parts())),
         )
         .await
         .unwrap();
@@ -687,7 +690,7 @@ async fn custom_transport_enforces_identity_policies_and_keeps_one_deadline() {
                 Bytes::from_static(b"public"),
                 CommunityResponsePolicy::AllowMismatchFromAnySource,
             ),
-            |data, source| Ok(Candidate::Accept((data, source))),
+            |packet| Ok(Candidate::Accept(packet.into_parts())),
         )
         .await
         .unwrap();
@@ -809,7 +812,7 @@ impl RequestTransport for RegistrationPolicyProbe {
     ) -> async_snmp::Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, async_snmp::ReceivedMessageInfo) -> async_snmp::Result<Candidate<T>> + Send,
+        F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
         self.policies
             .lock()

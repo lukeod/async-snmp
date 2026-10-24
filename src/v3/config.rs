@@ -45,6 +45,9 @@ enum UsmCredentials {
 /// internals, encoded message buffers, or kernel copies.
 #[derive(Clone)]
 pub struct UsmConfig {
+    // Clones identify the same immutable credentials until a credential or
+    // backend configurator replaces them. Context names do not affect keys.
+    identity: std::sync::Arc<()>,
     username: Bytes,
     credentials: UsmCredentials,
     context_name: Bytes,
@@ -179,6 +182,10 @@ impl UsmUser {
         self.config.validate_and_precompute()
     }
 
+    pub(crate) fn credential_identity(&self) -> std::sync::Arc<()> {
+        self.config.identity.clone()
+    }
+
     pub(crate) fn derive_keys(&self, engine_id: &[u8]) -> CryptoResult<DerivedKeys> {
         self.config.derive_keys_inner(engine_id)
     }
@@ -200,6 +207,7 @@ impl UsmConfig {
     /// Create a noAuthNoPriv USM config with the given username.
     pub fn new(username: impl Into<Bytes>) -> Self {
         Self {
+            identity: std::sync::Arc::new(()),
             username: username.into(),
             credentials: UsmCredentials::NoAuthNoPriv,
             context_name: Bytes::new(),
@@ -217,6 +225,7 @@ impl UsmConfig {
         protocol: AuthProtocol,
         password: impl AsRef<[u8]>,
     ) -> CryptoResult<Self> {
+        self.identity = std::sync::Arc::new(());
         self.credentials = UsmCredentials::Passwords {
             auth: (protocol, Password(password.as_ref().to_vec())),
             privacy: None,
@@ -237,6 +246,7 @@ impl UsmConfig {
         priv_protocol: PrivProtocol,
         priv_password: impl AsRef<[u8]>,
     ) -> CryptoResult<Self> {
+        self.identity = std::sync::Arc::new(());
         self.credentials = UsmCredentials::Passwords {
             auth: (auth_protocol, Password(auth_password.as_ref().to_vec())),
             privacy: Some((priv_protocol, Password(priv_password.as_ref().to_vec()))),
@@ -253,6 +263,7 @@ impl UsmConfig {
         if !backend.is_compiled() {
             return Err(CryptoError::BackendNotCompiled(backend));
         }
+        self.identity = std::sync::Arc::new(());
         self.crypto_backend = backend;
         self.crypto_backend_explicit = true;
         self.validate_credential_capabilities()?;
@@ -297,6 +308,7 @@ impl UsmConfig {
             self.crypto_backend.validate_priv_protocol(protocol)?;
         }
         master_keys.set_crypto_backend(self.crypto_backend);
+        self.identity = std::sync::Arc::new(());
         self.credentials = UsmCredentials::MasterKeys(master_keys);
         Ok(self)
     }
@@ -429,6 +441,10 @@ impl UsmConfig {
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     pub fn derive_keys(&self, engine_id: &[u8]) -> crate::v3::CryptoResult<DerivedKeys> {
         self.derive_keys_inner(engine_id)
+    }
+
+    pub(crate) fn credential_identity(&self) -> std::sync::Arc<()> {
+        self.identity.clone()
     }
 
     pub(crate) fn derive_keys_inner(

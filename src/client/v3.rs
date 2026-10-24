@@ -515,17 +515,33 @@ impl<T: RequestTransport> Client<T> {
             let discovery_exchange =
                 self.inner
                     .transport
-                    .request_with(&discovery_data, registration, |data, info| {
+                    .request_with(&discovery_data, registration, |packet| {
+                        let (data, info, prepared) = packet.into_prepared();
                         let source = info.peer_addr();
-                        let Ok(decoded) = RawV3Message::decode_bounded_with_target(
-                            data,
-                            self.inner.transport.receive_limits().accepted(),
-                            source,
-                            self.inner.config.decode_config,
-                        ) else {
+                        let mut prepared = prepared.filter(|p| p.matches(&data));
+                        let decode = match prepared.as_mut() {
+                            Some(p) => p.decode_raw(
+                                data,
+                                self.inner.transport.receive_limits().accepted(),
+                                source,
+                                self.inner.config.decode_config,
+                            ),
+                            None => RawV3Message::decode_bounded_with_target(
+                                data,
+                                self.inner.transport.receive_limits().accepted(),
+                                source,
+                                self.inner.config.decode_config,
+                            ),
+                        };
+                        let Ok(decoded) = decode else {
                             return Ok(Candidate::Reject);
                         };
-                        match self.validate_discovery_response(decoded, &msg_id_window, info) {
+                        match self.validate_discovery_response(
+                            decoded,
+                            &msg_id_window,
+                            info,
+                            prepared,
+                        ) {
                             Ok(response) => Ok(Candidate::Accept(response)),
                             Err(_) => Ok(Candidate::Reject),
                         }
@@ -593,6 +609,7 @@ impl<T: RequestTransport> Client<T> {
         decoded: crate::message::DecodeOutcome<RawV3Message>,
         msg_id_window: &BTreeSet<i32>,
         info: crate::ReceivedMessageInfo,
+        mut prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
     ) -> Result<DiscoveryResponse> {
         let source = info.peer_addr();
         let malformed = || Error::MalformedResponse { target: source }.boxed();
@@ -609,12 +626,15 @@ impl<T: RequestTransport> Client<T> {
         // Decode and validate the candidate before parsing the plaintext PDU,
         // preserving USM-before-scoped-PDU processing order. Boots/time are
         // syntactically decoded but discarded as unauthenticated input.
-        let usm = UsmSecurityParams::decode_with_context(
-            response.security_params.clone(),
-            response.security_params_offset,
-            source,
-            self.inner.config.decode_config,
-        )?;
+        let usm = match prepared.as_mut() {
+            Some(p) => p.decode_usm(&response, source, self.inner.config.decode_config),
+            None => UsmSecurityParams::decode_with_context(
+                response.security_params.clone(),
+                response.security_params_offset,
+                source,
+                self.inner.config.decode_config,
+            ),
+        }?;
         let decode_anomalies = combine_staged_v3_anomalies(decoded.anomalies, usm.anomalies);
         let usm = usm.value;
         let engine_state = crate::v3::discovered_engine_state(
@@ -795,6 +815,7 @@ impl<T: RequestTransport> Client<T> {
         response_data: &[u8],
         response_usm: &UsmSecurityParams,
         received_level: SecurityLevel,
+        prepared: Option<&crate::v3::prepared::PreparedV3>,
     ) -> Result<Arc<()>> {
         let security = self
             .inner
@@ -874,6 +895,13 @@ impl<T: RequestTransport> Client<T> {
             .boxed());
         }
 
+        if prepared
+            .and_then(|p| p.crypto.as_ref())
+            .is_some_and(|crypto| crypto.matches_keys(derived, &response_usm.engine_id))
+        {
+            return Ok(generation);
+        }
+
         let (offset, len) = UsmSecurityParams::find_auth_params_offset(response_data).ok_or_else(
             || {
                 tracing::warn!(target: "async_snmp::client", { peer = %self.peer_addr(), kind = %AuthErrorKind::AuthParamsNotFound }, "authentication failed");
@@ -904,6 +932,7 @@ impl<T: RequestTransport> Client<T> {
         ciphertext: &Bytes,
         usm_params: &UsmSecurityParams,
         source: std::net::SocketAddr,
+        prepared: Option<&mut crate::v3::prepared::PreparedV3>,
     ) -> Result<crate::message::DecodeOutcome<ScopedPdu>> {
         tracing::trace!(target: "async_snmp::client", { ciphertext_len = ciphertext.len() }, "decrypting response");
 
@@ -912,6 +941,14 @@ impl<T: RequestTransport> Client<T> {
             .engine
             .read()
             .map_err(|_| Error::Config("engine lock poisoned".into()).boxed())?;
+        let cached = prepared
+            .and_then(|p| p.crypto.as_mut())
+            .filter(|crypto| {
+                engine.as_ref().is_some_and(|engine| {
+                    crypto.matches_keys(&engine.derived_keys, &usm_params.engine_id)
+                })
+            })
+            .and_then(|crypto| crypto.plaintext.take());
         let priv_key = engine
             .as_ref()
             .and_then(|engine| engine.derived_keys.priv_key.as_ref())
@@ -923,14 +960,9 @@ impl<T: RequestTransport> Client<T> {
                 .boxed()
             })?;
 
-        let plaintext = priv_key
-            .decrypt(
-                ciphertext,
-                usm_params.engine_boots,
-                usm_params.engine_time,
-                &usm_params.priv_params,
-            )
-            .map_err(|e| {
+        let plaintext = cached.map_or_else(|| priv_key.decrypt(
+                ciphertext, usm_params.engine_boots, usm_params.engine_time, &usm_params.priv_params,
+            ), Ok).map_err(|e| {
                 tracing::warn!(target: "async_snmp::crypto", { peer = %self.peer_addr(), error = %e }, "decryption failed");
                 Error::Auth {
                     target: self.peer_addr(),
@@ -951,20 +983,30 @@ impl<T: RequestTransport> Client<T> {
 
     fn validate_v3_candidate(
         &self,
-        response_data: Bytes,
-        info: crate::ReceivedMessageInfo,
+        packet: crate::ReceivedPacket,
         msg_ids: &BTreeSet<i32>,
         request: &EncodedV3Request,
         expected_pdu_id: i32,
         expected_level: SecurityLevel,
     ) -> Result<Candidate<ValidatedV3Response>> {
+        let (response_data, info, prepared) = packet.into_prepared();
         let source = info.peer_addr();
-        let Ok(decoded) = RawV3Message::decode_bounded_with_target(
-            response_data.clone(),
-            self.inner.transport.receive_limits().accepted(),
-            source,
-            self.inner.config.decode_config,
-        ) else {
+        let mut prepared = prepared.filter(|p| p.matches(&response_data));
+        let decode = match prepared.as_mut() {
+            Some(p) => p.decode_raw(
+                response_data.clone(),
+                self.inner.transport.receive_limits().accepted(),
+                source,
+                self.inner.config.decode_config,
+            ),
+            None => RawV3Message::decode_bounded_with_target(
+                response_data.clone(),
+                self.inner.transport.receive_limits().accepted(),
+                source,
+                self.inner.config.decode_config,
+            ),
+        };
+        let Ok(decoded) = decode else {
             return Ok(Candidate::Reject);
         };
         let trailing_bytes = decoded
@@ -982,23 +1024,31 @@ impl<T: RequestTransport> Client<T> {
         let mut decode_anomalies = decoded.anomalies;
         let raw = decoded.value;
         let received_level = raw.security_level();
-        let Ok(usm) = UsmSecurityParams::decode_with_context(
-            raw.security_params.clone(),
-            raw.security_params_offset,
-            source,
-            self.inner.config.decode_config,
-        ) else {
+        let decode_usm = match prepared.as_mut() {
+            Some(p) => p.decode_usm(&raw, source, self.inner.config.decode_config),
+            None => UsmSecurityParams::decode_with_context(
+                raw.security_params.clone(),
+                raw.security_params_offset,
+                source,
+                self.inner.config.decode_config,
+            ),
+        };
+        let Ok(usm) = decode_usm else {
             return Ok(Candidate::Reject);
         };
         decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, usm.anomalies);
         let usm = usm.value;
 
-        let validated_generation =
-            match self.verify_response_security(&authenticated_message, &usm, received_level) {
-                Ok(generation) => generation,
-                Err(error) if matches!(*error, Error::Config(_)) => return Err(error),
-                Err(_) => return Ok(Candidate::Reject),
-            };
+        let validated_generation = match self.verify_response_security(
+            &authenticated_message,
+            &usm,
+            received_level,
+            prepared.as_deref(),
+        ) {
+            Ok(generation) => generation,
+            Err(error) if matches!(*error, Error::Config(_)) => return Err(error),
+            Err(_) => return Ok(Candidate::Reject),
+        };
 
         if received_level.requires_auth() {
             let local_state = self
@@ -1051,7 +1101,7 @@ impl<T: RequestTransport> Client<T> {
                 }
             }
             RawMsgData::Encrypted(ciphertext) => {
-                match self.decrypt_scoped_pdu(ciphertext, &usm, source) {
+                match self.decrypt_scoped_pdu(ciphertext, &usm, source, prepared.as_deref_mut()) {
                     Ok(scoped) => scoped,
                     Err(error) if matches!(*error, Error::Config(_)) => return Err(error),
                     Err(_) => return Ok(Candidate::Reject),
@@ -1194,10 +1244,9 @@ impl<T: RequestTransport> Client<T> {
                 let request_exchange =
                     self.inner
                         .transport
-                        .request_with(&request.data, registration, |data, info| {
+                        .request_with(&request.data, registration, |packet| {
                             self.validate_v3_candidate(
-                                data,
-                                info,
+                                packet,
                                 &msg_id_window,
                                 &request,
                                 pdu.request_id,
@@ -1637,6 +1686,160 @@ mod tests {
     use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
     use std::time::Duration;
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn prepared_client_reuses_crypto_and_rechecks_current_keys() {
+        use crate::v3::prepared::{
+            PreparedCrypto, PreparedV3,
+            test_counts::{Counts, measure},
+        };
+        let engine_id = Bytes::from_static(b"prepared-client-engine");
+        let security = UsmConfig::new("user")
+            .auth_priv(
+                crate::AuthProtocol::Sha256,
+                b"client-authentication",
+                crate::PrivProtocol::Aes128,
+                b"client-privacy",
+            )
+            .unwrap();
+        let keys = security.derive_keys(&engine_id).unwrap();
+        for (decode_config, changed_keys) in [
+            (crate::DecodeConfig::DEFAULT, false),
+            (crate::DecodeConfig::STRICT, false),
+            (crate::DecodeConfig::DEFAULT, true),
+        ] {
+            let client = Client::new(
+                TestTransport::new(),
+                ClientConfig {
+                    auth: crate::Auth::Usm(security.clone()),
+                    decode_config,
+                    ..ClientConfig::default()
+                },
+            )
+            .unwrap();
+            *client.inner.engine.write().unwrap() = Some(ClientEngine::new(
+                EngineState::new(engine_id.clone(), 7, 1000),
+                security.derive_keys(&engine_id).unwrap(),
+            ));
+            let request = client
+                .build_v3_message(&Pdu::get_request(42, &[]), 9, None)
+                .unwrap();
+            let wire: Bytes = crate::v3::encode::encode_v3_message(
+                &Pdu::response(42, 0, 0, vec![]),
+                9,
+                &engine_id,
+                7,
+                1000,
+                &security,
+                Some(&keys),
+                Some(&crate::v3::SaltCounter::new().unwrap()),
+                None,
+                None,
+                false,
+                crate::MessageSize::new(8192).unwrap(),
+            )
+            .unwrap()
+            .into();
+            if changed_keys {
+                let changed = UsmConfig::new("user")
+                    .auth_priv(
+                        crate::AuthProtocol::Sha256,
+                        b"different-authentication",
+                        crate::PrivProtocol::Aes128,
+                        b"client-privacy",
+                    )
+                    .unwrap();
+                client
+                    .inner
+                    .engine
+                    .write()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .derived_keys = changed.derive_keys(&engine_id).unwrap();
+            }
+            let info = crate::ReceivedMessageInfo::udp(
+                crate::EndpointId::new(),
+                client.inner.transport.local_addr(),
+                client.peer_addr(),
+                None,
+                tokio::time::Instant::now(),
+                wire.len(),
+            );
+            let (candidate, counts) = measure(|| {
+                let raw = RawV3Message::decode_bounded_with_target(
+                    wire.clone(),
+                    8192,
+                    info.peer_addr(),
+                    crate::DecodeConfig::DEFAULT,
+                )
+                .unwrap();
+                let usm = UsmSecurityParams::decode_with_context(
+                    raw.value.security_params.clone(),
+                    raw.value.security_params_offset,
+                    info.peer_addr(),
+                    crate::DecodeConfig::DEFAULT,
+                )
+                .unwrap();
+                let (offset, length) = UsmSecurityParams::find_auth_params_offset(&wire).unwrap();
+                assert!(
+                    verify_message(keys.auth_key.as_ref().unwrap(), &wire, offset, length).unwrap()
+                );
+                let RawMsgData::Encrypted(ciphertext) = &raw.value.msg_data else {
+                    unreachable!()
+                };
+                let plaintext = keys
+                    .priv_key
+                    .as_ref()
+                    .unwrap()
+                    .decrypt(
+                        ciphertext,
+                        usm.value.engine_boots,
+                        usm.value.engine_time,
+                        &usm.value.priv_params,
+                    )
+                    .unwrap();
+                let mut prepared =
+                    PreparedV3::new(wire.clone(), crate::DecodeConfig::DEFAULT, raw, usm);
+                prepared.crypto = Some(PreparedCrypto {
+                    identity: security.credential_identity(),
+                    engine_id: engine_id.clone(),
+                    keys: security.derive_keys(&engine_id).unwrap(),
+                    plaintext: Some(plaintext),
+                });
+                let mut packet = crate::ReceivedPacket::new(wire.clone(), info);
+                packet.prepared = Some(Box::new(prepared));
+                client
+                    .validate_v3_candidate(
+                        packet,
+                        &BTreeSet::from([9]),
+                        &request,
+                        42,
+                        SecurityLevel::AuthPriv,
+                    )
+                    .unwrap()
+            });
+            assert_eq!(matches!(candidate, Candidate::Accept(_)), !changed_keys);
+            assert_eq!(
+                counts,
+                Counts {
+                    raw: if decode_config == crate::DecodeConfig::STRICT {
+                        2
+                    } else {
+                        1
+                    },
+                    usm: if decode_config == crate::DecodeConfig::STRICT {
+                        2
+                    } else {
+                        1
+                    },
+                    auth: if changed_keys { 2 } else { 1 },
+                    decrypt: 1
+                }
+            );
+        }
+    }
+
     #[derive(Clone)]
     struct TestTransport {
         peer: SocketAddr,
@@ -1670,7 +1873,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             self.sends.fetch_add(1, Ordering::Relaxed);
             ready(Err(Error::Config(
@@ -2017,7 +2220,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -2081,7 +2284,7 @@ mod tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -2175,7 +2378,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered.notify_waiters();
@@ -2196,7 +2399,7 @@ mod tests {
                 tokio::time::Instant::now(),
                 response.len(),
             );
-            match validate(response, info)? {
+            match validate(crate::ReceivedPacket::new(response, info))? {
                 Candidate::Accept(response) => Ok(response),
                 Candidate::Reject => Err(Error::MalformedResponse { target: self.peer }.boxed()),
             }
@@ -2516,7 +2719,7 @@ mod tests {
             ) -> impl std::future::Future<Output = Result<T>> + Send
             where
                 T: Send,
-                F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+                F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
             {
                 crate::transport::request_with_scripted(
                     self,
@@ -2586,7 +2789,7 @@ mod tests {
             ) -> Result<T>
             where
                 T: Send,
-                F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+                F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
             {
                 self.calls.fetch_add(1, Ordering::Relaxed);
                 std::future::pending().await
@@ -2645,7 +2848,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered.notify_waiters();
@@ -2850,7 +3053,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             Err(Error::Timeout {
@@ -2989,7 +3192,7 @@ mod tests {
         ) -> Result<T>
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             self.calls.fetch_add(1, Ordering::Relaxed);
             self.entered.notify_waiters();
@@ -3132,7 +3335,7 @@ mod response_validation_tests {
         ) -> impl std::future::Future<Output = Result<T>> + Send
         where
             T: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<T>> + Send,
         {
             crate::transport::request_with_scripted(
                 self,
@@ -3193,7 +3396,7 @@ mod response_validation_tests {
         ) -> Result<U>
         where
             U: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<U>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<U>> + Send,
         {
             let response_number = self.response_number.fetch_add(1, Ordering::SeqCst);
             let response = build_deferred_update_response(data, response_number);
@@ -3205,7 +3408,7 @@ mod response_validation_tests {
                 tokio::time::Instant::now(),
                 response.len(),
             );
-            match validate(response, info)? {
+            match validate(crate::ReceivedPacket::new(response, info))? {
                 Candidate::Accept(value) => Ok(value),
                 Candidate::Reject => Err(Error::Timeout {
                     target: self.peer,
@@ -3261,7 +3464,7 @@ mod response_validation_tests {
         ) -> Result<U>
         where
             U: Send,
-            F: FnMut(Bytes, crate::ReceivedMessageInfo) -> Result<Candidate<U>> + Send,
+            F: FnMut(crate::ReceivedPacket) -> Result<Candidate<U>> + Send,
         {
             let request =
                 V3Message::decode(Bytes::copy_from_slice(data), crate::DecodeConfig::default())
@@ -3286,7 +3489,7 @@ mod response_validation_tests {
                 tokio::time::Instant::now(),
                 response.len(),
             );
-            match validate(response, info)? {
+            match validate(crate::ReceivedPacket::new(response, info))? {
                 Candidate::Accept(value) => Ok(value),
                 Candidate::Reject => Err(Error::Timeout {
                     target: self.peer,

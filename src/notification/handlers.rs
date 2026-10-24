@@ -15,7 +15,9 @@ use crate::message::{CommunityMessage, MsgGlobalData};
 use crate::pdu::{Pdu, PduType};
 use crate::v3::UsmSecurityParams;
 use crate::v3::encode::encode_v3_response;
-use crate::v3::process::{UsmFailure, V3Inbound, V3LocalContext, V3Role, process_v3_inbound};
+use crate::v3::process::{
+    UsmFailure, V3Inbound, V3LocalContext, V3Role, process_prepared_v3_inbound,
+};
 
 use super::varbind::extract_notification_varbinds;
 use super::{
@@ -48,6 +50,7 @@ impl super::NotificationProcessor {
             bytes: data,
             info,
             reply: _route,
+            ..
         } = message;
         let source = info.peer_addr();
         let decoded =
@@ -123,6 +126,7 @@ impl super::NotificationProcessor {
             bytes: data,
             info,
             reply: route,
+            prepared: _,
         } = message;
         let source = info.peer_addr();
         let decoded =
@@ -257,7 +261,7 @@ impl super::NotificationProcessor {
     /// Handle `SNMPv3` message.
     ///
     /// USM processing (RFC 3414 Section 3.2) runs in the shared
-    /// [`process_v3_inbound`] core in the receiver role: informs under this
+    /// [`process_prepared_v3_inbound`] core in the receiver role: informs under this
     /// receiver's engine ID use the authoritative time window (Step 7a),
     /// traps under a remote authoritative engine ID use per-engine
     /// timeliness state (Step 7b).
@@ -293,6 +297,7 @@ impl super::NotificationProcessor {
             bytes: data,
             info,
             reply: route,
+            prepared,
         } = message;
         let source = info.peer_addr();
         let (our_boots, our_time) = super::unpack_boots_time(
@@ -322,7 +327,7 @@ impl super::NotificationProcessor {
             remote_engines: &self.inner.remote_engines,
         };
 
-        let inbound = match process_v3_inbound(data, &usm_ctx, &role)? {
+        let inbound = match process_prepared_v3_inbound(data, &usm_ctx, &role, prepared)? {
             V3Inbound::Failed { failure, report } => {
                 // The shared core logs USM failures at debug; re-surface them
                 // at warn in the receiver role so a misconfigured trap sender

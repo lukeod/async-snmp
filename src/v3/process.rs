@@ -4,13 +4,13 @@
 //! Section 3.2 USM step sequence once, for every receiving role. The agent
 //! (authoritative engine) and the notification receiver (non-authoritative
 //! for traps, authoritative for informs) both collapse onto
-//! [`process_v3_inbound`]; role-legitimate differences are carried by
+//! [`process_prepared_v3_inbound`]; role-legitimate differences are carried by
 //! [`V3Role`].
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
@@ -101,7 +101,7 @@ pub(crate) struct MpdCounters<'a> {
     pub(crate) unknown_security_models: &'a AtomicU32,
 }
 
-/// Receiving role for [`process_v3_inbound`], carrying the differences the
+/// Receiving role for [`process_prepared_v3_inbound`], carrying the differences the
 /// RFC assigns to each engine role.
 pub(crate) enum V3Role<'a> {
     /// Authoritative engine (agent): only messages under its own engine ID
@@ -209,19 +209,39 @@ pub(crate) enum V3Inbound {
 /// authentication (Step 6), timeliness (Step 7a/7b per role, with 7a also
 /// covering the RFC 3414 Section 2.3 latched-boots state), decryption, and
 /// scoped-PDU decode.
+#[cfg(test)]
 pub(crate) fn process_v3_inbound(
     data: Bytes,
     ctx: &V3LocalContext<'_>,
     role: &V3Role<'_>,
 ) -> Result<V3Inbound> {
-    let source = ctx.source;
+    process_prepared_v3_inbound(data, ctx, role, None)
+}
 
-    let decoded = match RawV3Message::decode_bounded_with_target(
-        data.clone(),
-        ctx.accepted_receive_size,
-        source,
-        ctx.decode_config,
-    ) {
+pub(crate) fn process_prepared_v3_inbound(
+    data: Bytes,
+    ctx: &V3LocalContext<'_>,
+    role: &V3Role<'_>,
+    prepared: Option<Box<super::prepared::PreparedV3>>,
+) -> Result<V3Inbound> {
+    let source = ctx.source;
+    let mut prepared = prepared.filter(|p| p.matches(&data));
+
+    let decode = match prepared.as_mut() {
+        Some(prepared) => prepared.decode_raw(
+            data.clone(),
+            ctx.accepted_receive_size,
+            source,
+            ctx.decode_config,
+        ),
+        None => RawV3Message::decode_bounded_with_target(
+            data.clone(),
+            ctx.accepted_receive_size,
+            source,
+            ctx.decode_config,
+        ),
+    };
+    let decoded = match decode {
         Ok(outcome) => outcome,
         Err(e) => {
             // RFC 3412 Section 7.2.4/7.2.7: invalid msgFlags and unknown
@@ -254,12 +274,15 @@ pub(crate) fn process_v3_inbound(
     let mut decode_anomalies = decoded.anomalies;
     let msg = decoded.value;
     let security_level = msg.global_data.msg_flags.security_level;
-    let usm_params = UsmSecurityParams::decode_with_context(
-        msg.security_params.clone(),
-        msg.security_params_offset,
-        source,
-        ctx.decode_config,
-    )?;
+    let usm_params = match prepared.as_mut() {
+        Some(prepared) => prepared.decode_usm(&msg, source, ctx.decode_config),
+        None => UsmSecurityParams::decode_with_context(
+            msg.security_params.clone(),
+            msg.security_params_offset,
+            source,
+            ctx.decode_config,
+        ),
+    }?;
     decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, usm_params.anomalies);
     let usm_params = usm_params.value;
 
@@ -324,9 +347,24 @@ pub(crate) fn process_v3_inbound(
     // Keys are localized to the message's (authoritative) engine ID: the
     // local engine ID for the authoritative role and informs, the sender's
     // for traps from a remote authoritative engine.
-    let derived_keys = user_config
-        .derive_keys(&usm_params.engine_id)
-        .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
+    let crypto = prepared
+        .as_mut()
+        .and_then(|p| p.crypto.take())
+        .filter(|crypto| {
+            Arc::ptr_eq(&crypto.identity, &user_config.credential_identity())
+                && crypto.engine_id == usm_params.engine_id
+        });
+    let (derived_keys, mut plaintext, authenticated) = if let Some(crypto) = crypto {
+        (crypto.keys, crypto.plaintext, true)
+    } else {
+        (
+            user_config
+                .derive_keys(&usm_params.engine_id)
+                .map_err(|e| Error::Config(e.to_string().into()).boxed())?,
+            None,
+            false,
+        )
+    };
 
     // RFC 3414 Section 3.2 Step 5: the user must support the requested
     // security level, checked before authentication (Step 6) and
@@ -347,19 +385,21 @@ pub(crate) fn process_v3_inbound(
             .auth_key
             .as_ref()
             .expect("authenticated message without an auth key is rejected at Step 5");
-        let Some((auth_offset, auth_len)) = UsmSecurityParams::find_auth_params_offset(&data)
-        else {
-            // The USM sequence was structurally decoded above, so this is
-            // defensive. At Step 6 an unusable authentication field is
-            // authentication failure, not an uncounted local decode error.
-            tracing::debug!(target: "async_snmp::v3", { source = %source }, "could not locate authentication parameters");
-            return fail(UsmFailure::WrongDigests, None);
-        };
-        if !verify_message(auth_key, &authenticated_data, auth_offset, auth_len)
-            .map_err(|_| Error::Auth { target: source }.boxed())?
-        {
-            tracing::debug!(target: "async_snmp::v3", { snmp.source = %source }, "authentication failed");
-            return fail(UsmFailure::WrongDigests, None);
+        if !authenticated {
+            let Some((auth_offset, auth_len)) = UsmSecurityParams::find_auth_params_offset(&data)
+            else {
+                // The USM sequence was structurally decoded above, so this is
+                // defensive. At Step 6 an unusable authentication field is
+                // authentication failure, not an uncounted local decode error.
+                tracing::debug!(target: "async_snmp::v3", { source = %source }, "could not locate authentication parameters");
+                return fail(UsmFailure::WrongDigests, None);
+            };
+            if !verify_message(auth_key, &authenticated_data, auth_offset, auth_len)
+                .map_err(|_| Error::Auth { target: source }.boxed())?
+            {
+                tracing::debug!(target: "async_snmp::v3", { snmp.source = %source }, "authentication failed");
+                return fail(UsmFailure::WrongDigests, None);
+            }
         }
 
         // RFC 3414 Section 3.2 Step 7: timeliness.
@@ -460,12 +500,16 @@ pub(crate) fn process_v3_inbound(
                 .priv_key
                 .as_ref()
                 .expect("authPriv without a privacy key is rejected at Step 5");
-            let decrypted = match priv_key.decrypt(
-                encrypted_data,
-                usm_params.engine_boots,
-                usm_params.engine_time,
-                &usm_params.priv_params,
-            ) {
+            let decrypt = match plaintext.take() {
+                Some(plaintext) => Ok(plaintext),
+                None => priv_key.decrypt(
+                    encrypted_data,
+                    usm_params.engine_boots,
+                    usm_params.engine_time,
+                    &usm_params.priv_params,
+                ),
+            };
+            let decrypted = match decrypt {
                 Ok(data) => data,
                 Err(e) => {
                     tracing::debug!(target: "async_snmp::v3", { source = %source, error = %e }, "decryption failed");

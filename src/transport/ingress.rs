@@ -36,7 +36,7 @@ impl ApplicationIngress {
     pub(crate) fn is_enabled(&self) -> bool {
         !self.disabled.is_cancelled() && !self.sender.is_closed()
     }
-    pub(crate) fn deliver_udp(&self, message: ReceivedMessage) {
+    pub(crate) fn deliver_udp(&self, mut message: ReceivedMessage) {
         if !self.is_enabled() {
             message.observe(super::MessageDisposition::Disabled);
             return;
@@ -47,12 +47,19 @@ impl ApplicationIngress {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return;
         };
-        let Ok(buffer) = self
+        let buffer = self
             .budget
             .inbound
             .clone()
-            .try_acquire_many_owned(message.bytes.len() as u32)
-        else {
+            .try_acquire_many_owned(message.buffered_len() as u32)
+            .or_else(|_| {
+                message.discard_cached_plaintext();
+                self.budget
+                    .inbound
+                    .clone()
+                    .try_acquire_many_owned(message.bytes.len() as u32)
+            });
+        let Ok(buffer) = buffer else {
             message.observe(super::MessageDisposition::Overloaded);
             self.drops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

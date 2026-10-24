@@ -14,7 +14,7 @@ impl RequestTransport for ContractTransport {
     ) -> Result<T>
     where
         T: Send,
-        F: FnMut(Bytes, ReceivedMessageInfo) -> Result<Candidate<T>> + Send,
+        F: FnMut(ReceivedPacket) -> Result<Candidate<T>> + Send,
     {
         Err(Error::Config("compile-contract transport has no response".into()).boxed())
     }
@@ -41,7 +41,8 @@ fn compile_default_and_generic_surface<T: RequestTransport>(transport: &T) {
     );
 
     assert_send(transport.send(b"request"));
-    assert_send(transport.request_with(b"request", registration, |data, source| {
+    assert_send(transport.request_with(b"request", registration, |packet| {
+                    let (data, source) = packet.into_parts();
         Result::Ok(Candidate::Accept((data, source)))
     }));
 }

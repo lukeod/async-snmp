@@ -784,6 +784,8 @@ impl RawV3Message {
         peer: Option<SocketAddr>,
         config: DecodeConfig,
     ) -> Result<DecodeOutcome<Self>> {
+        #[cfg(test)]
+        crate::v3::prepared::test_counts::record(|counts| counts.raw += 1);
         if data.len() > maximum {
             let mut error = DecodeError::new(
                 0,

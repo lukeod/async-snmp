@@ -28,8 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the sum of receive/send limits; service budgets must accommodate the largest
   inbound partition and largest send capacity across their listeners.
 
-- Shared endpoint dispatch classifies PDU headers without decoding varbinds a
-  second time. Applications retain their own full decoding and security checks.
+- Shared endpoint dispatch retains packet-bound v3 header and cryptographic work
+  for the selected consumer. Applications retain their own decode policy,
+  ordered security checks and timeliness processing. Optional plaintext retention
+  uses available byte permits and falls back to decryption in the consumer.
 
 - **Breaking:** `UdpTransport` is now `UdpEndpoint`. Its builder uses `prepare()`
   for an unstarted endpoint/runner pair, or explicit `spawn()`/`spawn_on()` for a
@@ -40,7 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests, including when the runner is dropped before its first poll.
 
 - **Breaking:** The client exchange trait is named `RequestTransport`; validators
-  receive `ReceivedMessageInfo` alongside the original bytes. Notification results
+  receive a `ReceivedPacket` containing the original bytes and `ReceivedMessageInfo`.
+  Custom transports construct it with `ReceivedPacket::new(bytes, info)`; validators
+  can use `packet.into_parts()` to take both values. Notification results
   and acceptance envelopes expose `receive_info` instead of `source`. Use
   `receive_info.peer_addr()` for the sender and `receive_info.received_len()` for
   the complete encoded SNMP input length, including accepted UDP suffixes.
