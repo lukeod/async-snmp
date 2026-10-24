@@ -64,6 +64,120 @@ fn registration(id: i32) -> RequestRegistration {
 }
 
 #[tokio::test]
+async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses() {
+    use super::dispatch::DispatchRoles;
+    use super::framing::BufferBudget;
+    use super::ingress::ApplicationIngress;
+    use std::collections::HashMap;
+    use tokio::sync::{Semaphore, mpsc};
+    use tokio::task::JoinSet;
+    use tokio_util::sync::CancellationToken;
+
+    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let (observer, mut events) = TransportObserver::channel(16).unwrap();
+    let observation = super::observation::Observation(Some(observer));
+    let responder =
+        Arc::new(crate::udp_responder::UdpResponder::new(&socket).with_observation(observation));
+    let endpoint = EndpointId::new();
+    for version in [crate::CommunityVersion::V1, crate::CommunityVersion::V2c] {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let disabled = CancellationToken::new();
+        let drops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let ingress = ApplicationIngress {
+            admission_hook: None,
+            sender,
+            disabled: disabled.clone(),
+            capacity: Arc::new(Semaphore::new(1)),
+            budget: Arc::new(BufferBudget::new(1024)),
+            overload_timeout: Duration::from_secs(1),
+            drops: drops.clone(),
+            session: None,
+        };
+        let roles = Arc::new(DispatchRoles::new(
+            Some(ingress),
+            None,
+            HashMap::new(),
+            false,
+            1,
+        ));
+        let core = Arc::new(super::udp_core::UdpCore::new());
+        let mut tasks = JoinSet::new();
+        let message = |pdu| {
+            let bytes = match version {
+                crate::CommunityVersion::V1 => CommunityMessage::v1("public", pdu),
+                crate::CommunityVersion::V2c => CommunityMessage::v2c("public", pdu),
+            }
+            .unwrap()
+            .encode()
+            .unwrap();
+            let received = crate::udp_responder::ReceivedDatagram {
+                len: bytes.len(),
+                source: peer.local_addr().unwrap(),
+                destination: None,
+            };
+            let info = ReceivedMessageInfo::udp(
+                endpoint,
+                socket.local_addr().unwrap(),
+                received.source,
+                None,
+                tokio::time::Instant::now(),
+                bytes.len(),
+            );
+            ReceivedMessage::udp(
+                bytes,
+                info,
+                socket.clone(),
+                responder.clone(),
+                received,
+                EndpointLimits::UDP,
+            )
+        };
+
+        let first = message(crate::Pdu::get_request(1, &[get_oid()]));
+        let info = first.info;
+        roles.dispatch(first, core.clone(), &mut tasks);
+        let work = receiver.try_recv().unwrap();
+        assert_eq!(work.message.info, info);
+        assert!(
+            tasks.is_empty(),
+            "command admission must not wait on a classifier task"
+        );
+        roles.dispatch(
+            message(crate::Pdu::get_request(2, &[get_oid()])),
+            core.clone(),
+            &mut tasks,
+        );
+        assert_eq!(drops.load(Ordering::Relaxed), 1);
+        roles.dispatch(
+            message(crate::Pdu::response(3, 0, 0, vec![])),
+            core.clone(),
+            &mut tasks,
+        );
+        assert!(receiver.try_recv().is_err());
+        disabled.cancel();
+        drop(work);
+        roles.dispatch(
+            message(crate::Pdu::get_request(4, &[get_oid()])),
+            core,
+            &mut tasks,
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(tasks.is_empty());
+        for disposition in [
+            MessageDisposition::ApplicationQueued,
+            MessageDisposition::Overloaded,
+            MessageDisposition::Unmatched,
+            MessageDisposition::Disabled,
+        ] {
+            assert!(
+                matches!(events.try_recv().unwrap(), ObservationEvent::Disposition { disposition: actual, .. } if actual == disposition)
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn bidirectional_commands_and_notifications_share_source_ports() {
     let mut a = agent(b"shared-endpoint-a").spawn().await.unwrap();
     let mut b = agent(b"shared-endpoint-b").spawn().await.unwrap();

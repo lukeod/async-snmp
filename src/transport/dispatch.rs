@@ -102,6 +102,26 @@ impl DispatchRoles {
         tasks: &mut JoinSet<()>,
     ) {
         let envelope = CorrelationEnvelope::parse(&message.bytes);
+        // A community message on a command-only endpoint needs only a bounded
+        // header peek to exclude unmatched Responses. Queue it directly into
+        // the agent's admission rather than spawning a classifier task first.
+        // Encrypted/mixed-role messages retain the independently bounded path.
+        if !self.client_exchanges
+            && self.notifications.is_none()
+            && let Some(commands) = &self.commands
+            && let Some(envelope) = envelope
+            && matches!(envelope.version, Version::V1 | Version::V2c)
+        {
+            if matches!(
+                community_pdu_class(&message, envelope),
+                Ok(Some(PduType::Response | PduType::Report))
+            ) {
+                message.observe(super::MessageDisposition::Unmatched);
+            } else {
+                commands.deliver_udp(message);
+            }
+            return;
+        }
         let registration = if self.client_exchanges {
             envelope.and_then(|e| {
                 e.request_id(&message.bytes).and_then(|id| {
@@ -399,14 +419,7 @@ impl DispatchRoles {
                 let Some(envelope) = envelope else {
                     return Ok(None);
                 };
-                let mut decoder = Decoder::with_target(
-                    message
-                        .bytes
-                        .slice(envelope.after_version..envelope.content_end),
-                    source,
-                );
-                decoder.read_octet_string()?; // community
-                peek_pdu_class(&decoder, version)
+                community_pdu_class(message, envelope)
             }
             Version::V3 => {
                 let raw = RawV3Message::decode_bounded_with_target(
@@ -489,6 +502,20 @@ impl DispatchRoles {
             }
         }
     }
+}
+
+fn community_pdu_class(
+    message: &ReceivedMessage,
+    envelope: CorrelationEnvelope,
+) -> Result<Option<PduType>> {
+    let mut decoder = Decoder::with_target(
+        message
+            .bytes
+            .slice(envelope.after_version..envelope.content_end),
+        message.info.peer_addr(),
+    );
+    decoder.read_octet_string()?; // community
+    peek_pdu_class(&decoder, envelope.version)
 }
 
 // Classification only needs the envelope's PDU tag. Leave varbind decoding,
