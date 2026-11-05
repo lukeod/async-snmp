@@ -32,7 +32,7 @@ use crate::v3::{
 
 /// RFC 3414 usmStats counters, shared by every receiving role.
 #[derive(Debug, Default)]
-pub(crate) struct UsmStats {
+pub(crate) struct UsmCounters {
     /// usmStatsUnknownEngineIDs (1.3.6.1.6.3.15.1.1.4)
     pub(crate) unknown_engine_ids: AtomicU32,
     /// usmStatsUnknownUserNames (1.3.6.1.6.3.15.1.1.3)
@@ -47,7 +47,7 @@ pub(crate) struct UsmStats {
     pub(crate) decryption_errors: AtomicU32,
 }
 
-impl UsmStats {
+impl UsmCounters {
     fn counter(&self, failure: UsmFailure) -> &AtomicU32 {
         match failure {
             UsmFailure::UnknownEngineIds => &self.unknown_engine_ids,
@@ -65,17 +65,58 @@ impl UsmStats {
             .fetch_add(1, Ordering::Relaxed)
             .wrapping_add(1)
     }
+
+    pub(crate) fn snapshot(&self) -> UsmStats {
+        UsmStats {
+            unknown_engine_ids: self.unknown_engine_ids.load(Ordering::Relaxed),
+            unknown_usernames: self.unknown_usernames.load(Ordering::Relaxed),
+            wrong_digests: self.wrong_digests.load(Ordering::Relaxed),
+            not_in_time_windows: self.not_in_time_windows.load(Ordering::Relaxed),
+            unsupported_sec_levels: self.unsupported_sec_levels.load(Ordering::Relaxed),
+            decryption_errors: self.decryption_errors.load(Ordering::Relaxed),
+        }
+    }
 }
 
-/// A USM processing failure, binding the usmStats counter to the report OID
-/// sent for it (RFC 3414 Section 3.2) so the pair cannot be mismatched.
+/// RFC 3414 usmStats counter values.
+///
+/// Each field is read independently, so a snapshot taken while messages are
+/// processed is not one atomic view of all six counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct UsmStats {
+    /// usmStatsUnknownEngineIDs (1.3.6.1.6.3.15.1.1.4)
+    pub unknown_engine_ids: u32,
+    /// usmStatsUnknownUserNames (1.3.6.1.6.3.15.1.1.3)
+    pub unknown_usernames: u32,
+    /// usmStatsWrongDigests (1.3.6.1.6.3.15.1.1.5)
+    pub wrong_digests: u32,
+    /// usmStatsNotInTimeWindows (1.3.6.1.6.3.15.1.1.2)
+    pub not_in_time_windows: u32,
+    /// usmStatsUnsupportedSecLevels (1.3.6.1.6.3.15.1.1.1)
+    pub unsupported_sec_levels: u32,
+    /// usmStatsDecryptionErrors (1.3.6.1.6.3.15.1.1.6)
+    pub decryption_errors: u32,
+}
+
+/// A USM processing failure (RFC 3414 Section 3.2).
+///
+/// A reported failure has already been counted in its usmStats counter, and
+/// any Report generated for it carries that counter's OID.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UsmFailure {
+#[non_exhaustive]
+pub enum UsmFailure {
+    /// The authoritative engine ID is empty (discovery), invalid, or unknown.
     UnknownEngineIds,
+    /// The USM user name is not configured.
     UnknownUserNames,
+    /// Authentication verification failed.
     WrongDigests,
+    /// The message was outside the local authoritative time window.
     NotInTimeWindows,
+    /// The user does not support the requested security level.
     UnsupportedSecLevels,
+    /// Scoped-PDU decryption failed.
     DecryptionErrors,
 }
 
@@ -104,10 +145,10 @@ pub(crate) struct MpdCounters<'a> {
 /// Receiving role for [`process_v3_inbound`], carrying the differences the
 /// RFC assigns to each engine role.
 pub(crate) enum V3Role<'a> {
-    /// Authoritative engine (agent): only messages under its own engine ID
+    /// Authoritative engine (agent, and a notification processor answering
+    /// an unknown engine ID): only messages under its own engine ID
     /// are accepted (RFC 3414 Section 3.2 Step 3), timeliness is Step 7a
     /// against its own boots/time.
-    #[cfg(any(feature = "agent", test))]
     Authoritative,
     /// Non-authoritative receiver (notification receiver): messages under
     /// its own engine ID (informs) use Step 7a; messages under a remote
@@ -121,27 +162,14 @@ pub(crate) enum V3Role<'a> {
 pub(crate) type RemoteEngineTable = RecencyMap<Bytes, EngineState>;
 
 impl V3Role<'_> {
-    #[cfg(any(feature = "agent", test))]
     fn is_authoritative(&self) -> bool {
         matches!(self, Self::Authoritative)
     }
 
-    #[cfg(not(any(feature = "agent", test)))]
-    fn is_authoritative(&self) -> bool {
-        false
-    }
-
     fn remote_engines(&self) -> &Mutex<RemoteEngineTable> {
-        #[cfg(any(feature = "agent", test))]
         match self {
             Self::Authoritative => unreachable!("authoritative role rejected a foreign engine ID"),
             Self::Receiver { remote_engines } => remote_engines,
-        }
-
-        #[cfg(not(any(feature = "agent", test)))]
-        {
-            let Self::Receiver { remote_engines } = self;
-            remote_engines
         }
     }
 }
@@ -164,7 +192,7 @@ pub(crate) struct V3LocalContext<'a> {
     /// Local policy bound for outbound responses and Reports.
     pub(crate) outbound_limit: usize,
     pub(crate) usm_users: &'a HashMap<Bytes, UsmUser>,
-    pub(crate) stats: &'a UsmStats,
+    pub(crate) stats: &'a UsmCounters,
     pub(crate) mpd: Option<MpdCounters<'a>>,
     pub(crate) source: SocketAddr,
 }
@@ -504,7 +532,7 @@ mod tests {
 
     #[test]
     fn usm_report_counter_wraps_at_counter32_rollover() {
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         stats
             .unknown_engine_ids
             .store(u32::MAX - 1, Ordering::Relaxed);
@@ -523,7 +551,7 @@ mod tests {
     fn test_ctx<'a>(
         engine_id: &'a Bytes,
         usm_users: &'a HashMap<Bytes, UsmUser>,
-        stats: &'a UsmStats,
+        stats: &'a UsmCounters,
         mpd: Option<MpdCounters<'a>>,
     ) -> V3LocalContext<'a> {
         V3LocalContext {
@@ -668,7 +696,7 @@ mod tests {
     fn test_invalid_msg_flags_counts_snmp_invalid_msgs() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let invalid_msgs = AtomicU32::new(0);
         let unknown_models = AtomicU32::new(0);
         let ctx = test_ctx(
@@ -697,7 +725,7 @@ mod tests {
     fn test_unknown_security_model_counts_snmp_unknown_security_models() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let invalid_msgs = AtomicU32::new(0);
         let unknown_models = AtomicU32::new(0);
         let ctx = test_ctx(
@@ -728,7 +756,7 @@ mod tests {
     fn test_discovery_produces_unknown_engine_ids_report() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
         let data = V3Message::discovery_request(5, crate::UDP_RECEIVE_LIMITS.advertised())
@@ -781,7 +809,7 @@ mod tests {
     fn empty_engine_id_precedes_contradictory_usm_fields() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let data = build_raw_usm_msg(
             b"",
@@ -811,7 +839,7 @@ mod tests {
     fn foreign_engine_id_precedes_missing_auth_priv_fields() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let data = build_raw_usm_msg(
             b"\x80\x00\x00\x00\x01remote",
@@ -842,7 +870,7 @@ mod tests {
     fn receiver_unknown_user_precedes_missing_auth_priv_fields() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let data = build_raw_usm_msg(
             b"\x80\x00\x00\x00\x01remote",
@@ -878,7 +906,7 @@ mod tests {
     fn local_engine_unknown_user_precedes_missing_auth_priv_fields() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let data = build_raw_usm_msg(
             &engine_id,
@@ -909,7 +937,7 @@ mod tests {
         let engine_id = local_engine_id();
         let mut users = HashMap::new();
         users.insert(Bytes::from_static(b"user"), UsmUser::new("user"));
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let data = build_raw_usm_msg(&engine_id, b"user", SecurityLevel::AuthPriv, true, b"", b"");
 
@@ -940,7 +968,7 @@ mod tests {
                 .auth(AuthProtocol::Sha256, b"auth-password")
                 .unwrap(),
         );
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let data = build_raw_usm_msg(
             &engine_id,
@@ -977,7 +1005,7 @@ mod tests {
         let auth_key = keys.auth_key.as_ref().unwrap();
         let mut users = HashMap::new();
         users.insert(Bytes::from_static(b"user"), user);
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let mut data = build_raw_usm_msg(
             &engine_id,
@@ -1025,7 +1053,7 @@ mod tests {
         let auth_key = keys.auth_key.as_ref().unwrap();
         let mut users = HashMap::new();
         users.insert(Bytes::from_static(b"user"), user);
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let mut data = build_raw_usm_msg(
             &engine_id,
@@ -1080,7 +1108,7 @@ mod tests {
         let auth_key = keys.auth_key.as_ref().unwrap();
         let mut users = HashMap::new();
         users.insert(Bytes::from_static(b"user"), user);
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let mut data = crate::v3::encode::encode_v3_message(
             &Pdu::get_request(42, &[]),
@@ -1131,7 +1159,7 @@ mod tests {
         let engine_id = local_engine_id();
         let mut users = HashMap::new();
         users.insert(Bytes::from_static(b"user"), UsmUser::new("user"));
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let data = build_raw_usm_msg(
             &engine_id,
@@ -1156,7 +1184,7 @@ mod tests {
         let engine_id = local_engine_id();
         let users = HashMap::new();
 
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let outcome =
             process_v3_inbound(build_msg(b"", b"", true), &ctx, &V3Role::Authoritative).unwrap();
@@ -1170,7 +1198,7 @@ mod tests {
         let exact = report.len();
 
         for (limit, report_fits) in [(exact - 1, false), (exact, true), (exact + 1, true)] {
-            let stats = UsmStats::default();
+            let stats = UsmCounters::default();
             let mut ctx = test_ctx(&engine_id, &users, &stats, None);
             ctx.outbound_limit = limit;
             let outcome =
@@ -1195,7 +1223,7 @@ mod tests {
     fn test_unreportable_failure_counts_without_report() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
         let data = build_msg(&engine_id, b"nobody", false);
@@ -1231,7 +1259,7 @@ mod tests {
                 .auth(AuthProtocol::Sha1, "authpass12345678")
                 .unwrap(),
         );
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
         let usm = UsmSecurityParams::new(engine_id.clone(), 7, 1000, Bytes::from_static(b"user"))
@@ -1310,7 +1338,7 @@ mod tests {
     fn invalid_engine_ids_are_rejected_before_role_lookup_or_state() {
         let engine_id = local_engine_id();
         let users = HashMap::new();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let remote_engines = Mutex::new(RemoteEngineTable::new(16));
         let receiver = V3Role::Receiver {
@@ -1345,7 +1373,7 @@ mod tests {
         let engine_id = local_engine_id();
         let mut users = HashMap::new();
         users.insert(Bytes::from_static(b"user"), UsmUser::new("user"));
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
         let data = build_msg(b"\x80\x00\x00\x00\x01remote", b"user", true);
@@ -1388,7 +1416,7 @@ mod tests {
         ] {
             let mut users = HashMap::new();
             users.insert(Bytes::from_static(b"user"), user);
-            let stats = UsmStats::default();
+            let stats = UsmCounters::default();
             let ctx = test_ctx(&engine_id, &users, &stats, None);
             let outcome = process_v3_inbound(
                 build_msg(&engine_id, b"user", true),
@@ -1432,7 +1460,7 @@ mod tests {
             crate::UDP_RECEIVE_LIMITS.advertised(),
         )
         .unwrap();
-        let stats = UsmStats::default();
+        let stats = UsmCounters::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
         let outcome = process_v3_inbound(data.into(), &ctx, &V3Role::Authoritative).unwrap();
         let V3Inbound::Message(message) = outcome else {
