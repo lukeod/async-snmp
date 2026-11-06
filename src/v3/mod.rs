@@ -95,6 +95,7 @@ pub use privacy::{
 pub use privacy::{DesSaltReservation, PrivKey, SaltCounter};
 #[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 pub(crate) use privacy::{PrivKey, SaltCounter};
+pub use process::{UsmFailure, UsmStats};
 pub use report::{MalformedReport, ReportStatus, classify_report};
 pub use usm::UsmSecurityParams;
 

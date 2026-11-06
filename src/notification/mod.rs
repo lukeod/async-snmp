@@ -185,8 +185,21 @@
 //! spoofable `noAuthNoPriv` messages, so use a policy that requires at least
 //! [`SecurityLevel::AuthNoPriv`] when authenticated identity and content are
 //! required.
+//!
+//! # Caller-owned sockets
+//!
+//! [`NotificationProcessor`] runs the receiver's `SNMPv3` USM processing over
+//! one datagram at a time without owning a socket. It returns Reports for the
+//! caller to send, and [`NotificationProcessor::encode_inform_response`]
+//! encodes an Inform response only when the caller decides to acknowledge,
+//! for example after storing the notification durably. Processors built from
+//! one [`NotificationEngine`] share its authoritative engine and counters,
+//! but each has its own users, which can be replaced at runtime. A datagram
+//! that no processor claims can be answered with
+//! [`NotificationProcessor::report_unknown_engine`].
 
 mod handlers;
+mod processor;
 mod varbind;
 
 use std::collections::HashMap;
@@ -209,12 +222,16 @@ use crate::transport::udp_error::{UdpRecvErrorClass, classify_udp_recv_error};
 use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{PreparedAuthoritativeUsm, bind_udp_socket, validate_authoritative_usm};
 use crate::v3::process::RemoteEngineTable;
-use crate::v3::process::UsmStats;
+use crate::v3::process::UsmCounters;
 use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
 use crate::v3::UsmUser;
+pub use processor::{
+    InformAck, InformResponse, NotificationEngine, NotificationProcessor,
+    NotificationProcessorBuilder, V3InboundNotification, V3Processed,
+};
 pub use varbind::{NotificationVarbindValidation, validate_notification_varbinds};
 
 /// Maximum number of distinct remote authoritative engines whose timeliness
@@ -1104,7 +1121,7 @@ impl NotificationReceiverBuilder {
                 authoritative_snapshot: AtomicU64::new(pack_boots_time((engine_boots, 0))),
                 engine_boots_base: engine_boots,
                 engine_start: Instant::now(),
-                usm_stats: UsmStats::default(),
+                usm_stats: UsmCounters::default(),
                 remote_engines: Mutex::new(RemoteEngineTable::new(MAX_REMOTE_ENGINES)),
                 max_message_size: self.max_message_size,
                 decode_config: self.decode_config,
@@ -1418,7 +1435,7 @@ struct ReceiverInner {
     /// Time when the receiver was started, used to compute engine time.
     engine_start: Instant,
     /// RFC 3414 usmStats counters
-    usm_stats: UsmStats,
+    usm_stats: UsmCounters,
     /// Timeliness state for remote authoritative engines (trap senders),
     /// keyed by engine ID (RFC 3414 Section 2.3). Seeded from the first
     /// authenticated message from each engine, so only holders of configured
@@ -2544,7 +2561,7 @@ mod tests {
     /// `auth: Some((password, protocol))` the message is AuthNoPriv with a
     /// valid HMAC; with `None` it is noAuthNoPriv.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn build_v3_notification(
+    pub(super) fn build_v3_notification(
         pdu_type: crate::pdu::PduType,
         engine_id: &[u8],
         engine_boots: u32,
@@ -2566,7 +2583,7 @@ mod tests {
     /// As [`build_v3_notification`], but with an explicit advertised
     /// `msg_max_size` in the message header.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn build_v3_notification_with_max(
+    pub(super) fn build_v3_notification_with_max(
         pdu_type: crate::pdu::PduType,
         engine_id: &[u8],
         engine_boots: u32,
@@ -2641,7 +2658,7 @@ mod tests {
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn inform_security(level: SecurityLevel, username: &[u8]) -> crate::v3::UsmConfig {
+    pub(super) fn inform_security(level: SecurityLevel, username: &[u8]) -> crate::v3::UsmConfig {
         use crate::v3::PrivProtocol;
 
         let username = Bytes::copy_from_slice(username);
@@ -2662,7 +2679,7 @@ mod tests {
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn inform_user(level: SecurityLevel, username: &[u8]) -> crate::v3::UsmUser {
+    pub(super) fn inform_user(level: SecurityLevel, username: &[u8]) -> crate::v3::UsmUser {
         use crate::v3::PrivProtocol;
 
         let username = Bytes::copy_from_slice(username);
@@ -2683,7 +2700,7 @@ mod tests {
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn build_v3_inform_at_level(
+    pub(super) fn build_v3_inform_at_level(
         engine_id: &[u8],
         username: &[u8],
         level: SecurityLevel,
@@ -2725,7 +2742,7 @@ mod tests {
     /// Build an authenticated V3 `InformRequest` message with the given
     /// `engine_boots` and `engine_time` in the USM parameters.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn build_authed_v3_inform(
+    pub(super) fn build_authed_v3_inform(
         engine_id: &[u8],
         engine_boots: u32,
         engine_time: u32,
@@ -2746,7 +2763,11 @@ mod tests {
     /// Build an authenticated V3 `SNMPv2-Trap` message with the given
     /// `engine_boots` and `engine_time` in the USM parameters.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-    fn build_authed_v3_trap(engine_id: &[u8], engine_boots: u32, engine_time: u32) -> Bytes {
+    pub(super) fn build_authed_v3_trap(
+        engine_id: &[u8],
+        engine_boots: u32,
+        engine_time: u32,
+    ) -> Bytes {
         build_v3_notification(
             crate::pdu::PduType::TrapV2,
             engine_id,
@@ -3211,7 +3232,7 @@ mod tests {
     }
 
     /// Build a V3 discovery request message (empty engine ID, noAuthNoPriv).
-    fn build_v3_discovery_request(msg_id: i32, reportable: bool) -> Bytes {
+    pub(super) fn build_v3_discovery_request(msg_id: i32, reportable: bool) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
         use crate::pdu::Pdu;
         use crate::v3::UsmSecurityParams;
@@ -3232,7 +3253,7 @@ mod tests {
         msg.encode().unwrap()
     }
 
-    fn build_noauth_v3_inform(engine_id: &[u8], username: &[u8]) -> Bytes {
+    pub(super) fn build_noauth_v3_inform(engine_id: &[u8], username: &[u8]) -> Bytes {
         use crate::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
         use crate::pdu::{Pdu, StandardPduType};
         use crate::v3::UsmSecurityParams;

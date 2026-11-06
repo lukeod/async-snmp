@@ -12,6 +12,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `HandlerError::drop_request` lets simulators suppress the entire SNMPv1/v2c/v3
   retrieval response, even after successful GETBULK repetitions. Ordinary
   handler errors retain their existing `genErr` behavior.
+- `NotificationProcessor` runs SNMPv3 notification USM processing over
+  caller-supplied datagrams without owning a socket. It returns Reports for
+  the caller to send, answers unknown engine IDs through
+  `report_unknown_engine`, and encodes an Inform response only when
+  `encode_inform_response` is called with the `InformAck`, using the
+  authoritative boots/time current at that point. Processors sharing a
+  `NotificationEngine` share its authoritative engine, `UsmStats` counters,
+  and `snmpSilentDrops`; each keeps its own replaceable USM users and bounded
+  remote-engine table. `UsmFailure` is now public.
 
 ## [0.18.1] - 2026-08-19
 

@@ -310,7 +310,7 @@ mod tests {
             snmp_silent_drops: AtomicU32::new(30),
             snmp_unknown_contexts: AtomicU32::new(0),
             usm_stats: {
-                let stats = crate::v3::process::UsmStats::default();
+                let stats = crate::v3::process::UsmCounters::default();
                 stats.unknown_engine_ids.store(40, Ordering::Relaxed);
                 stats.unknown_usernames.store(50, Ordering::Relaxed);
                 stats.wrong_digests.store(60, Ordering::Relaxed);

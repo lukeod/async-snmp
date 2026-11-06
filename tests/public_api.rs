@@ -58,6 +58,73 @@ fn notification_acceptance_policy_surface_is_public() {
 }
 
 #[test]
+fn notification_processor_surface_is_public() {
+    use async_snmp::{
+        InformAck, InformResponse, NotificationEngine, NotificationProcessor,
+        NotificationProcessorBuilder, UsmFailure, UsmStats, UsmUser, V3InboundNotification,
+        V3Processed,
+    };
+
+    fn assert_send_sync<T: Send + Sync + 'static>() {}
+    assert_send_sync::<NotificationProcessor>();
+    assert_send_sync::<InformAck>();
+
+    let engine = NotificationEngine::new(
+        AuthoritativeEngine::install(b"processor-engine".to_vec(), |_| {
+            Ok::<(), std::convert::Infallible>(())
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let builder: NotificationProcessorBuilder = NotificationProcessor::builder(engine.clone())
+        .max_remote_engines(1)
+        .max_message_size(1400)
+        .decode_config(DecodeConfig::default());
+    let processor = builder.build().unwrap();
+    processor.set_usm_users([UsmUser::new("user")]).unwrap();
+    processor.set_des_salt_state(None).unwrap();
+    assert_eq!(processor.engine().engine_id(), engine.engine_id());
+    assert_eq!(
+        engine.authoritative_engine().engine_id(),
+        b"processor-engine"
+    );
+
+    let stats: UsmStats = engine.usm_stats();
+    assert_eq!(stats.unknown_engine_ids, 0);
+    assert_eq!(engine.snmp_silent_drops(), 0);
+
+    let source: SocketAddr = "192.0.2.1:162".parse().unwrap();
+    let discovery = async_snmp::message::V3Message::discovery_request(
+        1,
+        async_snmp::UDP_RECEIVE_LIMITS.advertised(),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    match processor.process(discovery.clone(), source).unwrap() {
+        V3Processed::UsmFailed {
+            failure: UsmFailure::UnknownEngineIds,
+            report,
+        } => assert!(report.is_some()),
+        V3Processed::Authenticated(message) => {
+            let _: &V3InboundNotification = &message;
+            let _: Option<InformAck> = message.inform_ack();
+        }
+        _ => panic!("discovery must fail USM processing"),
+    }
+    assert!(
+        processor
+            .report_unknown_engine(discovery, source)
+            .unwrap()
+            .is_some()
+    );
+    let _ = |response: InformResponse| match response {
+        InformResponse::Response(bytes) | InformResponse::TooBig(bytes) => Some(bytes),
+        _ => None,
+    };
+}
+
+#[test]
 fn engine_cache_public_seeding_encodes_and_validates_trust() {
     use async_snmp::v3::MAX_ENGINE_TIME;
     use async_snmp::{DiscoveredEngine, EngineCache, MessageSize};

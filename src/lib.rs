@@ -622,11 +622,12 @@ pub use message_size::{
     ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS,
 };
 pub use notification::{
-    InformAckOutcome, Notification, NotificationAcceptance, NotificationAcceptanceError,
-    NotificationAcceptancePolicy, NotificationAcceptanceResult, NotificationEnvelope,
-    NotificationPduClass, NotificationReceiver, NotificationReceiverBuilder,
+    InformAck, InformAckOutcome, InformResponse, Notification, NotificationAcceptance,
+    NotificationAcceptanceError, NotificationAcceptancePolicy, NotificationAcceptanceResult,
+    NotificationEngine, NotificationEnvelope, NotificationPduClass, NotificationProcessor,
+    NotificationProcessorBuilder, NotificationReceiver, NotificationReceiverBuilder,
     NotificationVarbindValidation, NotificationWireIdentity, ReceivedNotification,
-    V3NotificationWireIdentity, validate_notification_varbinds,
+    V3InboundNotification, V3NotificationWireIdentity, V3Processed, validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{
@@ -642,7 +643,8 @@ pub use v3::{
     AuthoritativeEnginePersistenceOperation, CryptoBackend, CryptoError, CryptoResult,
     DesSaltPersistenceError, DesSaltPersistenceOperation, DesSaltState, DesSaltStateError,
     DiscoveredEngine, EngineCache, ParseProtocolError, PersistedAuthoritativeEngine,
-    PersistedDesSaltState, PrivProtocol, UsmConfig, UsmUser, generate_engine_id,
+    PersistedDesSaltState, PrivProtocol, UsmConfig, UsmFailure, UsmStats, UsmUser,
+    generate_engine_id,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use v3::{LocalizedKey, MasterKey, MasterKeys};

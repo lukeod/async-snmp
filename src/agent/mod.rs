@@ -122,7 +122,7 @@ use crate::util::{
     EmptyCommunityPolicy, PreparedAuthoritativeUsm, ValidatedAuthoritativeUsm, bind_udp_socket,
     community_matches, validate_authoritative_usm_deferred,
 };
-use crate::v3::process::UsmStats;
+use crate::v3::process::UsmCounters;
 use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, UsmUser};
 use crate::v3::{SaltCounter, compute_engine_boots_time};
 use crate::value::Value;
@@ -1308,7 +1308,7 @@ impl AgentBuilder {
             snmp_unknown_security_models: AtomicU32::new(0),
             snmp_silent_drops: AtomicU32::new(0),
             snmp_unknown_contexts: AtomicU32::new(0),
-            usm_stats: UsmStats::default(),
+            usm_stats: UsmCounters::default(),
             health: tokio::sync::watch::channel(AgentHealth::Healthy).0,
         });
 
@@ -1701,7 +1701,7 @@ pub(crate) struct AgentState {
     /// contextEngineID did not name a context served by this engine
     pub(crate) snmp_unknown_contexts: AtomicU32,
     /// RFC 3414 usmStats counters
-    pub(crate) usm_stats: UsmStats,
+    pub(crate) usm_stats: UsmCounters,
     /// Bounded/coalescing current-health publication.
     health: tokio::sync::watch::Sender<AgentHealth>,
 }
