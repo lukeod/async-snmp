@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Public `ProcessingInput` validates original packet length and the hard receive
+  bound using `ProcessingLimits`. Managed command and notification processing
+  use the same envelope, preserving receive identity, UDP tolerance and TCP limits.
+
 - **Breaking:** notification receivers use `prepare()` or explicit `spawn()` /
   `spawn_on()` and an independently driven runner. `recv(&mut self)` is a
   cancellation-safe single-consumer queue returning `Option`; receivers are no

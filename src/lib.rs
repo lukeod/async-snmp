@@ -649,10 +649,10 @@ pub use transport::{
     BoundListener, BuiltinTransport, Candidate, CommunityResponsePolicy,
     DEFAULT_OBSERVATION_CAPACITY, EndpointId, ListenerSource, MessageDisposition, ObservationEvent,
     ObservationReceiver, ObservationStats, PreparedTcpSession, PreparedUdpEndpoint,
-    ReceivedMessageInfo, ReceivedPacket, ReceptionId, RequestRegistration, RequestTransport,
-    ResponseIdentity, RunningTcpSession, RunningUdpEndpoint, SentMessageInfo, SessionId,
-    TcpControl, TcpListenerSource, TcpOptions, TcpRunner, TcpStatus, TcpTransport,
-    TcpTransportBuilder, TransportKind, TransportObserver, UdpControl, UdpEndpoint,
+    ProcessingInput, ProcessingLimits, ReceivedMessageInfo, ReceivedPacket, ReceptionId,
+    RequestRegistration, RequestTransport, ResponseIdentity, RunningTcpSession, RunningUdpEndpoint,
+    SentMessageInfo, SessionId, TcpControl, TcpListenerSource, TcpOptions, TcpRunner, TcpStatus,
+    TcpTransport, TcpTransportBuilder, TransportKind, TransportObserver, UdpControl, UdpEndpoint,
     UdpEndpointBuilder, UdpHandle, UdpRunner, UdpStats, UdpStatus,
 };
 pub use v3::{

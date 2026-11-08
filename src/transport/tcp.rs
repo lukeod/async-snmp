@@ -632,8 +632,8 @@ impl TcpTransport {
     pub(crate) fn configure_dispatch(&self, roles: Arc<super::dispatch::DispatchRoles>) {
         *self.inner.state.dispatch.lock().unwrap() = Some(roles);
     }
-    pub(crate) fn limits(&self) -> super::EndpointLimits {
-        super::EndpointLimits {
+    pub(crate) fn limits(&self) -> super::ProcessingLimits {
+        super::ProcessingLimits {
             receive: self.receive_limits(),
             send: self.send_capacity(),
         }

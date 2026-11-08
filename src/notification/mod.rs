@@ -2137,10 +2137,11 @@ impl NotificationProcessor {
         message: crate::transport::ReceivedMessage,
         admission: &mut NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
-        match crate::message::peek_version(message.bytes.clone(), message.info.peer_addr())? {
-            Version::V1 => self.handle_v1_message(message, admission).await,
-            Version::V2c => self.handle_v2c_message(message, admission).await,
-            Version::V3 => self.handle_v3_message(message, admission).await,
+        let (input, route) = message.into_processing()?;
+        match crate::message::peek_version(input.bytes().clone(), input.info().peer_addr())? {
+            Version::V1 => self.handle_v1_message(input, route, admission).await,
+            Version::V2c => self.handle_v2c_message(input, route, admission).await,
+            Version::V3 => self.handle_v3_message(input, route, admission).await,
         }
     }
 
@@ -2171,7 +2172,7 @@ impl NotificationProcessor {
             socket,
             self.inner.udp_responder.clone().expect("UDP test fixture"),
             received,
-            crate::transport::EndpointLimits::UDP,
+            crate::transport::ProcessingLimits::UDP,
         )
     }
 

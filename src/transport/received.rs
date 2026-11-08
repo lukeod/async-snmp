@@ -6,11 +6,12 @@ use tokio::time::Instant;
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-/// One original response candidate and its complete-input receive metadata.
+/// One original complete SNMP input and its receive metadata.
 ///
-/// Custom transports construct this value once per candidate. Built-in transports
-/// may retain private parsing work alongside the original bytes; consumers still
-/// perform their own security, policy and exchange acceptance checks.
+/// Custom transports construct this value once per message or response
+/// candidate. Built-in transports may retain private parsing work alongside the
+/// original bytes; consumers still perform their own security, policy and
+/// exchange acceptance checks.
 pub struct ReceivedPacket {
     bytes: bytes::Bytes,
     info: ReceivedMessageInfo,
@@ -18,7 +19,10 @@ pub struct ReceivedPacket {
 }
 impl ReceivedPacket {
     /// Wrap original input bytes and metadata captured once at receipt.
-    /// `info.received_len()` must equal `bytes.len()`.
+    ///
+    /// `info.received_len()` must equal `bytes.len()`. This constructor does not
+    /// validate the length; [`ProcessingInput::new`] checks it together with the
+    /// hard receive bound before protocol processing.
     pub fn new(bytes: bytes::Bytes, info: ReceivedMessageInfo) -> Self {
         Self {
             bytes,
@@ -46,6 +50,79 @@ impl ReceivedPacket {
         Option<Box<crate::v3::prepared::PreparedV3>>,
     ) {
         (self.bytes, self.info, self.prepared)
+    }
+}
+
+/// A complete SNMP input checked against its receive metadata and local limits.
+///
+/// This envelope retains the original packet and reception identity without
+/// decoding or reconstructing its bytes. Construction checks only byte length
+/// and the hard input bound. The transport supplies a complete datagram or
+/// frame; protocol and security validation still belong to the processor.
+/// Caller-supplied metadata and limits do not establish an authenticated
+/// identity or trusted transport-security state.
+pub struct ProcessingInput {
+    packet: ReceivedPacket,
+    limits: ProcessingLimits,
+}
+
+impl ProcessingInput {
+    /// Validate one packet before protocol processing.
+    ///
+    /// Returns [`crate::Error::InvalidMessage`] when metadata records a different
+    /// length, or [`crate::Error::Decode`] with
+    /// [`crate::DecodeErrorKind::MessageTooLarge`] when the full input exceeds
+    /// the receive limit. The full length includes any tolerated UDP suffix.
+    pub fn new(packet: ReceivedPacket, limits: ProcessingLimits) -> crate::Result<Self> {
+        if packet.info.received_len() != packet.bytes.len() {
+            return Err(crate::Error::InvalidMessage(
+                "received length does not match the complete input".into(),
+            )
+            .boxed());
+        }
+        if packet.bytes.len() > limits.receive.accepted() {
+            return Err(crate::Error::Decode(
+                crate::DecodeError::new(
+                    0,
+                    crate::DecodeErrorKind::MessageTooLarge {
+                        size: packet.bytes.len(),
+                        maximum: limits.receive.accepted(),
+                    },
+                )
+                .with_peer(packet.info.peer_addr()),
+            )
+            .boxed());
+        }
+        Ok(Self { packet, limits })
+    }
+
+    /// Borrow the original complete SNMP input, before decoding or decryption.
+    pub fn bytes(&self) -> &bytes::Bytes {
+        self.packet.bytes()
+    }
+
+    /// Return receive metadata with its original reception identity.
+    pub fn info(&self) -> ReceivedMessageInfo {
+        self.packet.info()
+    }
+
+    /// Return the local receive and encoded-send capacities for this input.
+    pub fn limits(&self) -> ProcessingLimits {
+        self.limits
+    }
+
+    /// Recover the original packet and processing limits.
+    pub fn into_parts(self) -> (ReceivedPacket, ProcessingLimits) {
+        (self.packet, self.limits)
+    }
+}
+
+impl std::fmt::Debug for ProcessingInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProcessingInput")
+            .field("info", &self.info())
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
     }
 }
 
@@ -205,26 +282,56 @@ impl ReceivedMessageInfo {
     }
 }
 
-/// Limits of the endpoint which received a message, independent of application
-/// response policy and the peer's advertised receive size.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct EndpointLimits {
+/// Local capacities for complete-message protocol processing.
+///
+/// These limits are independent of application response policy and the peer's
+/// advertised receive size. The receive limit distinguishes advertised capacity
+/// from the hard accepted-input bound, including UDP tolerance. No UDP ceiling
+/// is applied to stream inputs. Limits supplied by custom I/O describe that
+/// implementation's capacities and are not independently verified.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessingLimits {
     pub(crate) receive: crate::ReceiveLimits,
     pub(crate) send: usize,
 }
-impl EndpointLimits {
-    #[cfg(any(feature = "agent", test))]
-    pub(crate) const UDP: Self = Self {
+impl ProcessingLimits {
+    /// Default full-capacity UDP receive and send limits.
+    pub const UDP: Self = Self {
         receive: crate::UDP_RECEIVE_LIMITS,
         send: crate::MAX_UDP_PAYLOAD,
     };
+
+    /// Combine validated receive limits with an exact encoded-send capacity.
+    ///
+    /// A send capacity below the minimum SNMP message size is allowed: response
+    /// finalization may suppress responses that cannot fit. Returns a
+    /// configuration error when `send` exceeds [`crate::MESSAGE_SIZE_MAXIMUM`].
+    pub fn new(receive: crate::ReceiveLimits, send: usize) -> crate::Result<Self> {
+        if send > crate::MESSAGE_SIZE_MAXIMUM {
+            return Err(crate::Error::Config(
+                "processing send capacity exceeds the SNMP size range".into(),
+            )
+            .boxed());
+        }
+        Ok(Self { receive, send })
+    }
+
+    /// Local advertised receive capacity and hard accepted-input bound.
+    pub const fn receive(self) -> crate::ReceiveLimits {
+        self.receive
+    }
+
+    /// Largest encoded response that the receiving endpoint can send.
+    pub const fn send(self) -> usize {
+        self.send
+    }
 }
 
 /// A response capability bound to the exact receiving endpoint and destination.
 #[derive(Clone)]
 pub(crate) struct ReplyRoute {
     kind: ReplyKind,
-    pub(crate) limits: EndpointLimits,
+    pub(crate) limits: ProcessingLimits,
 }
 
 #[derive(Clone)]
@@ -317,6 +424,24 @@ pub(crate) struct ReceivedMessage {
     pub(crate) prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
 }
 impl ReceivedMessage {
+    pub(crate) fn into_processing(self) -> crate::Result<(ProcessingInput, ReplyRoute)> {
+        let Self {
+            bytes,
+            info,
+            reply,
+            prepared,
+        } = self;
+        let input = ProcessingInput::new(
+            ReceivedPacket {
+                bytes,
+                info,
+                prepared,
+            },
+            reply.limits,
+        )?;
+        Ok((input, reply))
+    }
+
     pub(crate) fn discard_cached_plaintext(&mut self) {
         if let Some(crypto) = self.prepared.as_mut().and_then(|p| p.crypto.as_mut()) {
             crypto.plaintext = None;
@@ -353,7 +478,7 @@ impl ReceivedMessage {
         transport: super::TcpTransport,
     ) -> Self {
         use super::RequestTransport;
-        let limits = EndpointLimits {
+        let limits = ProcessingLimits {
             receive: transport.receive_limits(),
             send: transport.send_capacity(),
         };
@@ -374,7 +499,7 @@ impl ReceivedMessage {
         socket: std::sync::Arc<tokio::net::UdpSocket>,
         responder: std::sync::Arc<crate::udp_responder::UdpResponder>,
         received: crate::udp_responder::ReceivedDatagram,
-        limits: EndpointLimits,
+        limits: ProcessingLimits,
     ) -> Self {
         debug_assert_eq!(info.received_len(), bytes.len());
         debug_assert_eq!(info.peer_addr(), received.source);
@@ -428,9 +553,13 @@ mod tests {
                 socket.clone(),
                 responder.clone(),
                 received,
-                EndpointLimits::UDP,
+                ProcessingLimits::UDP,
             );
             assert_eq!(message.info, info);
+            let (input, reply) = message.into_processing().unwrap();
+            assert_eq!(input.info(), info);
+            assert_eq!(input.bytes().as_ref(), b"same bytes");
+            assert_eq!(input.limits(), reply.limits);
             assert_ne!(Some(info.reception_id()), previous);
             previous = Some(info.reception_id());
         }

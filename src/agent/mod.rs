@@ -2601,6 +2601,22 @@ impl AgentProcessor {
             .await
     }
 
+    async fn handle_processing_input_with_lifecycle(
+        &self,
+        input: crate::ProcessingInput,
+        lifecycle: RequestLifecycle,
+    ) -> Result<Option<Bytes>> {
+        let (packet, limits) = input.into_parts();
+        let (data, info, prepared) = packet.into_prepared();
+        self.handle_prepared_request_with_lifecycle(
+            data,
+            info.peer_addr(),
+            lifecycle.with_message(info, limits),
+            prepared,
+        )
+        .await
+    }
+
     async fn handle_prepared_request_with_lifecycle(
         &self,
         data: Bytes,

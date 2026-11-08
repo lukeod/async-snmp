@@ -15,7 +15,7 @@ impl AgentProcessor {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn finalize_v3_response(
         &self,
-        limits: crate::transport::EndpointLimits,
+        limits: crate::transport::ProcessingLimits,
         source: std::net::SocketAddr,
         incoming: &MsgGlobalData,
         incoming_usm: &UsmSecurityParams,
@@ -90,7 +90,7 @@ impl AgentProcessor {
             Vec::new(),
         );
         self.finalize_v3_response(
-            crate::transport::EndpointLimits::UDP,
+            crate::transport::ProcessingLimits::UDP,
             "127.0.0.1:161".parse().unwrap(),
             incoming,
             incoming_usm,
@@ -426,7 +426,7 @@ mod tests {
         );
 
         let request = dummy_response_pdu();
-        let limits = crate::transport::EndpointLimits {
+        let limits = crate::transport::ProcessingLimits {
             receive: crate::ReceiveLimits::tcp(8192).unwrap(),
             send: 1024,
         };
@@ -452,7 +452,7 @@ mod tests {
         assert_eq!(decoded.global_data.msg_max_size, 8192);
         assert_eq!(agent.inner.state.engine_receive_capacity, 65507);
 
-        let limits = crate::transport::EndpointLimits { send: 1, ..limits };
+        let limits = crate::transport::ProcessingLimits { send: 1, ..limits };
         let result = agent
             .processor()
             .finalize_v3_response(

@@ -130,7 +130,7 @@ async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses
                 socket.clone(),
                 responder.clone(),
                 received,
-                EndpointLimits::UDP,
+                ProcessingLimits::UDP,
             )
         };
 

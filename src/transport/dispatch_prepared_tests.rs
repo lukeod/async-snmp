@@ -67,7 +67,7 @@ async fn message() -> ReceivedMessage {
             source,
             destination: None,
         },
-        super::super::EndpointLimits::UDP,
+        super::super::ProcessingLimits::UDP,
     )
 }
 fn context<'a>(
@@ -126,12 +126,10 @@ async fn prepared_application_reuses_crypto_with_policy_and_budget_fallbacks() {
                 message.prepared.as_ref().unwrap().plaintext_len() > 0,
                 retain_plaintext
             );
-            process_prepared_v3_inbound(
-                message.bytes,
-                &ctx,
-                &V3Role::Authoritative,
-                message.prepared,
-            )
+            let (input, _reply) = message.into_processing().unwrap();
+            let (packet, _limits) = input.into_parts();
+            let (bytes, _info, prepared) = packet.into_prepared();
+            process_prepared_v3_inbound(bytes, &ctx, &V3Role::Authoritative, prepared)
         });
         let V3Inbound::Message(inbound) = result.unwrap() else {
             panic!("expected accepted request")

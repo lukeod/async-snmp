@@ -33,25 +33,20 @@ impl super::NotificationProcessor {
         data: Bytes,
         source: SocketAddr,
     ) -> Result<Option<ReceivedNotification>> {
-        self.handle_v1_message(
-            self.test_message(data, source, None),
-            &mut super::NotificationAdmission::default(),
-        )
-        .await
+        let (input, route) = self.test_message(data, source, None).into_processing()?;
+        self.handle_v1_message(input, route, &mut super::NotificationAdmission::default())
+            .await
     }
 
     /// Handle `SNMPv1` message.
     pub(super) async fn handle_v1_message(
         &self,
-        message: crate::transport::ReceivedMessage,
+        input: crate::ProcessingInput,
+        _route: crate::transport::ReplyRoute,
         admission: &mut super::NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
-        let crate::transport::ReceivedMessage {
-            bytes: data,
-            info,
-            reply: _route,
-            ..
-        } = message;
+        let (packet, _) = input.into_parts();
+        let (data, info) = packet.into_parts();
         let source = info.peer_addr();
         let decoded =
             CommunityMessage::decode_with_target(data, Some(source), self.inner.decode_config)?;
@@ -110,24 +105,21 @@ impl super::NotificationProcessor {
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
     ) -> Result<Option<ReceivedNotification>> {
-        self.handle_v2c_message(
-            self.test_message(data, source, response_source),
-            &mut super::NotificationAdmission::default(),
-        )
-        .await
+        let (input, route) = self
+            .test_message(data, source, response_source)
+            .into_processing()?;
+        self.handle_v2c_message(input, route, &mut super::NotificationAdmission::default())
+            .await
     }
 
     pub(super) async fn handle_v2c_message(
         &self,
-        message: crate::transport::ReceivedMessage,
+        input: crate::ProcessingInput,
+        route: crate::transport::ReplyRoute,
         admission: &mut super::NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
-        let crate::transport::ReceivedMessage {
-            bytes: data,
-            info,
-            reply: route,
-            prepared: _,
-        } = message;
+        let (packet, _) = input.into_parts();
+        let (data, info) = packet.into_parts();
         let source = info.peer_addr();
         let decoded =
             CommunityMessage::decode_with_target(data, Some(source), self.inner.decode_config)?;
@@ -281,24 +273,21 @@ impl super::NotificationProcessor {
         source: SocketAddr,
         response_source: Option<DestinationMetadata>,
     ) -> Result<Option<ReceivedNotification>> {
-        self.handle_v3_message(
-            self.test_message(data, source, response_source),
-            &mut super::NotificationAdmission::default(),
-        )
-        .await
+        let (input, route) = self
+            .test_message(data, source, response_source)
+            .into_processing()?;
+        self.handle_v3_message(input, route, &mut super::NotificationAdmission::default())
+            .await
     }
 
     pub(super) async fn handle_v3_message(
         &self,
-        message: crate::transport::ReceivedMessage,
+        input: crate::ProcessingInput,
+        route: crate::transport::ReplyRoute,
         admission: &mut super::NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
-        let crate::transport::ReceivedMessage {
-            bytes: data,
-            info,
-            reply: route,
-            prepared,
-        } = message;
+        let (packet, limits) = input.into_parts();
+        let (data, info, prepared) = packet.into_prepared();
         let source = info.peer_addr();
         let (our_boots, our_time) = super::unpack_boots_time(
             self.inner
@@ -311,8 +300,8 @@ impl super::NotificationProcessor {
             engine_boots: our_boots,
             engine_time: our_time,
             authoritative_time: Some(&sample_authoritative_time),
-            local_receive_capacity: route.limits.receive.advertised(),
-            accepted_receive_size: route.limits.receive.accepted(),
+            local_receive_capacity: limits.receive().advertised(),
+            accepted_receive_size: limits.receive().accepted(),
             decode_config: self.inner.decode_config,
             outbound_limit: self.inner.max_message_size.min(route.limits.send),
             usm_users: &self.inner.usm_users,

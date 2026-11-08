@@ -182,7 +182,7 @@ impl SecurityName {
 #[derive(Debug, Clone)]
 pub struct RequestContext {
     receive_info: Option<crate::ReceivedMessageInfo>,
-    pub(crate) endpoint_limits: crate::transport::EndpointLimits,
+    pub(crate) endpoint_limits: crate::transport::ProcessingLimits,
     /// Monotonic instant when the datagram was received.
     received_at: tokio::time::Instant,
 
@@ -563,7 +563,7 @@ pub(crate) enum RequestTaskPhase {
 #[derive(Debug, Clone)]
 pub(crate) struct RequestLifecycle {
     pub(crate) receive_info: Option<crate::ReceivedMessageInfo>,
-    pub(crate) endpoint_limits: crate::transport::EndpointLimits,
+    pub(crate) endpoint_limits: crate::transport::ProcessingLimits,
     pub(crate) received_at: tokio::time::Instant,
     pub(crate) admitted_at: tokio::time::Instant,
     pub(crate) deadline: Option<tokio::time::Instant>,
@@ -575,7 +575,7 @@ impl RequestLifecycle {
     pub(crate) fn with_message(
         mut self,
         info: crate::ReceivedMessageInfo,
-        limits: crate::transport::EndpointLimits,
+        limits: crate::transport::ProcessingLimits,
     ) -> Self {
         self.received_at = info.received_at();
         self.receive_info = Some(info);
@@ -591,7 +591,7 @@ impl RequestLifecycle {
     ) -> Self {
         Self {
             receive_info: None,
-            endpoint_limits: crate::transport::EndpointLimits::UDP,
+            endpoint_limits: crate::transport::ProcessingLimits::UDP,
             received_at,
             admitted_at,
             deadline,

@@ -405,8 +405,7 @@ impl AgentRunner {
             deadline,
             cancel.clone(),
             phase.clone(),
-        )
-        .with_message(work.message.info, work.message.reply.limits);
+        );
         let processor = self.processor.clone();
         #[cfg(test)]
         self.processor
@@ -416,8 +415,15 @@ impl AgentRunner {
         requests.spawn(phase, async move {
             let InboundWork { message, _admission, _session, _buffers } = work;
             let request = async {
-                match processor.handle_prepared_request_with_lifecycle(message.bytes, message.info.peer_addr(), lifecycle, message.prepared).await {
-                    Ok(Some(bytes)) => { let _ = processor.send_response(bytes, &message.reply).await; },
+                let (input, reply) = match message.into_processing() {
+                    Ok(parts) => parts,
+                    Err(error) => {
+                        tracing::debug!(%error, "agent input rejected");
+                        return;
+                    }
+                };
+                match processor.handle_processing_input_with_lifecycle(input, lifecycle).await {
+                    Ok(Some(bytes)) => { let _ = processor.send_response(bytes, &reply).await; },
                     Ok(None) => {},
                     Err(error) => tracing::debug!(%error, "agent request rejected"),
                 }

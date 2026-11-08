@@ -1,6 +1,6 @@
 //! Concrete listener sources, with preparation independent of execution.
 use super::{
-    EndpointLimits, TcpOptions, TransportKind, UdpEndpoint, UdpEndpointBuilder, UdpRunner,
+    ProcessingLimits, TcpOptions, TransportKind, UdpEndpoint, UdpEndpointBuilder, UdpRunner,
 };
 use crate::{EndpointId, Error, RequestTransport, Result};
 use std::net::SocketAddr;
@@ -217,11 +217,11 @@ impl PreparedListener {
             }
         }
     }
-    pub(crate) fn limits(&self) -> EndpointLimits {
+    pub(crate) fn limits(&self) -> ProcessingLimits {
         match self {
             Self::Udp { endpoint, .. } => endpoint.limits(),
             Self::Session { transport, .. } => transport.limits(),
-            Self::Tcp { options, .. } => EndpointLimits {
+            Self::Tcp { options, .. } => ProcessingLimits {
                 receive: crate::ReceiveLimits::tcp(options.max_message_size).expect("validated"),
                 send: options.send_capacity,
             },
