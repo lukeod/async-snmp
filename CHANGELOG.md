@@ -16,10 +16,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   declare engine receive capacity with an RAII `ReceiveCapacityRegistration`;
   admitted input holds preserve MIB state without authorizing new admissions.
 
-- Managed receivers support application-controlled Inform acknowledgement with
-  bounded outstanding work, expiry and supervised completion. `inform_ack` now
-  uses `NotificationAcknowledgement` to distinguish traps, completed outcomes
-  and pending capabilities. Automatic acknowledgement remains the default.
+- **Breaking:** managed receivers support application-controlled Inform
+  acknowledgement with bounded outstanding work, expiry and supervised completion.
+  `inform_ack` now uses `NotificationAcknowledgement` to distinguish traps, completed outcomes
+  and pending capabilities, replacing `Option<InformAckOutcome>`/`None` semantics.
+  Automatic acknowledgement remains the default. Manual mode defaults to 256
+  outstanding Informs and 30 seconds from acceptance, including dequeued work
+  and sending. Expiry releases service-owned payloads; first polling completion
+  commits a bounded supervised attempt even if its waiter is abandoned. Drop or
+  reject sends nothing; retransmissions remain independent.
 
 - `NotificationProcessor` processes complete v1/v2c/v3 inputs without owning I/O
   or tasks, sharing protocol processing with managed receivers. Accepted Informs
@@ -33,6 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeliness state. Engine-specific user entries precede explicit defaults;
   atomic user replacement preserves each in-flight input's credential snapshot.
   Agent and notification builders accept an explicit `security_context`.
+  Exact-entry security failure never falls back to default credentials; invalid
+  replacements leave the previous table active and preserve remote timeliness.
 
 - Clients accept `local_engine` to share authoritative time, persistence health
   and privacy-sender state with other roles. Existing clients and cached agent

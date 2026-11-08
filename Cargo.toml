@@ -189,3 +189,11 @@ required-features = ["agent"]
 [[example]]
 name = "shared_tcp_roles"
 required-features = ["agent"]
+
+[[example]]
+name = "command_socketless"
+required-features = ["agent"]
+
+[[example]]
+name = "notification_socketless"
+required-features = ["crypto-rustcrypto"]

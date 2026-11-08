@@ -20,6 +20,22 @@
 //! [`AuthoritativeEnginePersistenceError`], together with the attempted boots
 //! transition.
 //!
+//! Share one [`LocalEngine`] across roles representing that same local engine;
+//! it owns the authoritative clock, persistence health, counters and privacy
+//! sender state. It does not own access policy or credentials. Caller-owned
+//! endpoints explicitly register their receive capacities and retain the returned
+//! [`ReceiveCapacityRegistration`]; the engine MIB reports the minimum.
+//!
+//! [`UsmSecurityContext`] independently shares immutable credential snapshots and
+//! bounded remote-engine timeliness. [`UsmUserEntry::for_engine`] selects an exact
+//! authoritative-engine-ID/username binding before a [`UsmUserEntry::new`] default,
+//! with no default fallback after exact-entry security failure. Atomic
+//! [`UsmSecurityContext::replace_users`] validates before publication and preserves
+//! timeliness. An input and its deferred Inform response retain their selected
+//! snapshot; replacement affects later selections. Managed endpoints select one
+//! configured context. Custom I/O can explicitly select a logical context before
+//! invoking its processor; unauthenticated routing hints do not establish identity.
+//!
 //! Cargo features determine which crypto backends are available. Each
 //! [`UsmConfig`] or [`UsmUser`] selects a backend; RustCrypto remains the
 //! default when both backends are enabled.

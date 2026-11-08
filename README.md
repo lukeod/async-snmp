@@ -88,10 +88,55 @@ The repository contains these examples:
 - [trap and inform sending](examples/notification_sender.rs) and
   [receiving](examples/notification_receiver.rs)
 - [an agent with writable objects](examples/agent_with_set.rs)
+- [caller-owned notification I/O and USM context selection](examples/notification_socketless.rs)
+- [persisting notifications before Inform acknowledgement](examples/notification_durable.rs)
+- [caller-owned command I/O and bounded shutdown](examples/command_socketless.rs)
 - [calling the library from synchronous code](examples/sync_wrapper.rs)
 - [MIB-backed queries](examples/mib_get.rs),
   [walks](examples/mib_walk.rs), and
   [table index decoding](examples/mib_table.rs)
+
+## Choose the application and I/O layer
+
+| Use case | API | Execution ownership |
+| --- | --- | --- |
+| Queries and outgoing notifications | `Client` with a built-in or custom `RequestTransport` | Transport implementation owns I/O; client validates exchange results |
+| Managed command listeners | `Agent` (`agent` feature) | Owned runner supervises listeners, requests and attached roles |
+| Managed notification listeners | `NotificationReceiver` | Owned runner supervises reception, delivery and acknowledgements |
+| Caller-owned notification I/O | `NotificationProcessor` | Synchronous complete-message processing; caller owns I/O, concurrency and retained-response bounds |
+| Caller-owned command I/O | `CommandProcessor` (`agent` feature) | Caller owns I/O; processor retains bounded Tokio request tasks and SET cleanup |
+
+Processor `build()` creates no sockets, readers or background tasks and requires
+no Tokio runtime. `NotificationProcessor::process` is synchronous and runtime-free;
+`CommandProcessor::process` requires a running Tokio runtime for its owned tasks.
+Supply original complete-message bytes and `ReceivedMessageInfo` through
+`ProcessingInput`, with explicit receive/send `ProcessingLimits`. Metadata records
+provenance; peer addresses, context names and unauthenticated wire fields do not
+establish identity. Custom UDP/TCP endpoints also retain a
+`LocalEngine::register_receive_capacity` registration for their serving lifetime.
+The engine MIB reports the minimum registered capacity; per-message limits remain
+specific to the receiving endpoint.
+
+`LocalEngine` shares persisted authoritative identity/boots/time, counters,
+persistence health and privacy sender state across roles. Prepare persisted
+engine state once and pass clones to builders. `UsmSecurityContext` independently
+shares inbound credentials and bounded remote-engine timeliness; separate contexts
+isolate those tables even on one socket and one local engine. An exact
+`UsmUserEntry::for_engine` engine-ID/username binding precedes an explicit
+`UsmUserEntry::new` default. A failed exact entry never retries a default.
+`replace_users` validates the complete replacement before atomic publication;
+invalid replacements leave the current table intact, and remote timeliness is
+retained. Each input keeps one selected credential snapshot, including its
+deferred Inform response. Managed attached roles share their configured context.
+Caller-owned I/O may select a logical processor explicitly, using untrusted routing
+hints before security processing; it must not retry contexts after security failure.
+
+`NotificationProcessor` returns accepted content and an optional owned
+`InformResponse`. Encode it after application processing; encoding samples current
+engine time and sender state while retaining the original validated credentials.
+Handle USM failure Reports separately, including discovery for unclaimed engine
+IDs through `report_unknown_engine`. The caller sends every result on the original
+UDP route or exact TCP session and controls any deferred response deadline.
 
 ## Transport and service lifecycle
 
@@ -111,6 +156,7 @@ ordinary deadlines before startup and fail after termination.
 | Agent/receiver startup | `prepare` plus runner, or explicit `spawn` |
 | Single service local address | Identified `bound_addresses()` |
 | Notification consumer | Non-Clone receiver; `recv(&mut self)` and separate control |
+| Managed `ReceivedNotification::inform_ack` | `NotificationAcknowledgement::{NotRequired, Completed, Pending}` |
 | Agent notification destinations | `notification_sink(id, NotificationTarget, auth)` |
 | Client response history | `ResponseMetadata::received_messages` |
 | Aggregate decode anomalies | `ResponseMetadata::decode_anomalies()` iterator |
@@ -129,9 +175,40 @@ See [shared UDP roles](examples/shared_udp_roles.rs) and
 [shared TCP roles](examples/shared_tcp_roles.rs) for command handling alongside
 Agent notification sends. SNMPv3 traps use the originating Agent's persisted engine;
 Informs discover the receiver's authoritative engine. Runtime v3 originators require
-prepared authoritative state, an AES role for AES privacy, or durable DES sender
-state for DES/3DES. Closing a notification consumer disables that role while other
+prepared authoritative state and the applicable shared AES or durable DES sender
+state. Closing a notification consumer disables that role while other
 roles continue; root shutdown terminates all owned endpoints and pending exchanges.
+
+Managed Inform acknowledgement defaults to `Automatic`: the local attempt
+finishes before delivery. `inform_ack` is an enum, replacing the former optional
+outcome: traps are `NotRequired`, finished attempts are `Completed(InformAckOutcome)`,
+and application-controlled Informs carry `Pending(PendingInformAck)`. A completed
+state can also report failure to install manual completion work. Select
+`ApplicationControlled`, persist/process the event, then consume the pending token
+with `acknowledge().await`. Drop or `reject()` sends nothing. Retransmissions remain
+independent events; acknowledgement provides no exactly-once guarantee.
+
+Manual mode defaults to 256 outstanding Informs and a 30-second deadline from
+acceptance, including encoding and sending. These bounds survive dequeue. Tokens
+hold weak references; expiry frees service-owned request/key memory and permits
+even if the application retains a token. First polling `acknowledge()` commits a
+supervised attempt that continues under its deadline if its waiter is abandoned.
+It uses the original UDP destination/source route or exact TCP session, without
+replacement. `receiver.close()` stops admission while allowing admitted tokens
+until their deadlines as the runner continues; consumer drop, control/root
+shutdown or runner abort invalidates pending work. Pending-slot saturation rejects
+new Informs without closing TCP or blocking traps and shared roles. Delivery-queue
+overload keeps its configured transport policy.
+
+Command cancellation, deadline or shutdown can return before SET undo/free
+finishes. Keep the Tokio runtime driven and close admission with
+`CommandControl::request_shutdown()` before a bounded drain. `drain_mutations`
+waits for SET and unclassified work; `drain_requests` also waits for retrievals.
+A drain timeout reports incomplete work without aborting retained cleanup.
+`shutdown(timeout)` combines closing admission and full request drain. Dropping
+the last processor/control also closes admission; runtime teardown cannot
+guarantee asynchronous cleanup. Command responses are encoded results: the caller
+still owns their send and its deadline.
 
 Response histories contain each accepted message's PDU kind, decode anomalies and
 `ReceivedMessageInfo`, including discovery/correction Reports and error Responses.

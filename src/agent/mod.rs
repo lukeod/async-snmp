@@ -19,6 +19,19 @@
 //! an identified entry in `bound_addresses()`. UDP and TCP listeners share one
 //! engine, USM state, VACM configuration, handler tree and SET coordinator.
 //!
+//! For caller-owned I/O, [`CommandProcessor`] provides the same application,
+//! security and SET processing without listeners. `build()` requires no runtime
+//! and creates no tasks; `process()` requires Tokio and retains admitted requests
+//! in owned tasks. Supply original [`crate::ProcessingInput`] metadata and limits,
+//! retain a [`crate::ReceiveCapacityRegistration`] for each custom endpoint, and
+//! send returned Responses/Reports on the original UDP route or exact TCP session.
+//! Metadata and pre-authentication context selectors do not establish identity.
+//! [`CommandControl`] closes admission and observes retained work independently
+//! of caller futures. Cancellation/deadline/shutdown may return before SET cleanup;
+//! keep the runtime driven and drain after closing admission. Mutation drain
+//! includes SET/unclassified work; full request drain also waits for retrievals.
+//! A drain timeout leaves cleanup retained rather than aborting it.
+//!
 //! Command listeners ignore notifications by default. Applications intentionally
 //! discarding and acknowledging Informs must opt in with `discard_notifications()`.
 //! Forced runner termination closes network endpoints while admitted SET cleanup
@@ -75,10 +88,14 @@
 //!
 //! Encrypted classification does not publish Reports or security state. The
 //! selected application or exchange performs its own final checks. A shared USM
-//! username must use compatible credentials; conflicting client credentials are
-//! rejected before sending. Use distinct identities or separate endpoints for
-//! distinct credential contexts. Structural classification does not replace each
-//! role's configured decode policy. These attached roles currently select UDP endpoints.
+//! engine-ID/username binding must use compatible credentials; conflicting client
+//! credentials are rejected before sending. Atomic replacement can introduce a
+//! conflict with an existing exchange: conflicting Responses/Reports are safely rejected,
+//! so that exchange may fail. Valid application PDUs retain application ownership
+//! despite transaction-ID collisions. Caller-owned I/O can explicitly select
+//! separate [`crate::UsmSecurityContext`] instances before processing; there is no
+//! retry across contexts after security failure. Structural classification does
+//! not replace each role's configured decode policy.
 //!
 //! # Example
 //!

@@ -36,8 +36,14 @@
 //! process the event, then call its `acknowledge()` method. At most 256 Informs
 //! remain outstanding by default, including dequeued events; their default
 //! lifetime is 30 seconds. Saturation rejects new Informs without affecting traps
-//! or shared roles. Expiry releases service-owned request/key memory even if the
-//! token is retained. Protocol Reports are independent of application completion.
+//! or shared roles and does not close TCP; delivery-queue overload retains its
+//! transport policy. The deadline starts at acceptance and includes encoding/send.
+//! Expiry releases service-owned request/key memory and permits even if the weak
+//! token is retained. Drop/reject sends nothing. First polling `acknowledge()`
+//! commits a supervised attempt that survives abandoning its waiter, bounded by
+//! the original deadline and service shutdown. Replies retain the original UDP
+//! destination/source route or exact TCP session; closed routes are not replaced.
+//! Protocol Reports are independent of application completion.
 //!
 //! `close()` stops admission and permits admitted manual tokens until their
 //! deadlines while the runner remains driven. Consumer drop or control/root
@@ -46,6 +52,23 @@
 //! aborting the runner can lose volatile events, including acknowledged events.
 //! Acknowledgement is not a durability guarantee. Queue EOF does not report the
 //! runner's terminal result; join the runner or inspect its control status.
+//! Retransmitted Informs are independent events, with no exactly-once promise.
+//!
+//! # Caller-owned I/O
+//!
+//! [`NotificationProcessor::builder`] prepares runtime-free protocol state without
+//! sockets or tasks. Feed original complete bytes and receive metadata through
+//! [`crate::ProcessingInput`] with explicit limits; register custom endpoint
+//! capacity on [`crate::LocalEngine`]. Metadata and pre-authentication selectors
+//! are untrusted routing hints. Select a logical [`crate::UsmSecurityContext`]
+//! once, then apply security; do not retry contexts on failure.
+//!
+//! [`NotificationProcessResult`] separates accepted notifications, rejection and
+//! USM failures with optional Report bytes. Accepted Informs carry an owned
+//! [`InformResponse`]; persist/process before `encode()`, then send on the original
+//! route. Encoding retains validated keys across credential replacement and
+//! samples current engine time/sender state. Caller-owned I/O must bound retained
+//! capabilities, deadlines and sends; managed pending-ack bounds do not apply.
 //!
 //! # SNMPv1 and SNMPv2c
 //!

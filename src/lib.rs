@@ -6,6 +6,40 @@
 //!
 //! An asynchronous SNMP library built on Tokio.
 //!
+//! ## Application and I/O layers
+//!
+//! Use [`Client`] with built-in transports or a custom [`RequestTransport`] for
+//! exchanges. Managed command agents (`agent` feature) and
+//! [`NotificationReceiver`] listeners use explicit preparation and owned runners:
+//! `prepare` binds/connects and validates without spawning background tasks;
+//! drive `run` or explicitly use `spawn`/`spawn_on`.
+//!
+//! [`NotificationProcessor`] accepts complete [`ProcessingInput`] messages
+//! synchronously, without runtime, sockets or tasks. Its [`InformResponse`] is
+//! encoded only when consumed; USM failure Reports are separate protocol results.
+//! With `agent`, `CommandProcessor` uses the same command/security/SET machinery
+//! as a managed Agent. Building is runtime-free, while processing retains owned
+//! Tokio tasks so caller cancellation cannot discard admitted mutation cleanup.
+//! Close command admission and perform a bounded control drain before runtime
+//! teardown. Callers own response routing, send deadlines and I/O in both layers.
+//!
+//! Share [`LocalEngine`] for one persisted local identity, clock, counters and
+//! privacy sender state. Caller-owned endpoints retain a
+//! [`ReceiveCapacityRegistration`] from [`LocalEngine::register_receive_capacity`];
+//! the engine reports the minimum registered capacity. Supply original bytes and
+//! metadata with explicit [`ProcessingLimits`]; metadata is provenance, not an
+//! authenticated identity. [`UsmSecurityContext`] separately owns selectable
+//! credential snapshots and remote timeliness. Exact engine/user bindings precede
+//! defaults with no fallback after security failure. Atomic replacement affects
+//! later inputs; in-flight messages and deferred responses retain selected keys.
+//!
+//! Managed notifications default to automatic acknowledgement before delivery.
+//! [`NotificationAcknowledgement`] distinguishes traps, completed local attempts
+//! and application-controlled [`PendingInformAck`] capabilities. Persist first,
+//! then acknowledge; drop/reject sends nothing. Manual mode bounds outstanding
+//! Informs after dequeue (256 and 30 seconds from acceptance by default).
+//! Retransmissions are independent; acknowledgement is not exactly-once delivery.
+//!
 //! ## Protocol and API coverage
 //!
 //! - `SNMPv1`, v2c, and v3 USM clients

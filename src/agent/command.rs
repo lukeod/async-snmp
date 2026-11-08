@@ -1,4 +1,4 @@
-//! Socketless command applications and retained request ownership.
+//! Caller-owned command I/O and retained request ownership.
 
 use super::*;
 
@@ -207,6 +207,11 @@ impl CommandProcessorBuilder {
 /// reaching a deadline or requesting shutdown signals cancellation but retains
 /// commit/undo/free work until it exits while the runtime remains alive/driven.
 /// Runtime teardown or process failure cannot guarantee asynchronous cleanup.
+/// Use [`CommandControl::request_shutdown`] before bounded
+/// [`CommandControl::drain_mutations`] or [`CommandControl::drain_requests`].
+/// The first waits for SET/unclassified work; the second also waits for retrievals.
+/// Neither timeout aborts retained work. Processing does not deduplicate retries
+/// or promise exactly-once SET execution. Returned bytes still require caller I/O.
 #[derive(Clone)]
 pub struct CommandProcessor {
     core: AgentProcessor,
