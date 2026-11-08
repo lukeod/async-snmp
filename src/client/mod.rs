@@ -386,7 +386,7 @@ struct ClientInner<T: RequestTransport> {
     /// Salt counter for privacy (V3)
     salt_counter: Option<Arc<SaltCounter>>,
     /// Registered local transport capacity, retained through the last client clone.
-    _capacity_registration: Option<crate::v3::local::EngineCapacityRegistration>,
+    _capacity_registration: Option<crate::v3::local::ReceiveCapacityRegistration>,
     /// Shared engine cache (V3, optional)
     engine_cache: Option<Arc<EngineCache>>,
     /// Serializes explicit rediscovery against ordinary discovery.
@@ -688,10 +688,9 @@ impl<T: RequestTransport> Client<T> {
             || Arc::new(DiscoveryCoordinator::new()),
             |cache| Arc::clone(&cache.discovery_coordinator),
         );
-        let capacity_registration = config
-            .local_engine
-            .as_ref()
-            .map(|engine| engine.register_capacity(transport.receive_limits().advertised()));
+        let capacity_registration = config.local_engine.as_ref().map(|engine| {
+            engine.register_receive_capacity(transport.receive_limits().advertised())
+        });
         Ok(Self {
             inner: Arc::new(ClientInner {
                 transport,

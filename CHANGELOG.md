@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `CommandProcessor` exposes socketless command handling with the managed
+  Agent's application/security/SET machinery. Owned, bounded request tasks
+  retain mutation cleanup after caller cancellation, deadlines or shutdown;
+  `CommandControl` observes and drains retained work. Caller-owned endpoints
+  declare engine receive capacity with an RAII `ReceiveCapacityRegistration`;
+  admitted input holds preserve MIB state without authorizing new admissions.
+
 - Managed receivers support application-controlled Inform acknowledgement with
   bounded outstanding work, expiry and supervised completion. `inform_ack` now
   uses `NotificationAcknowledgement` to distinguish traps, completed outcomes

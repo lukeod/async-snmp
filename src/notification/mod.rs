@@ -1465,7 +1465,7 @@ impl NotificationReceiverBuilder {
             .map(|listener| listener.limits().receive.advertised())
             .min()
             .expect("at least one notification endpoint");
-        let capacity_registration = local_engine.register_capacity(capacity);
+        let capacity_registration = local_engine.register_receive_capacity(capacity);
         let enabled = self.client_exchanges;
         let engine = PreparedNotificationRole {
             local_engine,
@@ -1937,12 +1937,12 @@ struct PreparedNotificationRole {
     local_engine: crate::LocalEngine,
     security_context: crate::UsmSecurityContext,
     requires_policy: bool,
-    capacity_registration: Option<crate::v3::local::EngineCapacityRegistration>,
+    capacity_registration: Option<crate::v3::local::ReceiveCapacityRegistration>,
 }
 
 struct ReceiverInner {
     protocol: NotificationProcessor,
-    _capacity_registration: Option<crate::v3::local::EngineCapacityRegistration>,
+    _capacity_registration: Option<crate::v3::local::ReceiveCapacityRegistration>,
     max_processing: usize,
     active: std::sync::atomic::AtomicUsize,
     idle: tokio::sync::Notify,

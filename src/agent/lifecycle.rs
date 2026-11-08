@@ -97,18 +97,7 @@ impl AgentControl {
     }
     /// Number of positively classified mutation tasks still retained by the application.
     pub fn outstanding_mutations(&self) -> usize {
-        self.agent
-            .inner
-            .live_request_tasks
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|task| {
-                let phase = task.phase.load(Ordering::Acquire);
-                phase == RequestTaskPhase::SetPreCommit as u8
-                    || phase == RequestTaskPhase::SetProtected as u8
-            })
-            .count()
+        command::outstanding_mutations(&self.agent.inner)
     }
     /// Wait for mutation and unclassified tasks after network admission stopped.
     /// A timeout or retained task panic is reported without aborting cleanup.
@@ -127,34 +116,7 @@ impl AgentControl {
                 )
                 .boxed()
             })?;
-        let inner = &self.agent.inner;
-        loop {
-            let notified = inner.task_changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            let outstanding = inner
-                .live_request_tasks
-                .lock()
-                .unwrap()
-                .values()
-                .any(|task| {
-                    task.phase.load(Ordering::Acquire) != RequestTaskPhase::Retrieval as u8
-                });
-            if !outstanding {
-                if inner.mutation_failures.load(Ordering::Acquire) != 0 {
-                    return Err(Error::Config("retained mutation cleanup failed".into()).boxed());
-                }
-                return Ok(());
-            }
-            tokio::time::timeout_at(deadline.into(), notified)
-                .await
-                .map_err(|_| {
-                    Error::Config(
-                        "mutation drain deadline expired; cleanup remains retained".into(),
-                    )
-                    .boxed()
-                })?;
-        }
+        command::drain_retained(&self.agent.inner, deadline, false).await
     }
 }
 

@@ -415,7 +415,10 @@ mod tests {
         let mut msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
         msg.msg_max_size = crate::MessageSize::new(4096).unwrap();
         assert_eq!(agent.inner.state.max_message_size, 1400);
-        assert_eq!(agent.inner.state.engine_receive_capacity, 65507);
+        assert_eq!(
+            agent.inner.state.local_engine.receive_capacity().unwrap(),
+            65507
+        );
         let usm = dummy_usm();
 
         let result = agent
@@ -464,7 +467,10 @@ mod tests {
             .unwrap()
             .value;
         assert_eq!(decoded.global_data.msg_max_size, 8192);
-        assert_eq!(agent.inner.state.engine_receive_capacity, 65507);
+        assert_eq!(
+            agent.inner.state.local_engine.receive_capacity().unwrap(),
+            65507
+        );
 
         let limits = crate::transport::ProcessingLimits { send: 1, ..limits };
         let result = agent

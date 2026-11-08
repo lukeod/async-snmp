@@ -137,6 +137,13 @@
 //! }
 //! ```
 
+//! [`CommandProcessor`] uses the same application construction and command
+//! processing without owning network resources. Its dedicated builder creates
+//! no tasks; caller-owned inputs run in tracked Tokio request tasks. Custom
+//! endpoints declare receive capacities through [`crate::LocalEngine`].
+
+mod command;
+pub use command::{CommandControl, CommandProcessor, CommandProcessorBuilder, CommandResponse};
 mod lifecycle;
 pub use lifecycle::{AgentControl, AgentRunner, AgentStatus, PreparedAgent, RunningAgent};
 use lifecycle::{AgentLease, AgentNetwork};
@@ -1085,18 +1092,7 @@ impl AgentBuilder {
     where
         F: FnOnce(VacmBuilder) -> VacmBuilder,
     {
-        let builder = VacmBuilder::new();
-        self.authorization = match self.authorization {
-            AgentAuthorization::Unset
-            | AgentAuthorization::Vacm(_)
-            | AgentAuthorization::InvalidVacm(_) => match configure(builder).build() {
-                Ok(config) => AgentAuthorization::Vacm(config),
-                Err(error) => AgentAuthorization::InvalidVacm(error),
-            },
-            AgentAuthorization::AllowAll | AgentAuthorization::Conflict => {
-                AgentAuthorization::Conflict
-            }
-        };
+        self.authorization = command::configure_vacm(self.authorization, configure);
         self
     }
 
@@ -1108,14 +1104,7 @@ impl AgentBuilder {
     /// exclusive.
     #[must_use]
     pub fn allow_all_access(mut self) -> Self {
-        self.authorization = match self.authorization {
-            AgentAuthorization::Unset | AgentAuthorization::AllowAll => {
-                AgentAuthorization::AllowAll
-            }
-            AgentAuthorization::Vacm(_)
-            | AgentAuthorization::InvalidVacm(_)
-            | AgentAuthorization::Conflict => AgentAuthorization::Conflict,
-        };
+        self.authorization = command::allow_all_access(self.authorization);
         self
     }
 
@@ -1561,84 +1550,30 @@ impl AgentBuilder {
             ),
         };
         construction.check(ConstructionStage::Prepare, None, None)?;
-        let capacity_registration = local_engine.register_capacity(config.engine_receive_capacity);
-        let state = Arc::new(AgentState {
+        let capacity_registration =
+            local_engine.register_receive_capacity(config.engine_receive_capacity);
+        let inner = command::prepare_application(command::ApplicationConfig {
             local_engine,
-            _capacity_registration: capacity_registration,
-            max_message_size: config.max_message_size,
-            engine_receive_capacity: config.engine_receive_capacity,
-            decode_config: config.decode_config,
-        });
-
-        // Register built-in handlers for any not disabled
-        if !config.disabled_builtins.contains(&BuiltinMib::SnmpEngine) {
-            config.handlers.push(RegisteredHandler {
-                prefix: oid!(1, 3, 6, 1, 6, 3, 10, 2, 1),
-                handler: Arc::new(builtins::SnmpEngineHandler {
-                    state: Arc::clone(&state),
-                }),
-            });
-        }
-        if !config.disabled_builtins.contains(&BuiltinMib::UsmStats) {
-            config.handlers.push(RegisteredHandler {
-                prefix: oid!(1, 3, 6, 1, 6, 3, 15, 1, 1),
-                handler: Arc::new(builtins::UsmStatsHandler {
-                    state: Arc::clone(&state),
-                }),
-            });
-        }
-        if !config.disabled_builtins.contains(&BuiltinMib::MpdStats) {
-            config.handlers.push(RegisteredHandler {
-                prefix: oid!(1, 3, 6, 1, 6, 3, 11, 2, 1),
-                handler: Arc::new(builtins::MpdStatsHandler {
-                    state: Arc::clone(&state),
-                }),
-            });
-        }
-
-        // Sort handlers by prefix length (longest first) for matching
-        config
-            .handlers
-            .sort_by_key(|h| std::cmp::Reverse(h.prefix.len()));
-
-        let inner = Arc::new(AgentInner {
-            discard_notifications: config.discard_notifications,
-            command_stop: ingress.disabled.clone(),
-            task_changed: tokio::sync::Notify::new(),
-            mutation_failures: AtomicU64::new(0),
-            communities: config.communities,
             security_context,
-            security_context_required: config.security_context_required,
+            capacity_registration: Some(capacity_registration),
+            communities: config.communities,
             handlers: config.handlers,
-            state,
-            set_coordinator: tokio::sync::Mutex::new(()),
-            #[cfg(test)]
+            security_context_required: config.security_context_required,
+            max_message_size: config.max_message_size,
+            decode_config: config.decode_config,
             concurrency_limit: config.concurrency_limit,
             authorization: config.authorization,
+            command_stop: ingress.disabled.clone(),
             cancel: config.cancel,
+            discard_notifications: config.discard_notifications,
             trap_send_timeout: config.trap_send_timeout,
             inform_timeout: config.inform_timeout,
             inform_retry: config.inform_retry,
-            notification_id: std::sync::atomic::AtomicI32::new(1),
-            run_active: AtomicBool::new(false),
-            run_orphaned: AtomicBool::new(false),
-            active_request_tasks: AtomicUsize::new(0),
-            next_request_task_id: AtomicU64::new(1),
-            live_request_tasks: std::sync::Mutex::new(HashMap::new()),
             response_send_timeout: config.response_send_timeout,
             request_deadline: config.request_deadline,
             shutdown_policy: config.shutdown_policy,
             notification_fanout_limit: config.notification_fanout_limit,
-            #[cfg(test)]
-            response_send_gate: std::sync::Mutex::new(None),
-            #[cfg(test)]
-            response_sends_started: AtomicU32::new(0),
-            #[cfg(test)]
-            received_datagrams: AtomicU32::new(0),
-            #[cfg(test)]
-            receive_errors: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
-            #[cfg(test)]
-            receive_attempts: Arc::new(AtomicU32::new(0)),
+            disabled_builtins: config.disabled_builtins,
         });
         construction.check(ConstructionStage::Prepare, None, None)?;
         let agent = Agent {
@@ -1716,23 +1651,10 @@ impl AgentBuilder {
             crate::transport::checked_deadline(grace, "agent shutdown grace")?;
         }
 
-        if matches!(self.authorization, AgentAuthorization::Conflict) {
-            return Err(Error::Config(
-                "VACM and unrestricted Agent access are mutually exclusive".into(),
-            )
-            .boxed());
-        }
-        if let AgentAuthorization::InvalidVacm(error) = &self.authorization {
-            return Err(Error::Config(error.to_string().into()).boxed());
-        }
-        if (!self.communities.is_empty() || security_context_required)
-            && matches!(self.authorization, AgentAuthorization::Unset)
-        {
-            return Err(Error::Config(
-                "an Agent with inbound identities requires vacm() or allow_all_access()".into(),
-            )
-            .boxed());
-        }
+        command::validate_authorization(
+            &self.authorization,
+            !self.communities.is_empty() || security_context_required,
+        )?;
 
         let mut sink_ids = HashSet::with_capacity(self.trap_sinks.len());
         for (id, _, _) in &self.trap_sinks {
@@ -2081,9 +2003,8 @@ impl Default for AgentBuilder {
 /// Engine state and counters shared across agent clones and (future) built-in handlers.
 pub(crate) struct AgentState {
     pub(crate) local_engine: crate::LocalEngine,
-    _capacity_registration: crate::v3::local::EngineCapacityRegistration,
+    _capacity_registration: Option<crate::v3::ReceiveCapacityRegistration>,
     pub(crate) max_message_size: usize,
-    pub(crate) engine_receive_capacity: MessageSize,
     pub(crate) decode_config: crate::DecodeConfig,
 }
 
@@ -2110,6 +2031,7 @@ impl AgentState {
 pub(crate) struct AgentInner {
     discard_notifications: bool,
     command_stop: CancellationToken,
+    command_admission_gate: std::sync::Mutex<()>,
     task_changed: tokio::sync::Notify,
     mutation_failures: AtomicU64,
     pub(crate) communities: Vec<crate::Community>,
@@ -2119,7 +2041,6 @@ pub(crate) struct AgentInner {
     pub(crate) state: Arc<AgentState>,
     /// Serializes complete SET transactions without restricting retrieval.
     pub(crate) set_coordinator: tokio::sync::Mutex<()>,
-    #[cfg(test)]
     pub(crate) concurrency_limit: Arc<Semaphore>,
     pub(crate) authorization: AgentAuthorization,
     /// Cancellation token for graceful shutdown.
@@ -7241,7 +7162,7 @@ mod tests {
             .unwrap();
         assert_eq!(agent.inner.state.max_message_size, 0);
         assert_eq!(
-            agent.inner.state.engine_receive_capacity,
+            agent.inner.state.local_engine.receive_capacity().unwrap(),
             UDP_RECEIVE_LIMITS.advertised()
         );
     }

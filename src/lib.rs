@@ -597,6 +597,7 @@ pub mod mib_support;
 #[cfg(feature = "agent")]
 pub use agent::{
     Agent, AgentBuilder, AgentControl, AgentRunner, AgentShutdownPolicy, AgentStatus, BuiltinMib,
+    CommandControl, CommandProcessor, CommandProcessorBuilder, CommandResponse,
     DuplicateVacmAccessEntry, NotificationOutcome, NotificationPeer, NotificationSendStream,
     NotificationSinkId, NotificationSinkIdError, NotificationSinkSummary, NotificationTarget,
     PreparedAgent, RunningAgent, SinkOutcome, SinkSkipReason, SinkStatus, VacmAccessIndex,
@@ -662,8 +663,9 @@ pub use v3::{
     AuthoritativeEnginePersistenceOperation, CryptoBackend, CryptoError, CryptoResult,
     DesSaltPersistenceError, DesSaltPersistenceOperation, DesSaltState, DesSaltStateError,
     DiscoveredEngine, EngineCache, LocalEngine, LocalEngineHealth, ParseProtocolError,
-    PersistedAuthoritativeEngine, PersistedDesSaltState, PrivProtocol, UsmConfig, UsmFailure,
-    UsmSecurityContext, UsmStatsSnapshot, UsmUser, UsmUserEntry, generate_engine_id,
+    PersistedAuthoritativeEngine, PersistedDesSaltState, PrivProtocol, ReceiveCapacityRegistration,
+    UsmConfig, UsmFailure, UsmSecurityContext, UsmStatsSnapshot, UsmUser, UsmUserEntry,
+    generate_engine_id,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use v3::{LocalizedKey, MasterKey, MasterKeys};

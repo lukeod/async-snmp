@@ -78,8 +78,13 @@ pub(crate) struct LocalEngineInner {
     pub(crate) health: tokio::sync::watch::Sender<LocalEngineHealth>,
     salt_counter: OnceLock<Arc<SaltCounter>>,
     des_salt_state: RwLock<LocalDesState>,
-    capacities: Mutex<BTreeMap<u64, MessageSize>>,
+    capacities: Mutex<BTreeMap<u64, RegisteredCapacity>>,
     next_capacity: AtomicU64,
+}
+
+struct RegisteredCapacity {
+    advertised: MessageSize,
+    endpoint: bool,
 }
 
 // Retain the allocator after removal so an independent same-epoch state cannot
@@ -311,9 +316,11 @@ impl LocalEngine {
         Ok(())
     }
 
-    /// Minimum advertised receive capacity of registered services and clients.
-    /// Client registrations remain until their last clone is dropped. Returns
-    /// `None` while no service or client is registered. Per-message v3
+    /// Minimum advertised receive capacity of declared endpoints and retained
+    /// processing inputs. Client registrations remain until their last clone
+    /// is dropped; admitted commands retain their input capacity through cleanup.
+    /// Returns `None` while neither endpoints nor processing inputs remain.
+    /// Per-message v3
     /// advertisement continues to use the receiving endpoint's own capacity.
     pub fn receive_capacity(&self) -> Option<MessageSize> {
         self.inner
@@ -321,26 +328,83 @@ impl LocalEngine {
             .lock()
             .unwrap()
             .values()
-            .copied()
+            .map(|entry| entry.advertised)
             .min()
     }
 
-    pub(crate) fn register_capacity(&self, capacity: MessageSize) -> EngineCapacityRegistration {
+    pub(crate) fn declared_receive_capacity(&self) -> Option<MessageSize> {
+        self.inner
+            .capacities
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|entry| entry.endpoint)
+            .map(|entry| entry.advertised)
+            .min()
+    }
+
+    /// Register a caller-owned endpoint's advertised receive capacity.
+    ///
+    /// Retain the returned registration while that endpoint serves this engine.
+    /// Register every endpoint; the engine MIB reports their minimum. Dropping
+    /// the registration removes that capacity. This creates no I/O or tasks.
+    pub fn register_receive_capacity(&self, capacity: MessageSize) -> ReceiveCapacityRegistration {
         let id = self.inner.next_capacity.fetch_add(1, Ordering::Relaxed);
-        self.inner.capacities.lock().unwrap().insert(id, capacity);
-        EngineCapacityRegistration {
+        self.inner.capacities.lock().unwrap().insert(
+            id,
+            RegisteredCapacity {
+                advertised: capacity,
+                endpoint: true,
+            },
+        );
+        ReceiveCapacityRegistration {
             engine: self.clone(),
             id,
         }
     }
+
+    pub(crate) fn register_processing_capacity(
+        &self,
+        capacity: MessageSize,
+    ) -> Result<ReceiveCapacityRegistration> {
+        let mut registered = self.inner.capacities.lock().unwrap();
+        if registered
+            .values()
+            .filter(|entry| entry.endpoint)
+            .map(|entry| entry.advertised)
+            .min()
+            .is_none_or(|minimum| minimum > capacity)
+        {
+            return Err(Error::Config(
+                "register the caller-owned endpoint receive capacity before command processing"
+                    .into(),
+            )
+            .boxed());
+        }
+        let id = self.inner.next_capacity.fetch_add(1, Ordering::Relaxed);
+        registered.insert(
+            id,
+            RegisteredCapacity {
+                advertised: capacity,
+                endpoint: false,
+            },
+        );
+        Ok(ReceiveCapacityRegistration {
+            engine: self.clone(),
+            id,
+        })
+    }
 }
 
-pub(crate) struct EngineCapacityRegistration {
+/// Lifetime registration of one endpoint's advertised receive capacity.
+/// Dropping it removes that endpoint from the local engine minimum.
+#[must_use = "retain the registration while the caller-owned endpoint serves this engine"]
+pub struct ReceiveCapacityRegistration {
     engine: LocalEngine,
     id: u64,
 }
 
-impl Drop for EngineCapacityRegistration {
+impl Drop for ReceiveCapacityRegistration {
     fn drop(&mut self) {
         self.engine
             .inner
@@ -390,8 +454,8 @@ mod tests {
                 .load(Ordering::Relaxed),
             1
         );
-        let first = engine.register_capacity(MessageSize::new(8192).unwrap());
-        let second = other.register_capacity(MessageSize::new(32768).unwrap());
+        let first = engine.register_receive_capacity(MessageSize::new(8192).unwrap());
+        let second = other.register_receive_capacity(MessageSize::new(32768).unwrap());
         assert_eq!(other.receive_capacity().unwrap().as_usize(), 8192);
         drop(first);
         assert_eq!(engine.receive_capacity().unwrap().as_usize(), 32768);

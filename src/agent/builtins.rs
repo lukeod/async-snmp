@@ -57,7 +57,9 @@ impl SnmpEngineHandler {
                 self.state
                     .local_engine
                     .receive_capacity()
-                    .unwrap_or(self.state.engine_receive_capacity)
+                    .ok_or_else(|| {
+                        crate::HandlerError::new("no registered local receive capacity")
+                    })?
                     .as_i32(),
             )),
             _ => None,
@@ -324,11 +326,11 @@ mod tests {
         stats.unsupported_sec_levels.store(80, Ordering::Relaxed);
         stats.decryption_errors.store(90, Ordering::Relaxed);
         Arc::new(AgentState {
-            _capacity_registration: engine
-                .register_capacity(crate::UDP_RECEIVE_LIMITS.advertised()),
+            _capacity_registration: Some(
+                engine.register_receive_capacity(crate::UDP_RECEIVE_LIMITS.advertised()),
+            ),
             local_engine: engine,
             max_message_size: 1472,
-            engine_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             decode_config: crate::DecodeConfig::default(),
         })
     }
@@ -401,7 +403,7 @@ mod tests {
             None,
         );
         state_mut._capacity_registration =
-            engine.register_capacity(crate::UDP_RECEIVE_LIMITS.advertised());
+            Some(engine.register_receive_capacity(crate::UDP_RECEIVE_LIMITS.advertised()));
         state_mut.local_engine = engine;
         let handler = SnmpEngineHandler { state };
 
