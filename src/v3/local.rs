@@ -84,6 +84,7 @@ pub(crate) struct LocalEngineInner {
 
 struct RegisteredCapacity {
     advertised: MessageSize,
+    #[cfg(feature = "agent")]
     endpoint: bool,
 }
 
@@ -332,6 +333,7 @@ impl LocalEngine {
             .min()
     }
 
+    #[cfg(feature = "agent")]
     pub(crate) fn declared_receive_capacity(&self) -> Option<MessageSize> {
         self.inner
             .capacities
@@ -354,6 +356,7 @@ impl LocalEngine {
             id,
             RegisteredCapacity {
                 advertised: capacity,
+                #[cfg(feature = "agent")]
                 endpoint: true,
             },
         );
@@ -363,6 +366,7 @@ impl LocalEngine {
         }
     }
 
+    #[cfg(feature = "agent")]
     pub(crate) fn register_processing_capacity(
         &self,
         capacity: MessageSize,
