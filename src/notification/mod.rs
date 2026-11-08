@@ -278,9 +278,11 @@ pub use lifecycle::{
 use std::collections::HashMap;
 #[cfg(test)]
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::Community;
 use bytes::Bytes;
@@ -295,7 +297,6 @@ use crate::pdu::TrapV1Pdu;
 use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{PreparedAuthoritativeUsm, validate_authoritative_usm};
 use crate::v3::process::RemoteEngineTable;
-use crate::v3::process::UsmStats;
 use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -778,6 +779,7 @@ pub struct NotificationReceiverBuilder {
     max_processing: usize,
     usm_users: HashMap<Bytes, UsmUser>,
     communities: Vec<Community>,
+    local_engine: Option<crate::LocalEngine>,
     authoritative_engine: Option<AuthoritativeEngine>,
     des_salt_state: Option<DesSaltState>,
     varbind_validation: NotificationVarbindValidation,
@@ -812,6 +814,7 @@ impl NotificationReceiverBuilder {
             max_processing: 64,
             usm_users: HashMap::new(),
             communities: Vec::new(),
+            local_engine: None,
             authoritative_engine: None,
             des_salt_state: None,
             varbind_validation: NotificationVarbindValidation::Tolerant,
@@ -1128,6 +1131,15 @@ impl NotificationReceiverBuilder {
         self
     }
 
+    /// Share local engine identity, clock, counters and privacy-sender state.
+    /// Conflicts with `authoritative_engine` or `des_salt_state` configuration.
+    /// Credentials, remote timeliness and acceptance remain receiver-specific.
+    #[must_use]
+    pub fn local_engine(mut self, engine: crate::LocalEngine) -> Self {
+        self.local_engine = Some(engine);
+        self
+    }
+
     /// Set durable local generating-engine state for DES/3DES Inform responses.
     #[must_use]
     pub fn des_salt_state(mut self, state: DesSaltState) -> Self {
@@ -1208,6 +1220,17 @@ impl NotificationReceiverBuilder {
             self.response_send_timeout,
             "notification response send timeout",
         )?;
+
+        if let Some(engine) = &self.local_engine {
+            if self.authoritative_engine.is_some() || self.des_salt_state.is_some() {
+                return Err(Error::Config(
+                    "local_engine conflicts with authoritative_engine or des_salt_state".into(),
+                )
+                .boxed());
+            }
+            self.authoritative_engine = engine.authoritative_engine().cloned();
+            self.des_salt_state = engine.des_salt_state();
+        }
 
         let uses_des = self.usm_users.values().any(|security| {
             security
@@ -1303,22 +1326,32 @@ impl NotificationReceiverBuilder {
             engine_id,
             engine_boots,
         } = validated_usm.prepare(generate_engine_id)?;
-        let salt_counter = uses_aes.then(SaltCounter::new).transpose()?.map(Arc::new);
+        let local_engine = match self.local_engine.take() {
+            Some(engine) => {
+                if uses_aes {
+                    engine.ensure_salt_counter(SaltCounter::new)?;
+                }
+                engine
+            }
+            None => crate::LocalEngine::from_prepared(
+                authoritative_engine,
+                engine_id,
+                engine_boots,
+                uses_aes.then(SaltCounter::new).transpose()?.map(Arc::new),
+                self.des_salt_state.take(),
+            ),
+        };
+        let capacity = listeners
+            .iter()
+            .map(|listener| listener.limits().receive.advertised())
+            .min()
+            .expect("at least one notification endpoint");
+        let capacity_registration = local_engine.register_capacity(capacity);
         let enabled = self.client_exchanges;
-        let engine = NotificationEngine {
-            authoritative_engine,
-            engine_id,
-            engine_boots,
+        let engine = PreparedNotificationRole {
+            local_engine,
             usm_users,
-            salt_counter,
-            des_salt_state: self.des_salt_state.take(),
-            stats: Arc::new(UsmStats::default()),
-            snmp_in_asn_parse_errs: Arc::new(AtomicU32::new(0)),
-            snmp_invalid_msgs: Arc::new(AtomicU32::new(0)),
-            snmp_unknown_security_models: Arc::new(AtomicU32::new(0)),
-            snmp_silent_drops: Arc::new(AtomicU32::new(0)),
-
-            time_source: None,
+            capacity_registration: Some(capacity_registration),
         };
         let (receiver, processor, cleanup) = self.prepare_role(engine, network.clone())?;
         let roles = Arc::new(crate::transport::dispatch::DispatchRoles::new(
@@ -1336,7 +1369,7 @@ impl NotificationReceiverBuilder {
     }
     fn prepare_role(
         self,
-        engine: NotificationEngine,
+        engine: PreparedNotificationRole,
         network: Arc<crate::transport::network::NetworkState>,
     ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
         if self.queue_capacity == 0
@@ -1366,9 +1399,9 @@ impl NotificationReceiverBuilder {
         }
         let (sender, events) = mpsc::channel(self.queue_capacity);
         let delivery = Arc::new(Delivery::new(sender));
-        let (health, _) = watch::channel(NotificationHealth::Healthy);
         let inner = Arc::new(ReceiverInner {
-            authoritative_engine: engine.authoritative_engine,
+            local_engine: engine.local_engine,
+            _capacity_registration: engine.capacity_registration,
             #[cfg(test)]
             socket: network.udp.first().map(crate::UdpEndpoint::test_socket),
             #[cfg(test)]
@@ -1376,28 +1409,15 @@ impl NotificationReceiverBuilder {
             #[cfg(test)]
             endpoint_id: network.bound[0].endpoint_id,
             delivery: delivery.clone(),
-            health,
             usm_users: engine.usm_users,
             communities: self.communities,
             varbind_validation: self.varbind_validation,
-            engine_id: engine.engine_id,
-            salt_counter: engine.salt_counter,
-            des_salt_state: engine.des_salt_state,
-            authoritative_snapshot: AtomicU64::new(pack_boots_time((engine.engine_boots, 0))),
-            engine_boots_base: engine.engine_boots,
-            engine_start: Instant::now(),
-            usm_stats: engine.stats,
-            time_source: engine.time_source,
             max_processing: self.max_processing,
             active: std::sync::atomic::AtomicUsize::new(0),
             idle: tokio::sync::Notify::new(),
             remote_engines: Mutex::new(RemoteEngineTable::new(MAX_REMOTE_ENGINES)),
             max_message_size: self.max_message_size,
             decode_config: self.decode_config,
-            snmp_in_asn_parse_errs: engine.snmp_in_asn_parse_errs,
-            snmp_invalid_msgs: engine.snmp_invalid_msgs,
-            snmp_unknown_security_models: engine.snmp_unknown_security_models,
-            snmp_silent_drops: engine.snmp_silent_drops,
             acceptance_policy: self.acceptance_policy,
             response_send_timeout: self.response_send_timeout,
             #[cfg(test)]
@@ -1435,6 +1455,7 @@ impl NotificationReceiverBuilder {
             || self.network_explicit
             || !self.listeners.is_empty()
             || self.bind_explicit
+            || self.local_engine.is_some()
             || self.authoritative_engine.is_some()
             || !self.usm_users.is_empty()
             || self.des_salt_state.is_some()
@@ -1478,21 +1499,10 @@ impl NotificationReceiverBuilder {
         network: &Arc<crate::transport::network::NetworkState>,
     ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
         self.validate_attached(!agent.inner.usm_users.is_empty())?;
-        let state = agent.inner.state.clone();
-        let engine = NotificationEngine {
-            authoritative_engine: state.authoritative_engine.clone(),
-            engine_id: state.engine_id.clone(),
-            engine_boots: state.engine_boots_base,
+        let engine = PreparedNotificationRole {
+            local_engine: agent.inner.state.local_engine.clone(),
             usm_users: agent.inner.usm_users.clone(),
-            salt_counter: agent.inner.salt_counter.clone(),
-            des_salt_state: agent.inner.des_salt_state.clone(),
-            stats: state.usm_stats.clone(),
-            snmp_in_asn_parse_errs: state.snmp_in_asn_parse_errs.clone(),
-            snmp_invalid_msgs: state.snmp_invalid_msgs.clone(),
-            snmp_unknown_security_models: state.snmp_unknown_security_models.clone(),
-            snmp_silent_drops: state.snmp_silent_drops.clone(),
-
-            time_source: Some(Arc::new(move || state.authoritative_boots_time())),
+            capacity_registration: None,
         };
         self.prepare_role(engine, network.clone())
     }
@@ -1787,28 +1797,18 @@ pub(crate) struct NotificationProcessor {
     inner: Arc<ReceiverInner>,
 }
 
-struct NotificationEngine {
-    authoritative_engine: Option<AuthoritativeEngine>,
-    engine_id: Bytes,
-    engine_boots: u32,
+struct PreparedNotificationRole {
+    local_engine: crate::LocalEngine,
     usm_users: HashMap<Bytes, UsmUser>,
-    salt_counter: Option<Arc<SaltCounter>>,
-    des_salt_state: Option<DesSaltState>,
-    stats: Arc<UsmStats>,
-    snmp_in_asn_parse_errs: Arc<AtomicU32>,
-    snmp_invalid_msgs: Arc<AtomicU32>,
-    snmp_unknown_security_models: Arc<AtomicU32>,
-    snmp_silent_drops: Arc<AtomicU32>,
-
-    time_source: Option<crate::client::LocalAuthoritativeTimeSource>,
+    capacity_registration: Option<crate::v3::local::EngineCapacityRegistration>,
 }
 
 struct ReceiverInner {
-    time_source: Option<crate::client::LocalAuthoritativeTimeSource>,
+    local_engine: crate::LocalEngine,
+    _capacity_registration: Option<crate::v3::local::EngineCapacityRegistration>,
     max_processing: usize,
     active: std::sync::atomic::AtomicUsize,
     idle: tokio::sync::Notify,
-    authoritative_engine: Option<AuthoritativeEngine>,
     #[cfg(test)]
     socket: Option<Arc<UdpSocket>>,
     #[cfg(test)]
@@ -1816,7 +1816,6 @@ struct ReceiverInner {
     #[cfg(test)]
     endpoint_id: crate::EndpointId,
     delivery: Arc<Delivery>,
-    health: watch::Sender<NotificationHealth>,
     /// Configured USM users for V3 authentication
     usm_users: HashMap<Bytes, UsmUser>,
     /// Accepted v1/v2c community strings. Empty means accept any community
@@ -1825,19 +1824,6 @@ struct ReceiverInner {
     communities: Vec<Community>,
     /// Validation policy for SNMPv2c/v3 standard notification varbind prefixes.
     varbind_validation: NotificationVarbindValidation,
-    /// Engine ID for V3 discovery responses
-    engine_id: Bytes,
-    /// Salt counter for privacy operations
-    salt_counter: Option<Arc<SaltCounter>>,
-    des_salt_state: Option<DesSaltState>,
-    /// Most recently sampled authoritative boots/time tuple.
-    authoritative_snapshot: AtomicU64,
-    /// Initial engine boots value at startup, used to compute overflow-adjusted boots.
-    engine_boots_base: u32,
-    /// Time when the receiver was started, used to compute engine time.
-    engine_start: Instant,
-    /// RFC 3414 usmStats counters
-    usm_stats: Arc<UsmStats>,
     /// Timeliness state for remote authoritative engines (trap senders),
     /// keyed by engine ID (RFC 3414 Section 2.3). Seeded from the first
     /// authenticated message from each engine, so only holders of configured
@@ -1849,11 +1835,6 @@ struct ReceiverInner {
     /// Local outbound response policy limit.
     max_message_size: usize,
     decode_config: crate::DecodeConfig,
-    /// Confirmed notifications dropped because even the alternate Response did not fit.
-    snmp_in_asn_parse_errs: Arc<AtomicU32>,
-    snmp_invalid_msgs: Arc<AtomicU32>,
-    snmp_unknown_security_models: Arc<AtomicU32>,
-    snmp_silent_drops: Arc<AtomicU32>,
     acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
     response_send_timeout: Duration,
     #[cfg(test)]
@@ -1900,73 +1881,24 @@ impl ReceiverInner {
         }
     }
 
-    /// Return one coherent authoritative boots/time pair for the current instant.
     fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
-        let pair = if let Some(source) = &self.time_source {
-            source()
-        } else {
-            match &self.authoritative_engine {
-                Some(engine) => engine.current_boots_time(),
-                None => {
-                    let total_secs = self.engine_start.elapsed().as_secs();
-                    Ok(crate::v3::compute_engine_boots_time(
-                        self.engine_boots_base,
-                        total_secs,
-                    ))
-                }
-            }
-        };
-        match pair {
-            Ok(pair) => {
-                self.health.send_if_modified(|health| {
-                    if *health == NotificationHealth::Healthy {
-                        false
-                    } else {
-                        *health = NotificationHealth::Healthy;
-                        true
-                    }
-                });
-                Ok(self.publish_authoritative_boots_time(pair))
-            }
-            Err(error) => {
-                if let Some(persistence) = error.authoritative_engine_persistence() {
-                    self.health.send_modify(|health| {
-                        let consecutive_failures = match *health {
-                            NotificationHealth::AuthoritativePersistenceDegraded {
-                                consecutive_failures,
-                                ..
-                            } => consecutive_failures.saturating_add(1),
-                            NotificationHealth::Healthy => 1,
-                        };
-                        *health = NotificationHealth::AuthoritativePersistenceDegraded {
-                            consecutive_failures,
-                            operation: persistence.operation(),
-                            previous_engine_boots: persistence.previous_engine_boots(),
-                            attempted_engine_boots: persistence.attempted_engine_boots(),
-                        };
-                    });
-                }
-                Err(error)
-            }
-        }
+        self.local_engine.current_boots_time()
     }
 
+    #[cfg(test)]
     fn publish_authoritative_boots_time(&self, pair: (u32, u32)) -> (u32, u32) {
-        let packed = pack_boots_time(pair);
-        let previous = self
-            .authoritative_snapshot
-            .fetch_max(packed, Ordering::Relaxed);
-        unpack_boots_time(previous.max(packed))
+        self.local_engine.publish_boots_time(pair)
     }
 }
 
-const fn pack_boots_time((boots, time): (u32, u32)) -> u64 {
-    (boots as u64) << 32 | time as u64
+impl std::ops::Deref for ReceiverInner {
+    type Target = crate::v3::local::LocalEngineInner;
+    fn deref(&self) -> &Self::Target {
+        &self.local_engine.inner
+    }
 }
 
-const fn unpack_boots_time(packed: u64) -> (u32, u32) {
-    ((packed >> 32) as u32, packed as u32)
-}
+use crate::v3::local::unpack_boots_time;
 
 impl NotificationReceiver {
     /// Create a builder for configuring the notification receiver.
@@ -2054,6 +1986,11 @@ impl NotificationReceiver {
         self.inner.decode_config
     }
 
+    /// Shared local engine state, independent of this receiver's endpoints.
+    pub fn local_engine(&self) -> crate::LocalEngine {
+        self.inner.local_engine.clone()
+    }
+
     /// Returns the local engine ID.
     ///
     /// With an [`AuthoritativeEngine`] this is the stable persisted V3
@@ -2066,11 +2003,10 @@ impl NotificationReceiver {
 
     /// Returns the most recently sampled local engine boots value.
     ///
-    /// V3 processing samples the authoritative clock. Any rollover increment
-    /// has already been stored through the retained persistence callback before
-    /// this snapshot is published. This getter does not sample the clock or run
-    /// the persistence callback, so it can remain unchanged while the receiver
-    /// is idle.
+    /// Any role sharing the local engine can sample its authoritative clock.
+    /// Rollover increments are stored through the retained persistence callback
+    /// before publication. This getter does not sample the clock or run the
+    /// persistence callback; it reads the latest shared snapshot.
     #[must_use]
     pub fn engine_boots(&self) -> u32 {
         unpack_boots_time(self.inner.authoritative_snapshot.load(Ordering::Relaxed)).0
@@ -2366,7 +2302,7 @@ mod tests {
                 NotificationVarbindValidation::Tolerant
             );
             crate::v3::validate_engine_id(receiver.engine_id()).unwrap();
-            assert!(receiver.inner.salt_counter.is_none());
+            assert!(receiver.inner.local_engine.salt_counter().is_none());
             assert_eq!(receiver.inner.engine_boots_base, 1);
             assert!(receiver.inner.remote_engines.lock().unwrap().is_empty());
             assert_eq!(

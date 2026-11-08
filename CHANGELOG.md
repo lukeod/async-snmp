@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `LocalEngine` shares local identity, authoritative time, engine counters,
+  persistence health and privacy-sender state across independently prepared
+  agent and notification services. Builders accept `local_engine`; engine MIB
+  receive capacity tracks the minimum across registered service lifetimes.
+
 - Public `ProcessingInput` validates original packet length and the hard receive
   bound using `ProcessingLimits`. Managed command and notification processing
   use the same envelope, preserving receive identity, UDP tolerance and TCP limits.

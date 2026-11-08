@@ -45,6 +45,8 @@ mod config;
 mod crypto;
 pub(crate) mod encode;
 mod engine;
+pub(crate) mod local;
+pub use local::{LocalEngine, LocalEngineHealth};
 pub(crate) mod prepared;
 #[cfg_attr(
     not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")),

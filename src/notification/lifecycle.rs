@@ -84,25 +84,8 @@ impl NotificationAdmission {
     }
 }
 
-/// Health of the notification role's local authoritative engine. Changes are
-/// coalesced; a later successful authoritative acquisition restores health.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum NotificationHealth {
-    /// No unresolved authoritative persistence failure.
-    Healthy,
-    /// Traffic requiring unavailable local authoritative state is withheld.
-    AuthoritativePersistenceDegraded {
-        /// Failed acquisitions during the current outage.
-        consecutive_failures: u64,
-        /// Durable transition whose publication failed.
-        operation: crate::v3::AuthoritativeEnginePersistenceOperation,
-        /// Last durable boots value.
-        previous_engine_boots: Option<u32>,
-        /// Boots value passed to the persistence callback.
-        attempted_engine_boots: u32,
-    },
-}
+/// Shared local authoritative-engine persistence health.
+pub use crate::v3::LocalEngineHealth as NotificationHealth;
 
 /// Network runner state. Queue EOF does not distinguish normal termination
 /// from failure; inspect this state or join the runner.

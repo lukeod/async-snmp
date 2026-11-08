@@ -659,8 +659,9 @@ pub use v3::{
     AuthProtocol, AuthoritativeEngine, AuthoritativeEnginePersistenceError,
     AuthoritativeEnginePersistenceOperation, CryptoBackend, CryptoError, CryptoResult,
     DesSaltPersistenceError, DesSaltPersistenceOperation, DesSaltState, DesSaltStateError,
-    DiscoveredEngine, EngineCache, ParseProtocolError, PersistedAuthoritativeEngine,
-    PersistedDesSaltState, PrivProtocol, UsmConfig, UsmUser, generate_engine_id,
+    DiscoveredEngine, EngineCache, LocalEngine, LocalEngineHealth, ParseProtocolError,
+    PersistedAuthoritativeEngine, PersistedDesSaltState, PrivProtocol, UsmConfig, UsmUser,
+    generate_engine_id,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use v3::{LocalizedKey, MasterKey, MasterKeys};

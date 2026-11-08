@@ -53,7 +53,13 @@ impl SnmpEngineHandler {
             3 => Some(Value::Integer(
                 self.state.authoritative_boots_time()?.1 as i32,
             )),
-            4 => Some(Value::Integer(self.state.engine_receive_capacity.as_i32())),
+            4 => Some(Value::Integer(
+                self.state
+                    .local_engine
+                    .receive_capacity()
+                    .unwrap_or(self.state.engine_receive_capacity)
+                    .as_i32(),
+            )),
             _ => None,
         })
     }
@@ -286,8 +292,6 @@ impl MibHandler for MpdStatsHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
-    use std::time::Instant;
 
     use bytes::Bytes;
 
@@ -295,31 +299,37 @@ mod tests {
     use crate::pdu::PduType;
 
     fn test_state() -> Arc<AgentState> {
+        let engine = crate::LocalEngine::from_prepared(
+            None,
+            Bytes::from_static(&[0x80, 0x00, 0x01, 0x02, 0x03]),
+            5,
+            None,
+            None,
+        );
+        engine
+            .inner
+            .authoritative_elapsed_override
+            .store(12345, Ordering::Relaxed);
+        engine.inner.snmp_invalid_msgs.store(10, Ordering::Relaxed);
+        engine
+            .inner
+            .snmp_unknown_security_models
+            .store(20, Ordering::Relaxed);
+        engine.inner.snmp_silent_drops.store(30, Ordering::Relaxed);
+        let stats = &engine.inner.usm_stats;
+        stats.unknown_engine_ids.store(40, Ordering::Relaxed);
+        stats.unknown_usernames.store(50, Ordering::Relaxed);
+        stats.wrong_digests.store(60, Ordering::Relaxed);
+        stats.not_in_time_windows.store(70, Ordering::Relaxed);
+        stats.unsupported_sec_levels.store(80, Ordering::Relaxed);
+        stats.decryption_errors.store(90, Ordering::Relaxed);
         Arc::new(AgentState {
-            authoritative_engine: None,
-            engine_id: Bytes::from_static(&[0x80, 0x00, 0x01, 0x02, 0x03]),
-            engine_start: Instant::now(),
-            engine_boots_base: 5,
-            authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(12345),
+            _capacity_registration: engine
+                .register_capacity(crate::UDP_RECEIVE_LIMITS.advertised()),
+            local_engine: engine,
             max_message_size: 1472,
             engine_receive_capacity: crate::UDP_RECEIVE_LIMITS.advertised(),
             decode_config: crate::DecodeConfig::default(),
-            snmp_in_asn_parse_errs: Arc::new(AtomicU32::new(0)),
-            snmp_invalid_msgs: Arc::new(AtomicU32::new(10)),
-            snmp_unknown_security_models: Arc::new(AtomicU32::new(20)),
-            snmp_silent_drops: Arc::new(AtomicU32::new(30)),
-            snmp_unknown_contexts: AtomicU32::new(0),
-            usm_stats: {
-                let stats = crate::v3::process::UsmStats::default();
-                stats.unknown_engine_ids.store(40, Ordering::Relaxed);
-                stats.unknown_usernames.store(50, Ordering::Relaxed);
-                stats.wrong_digests.store(60, Ordering::Relaxed);
-                stats.not_in_time_windows.store(70, Ordering::Relaxed);
-                stats.unsupported_sec_levels.store(80, Ordering::Relaxed);
-                stats.decryption_errors.store(90, Ordering::Relaxed);
-                Arc::new(stats)
-            },
-            health: tokio::sync::watch::channel(crate::agent::AgentHealth::Healthy).0,
         })
     }
 
@@ -379,14 +389,20 @@ mod tests {
     async fn snmp_engine_clock_failure_is_a_handler_error() {
         let mut state = test_state();
         let state_mut = Arc::get_mut(&mut state).unwrap();
-        state_mut.authoritative_engine = Some(
+        let authoritative =
             crate::v3::AuthoritativeEngine::with_rollover_persistence_failure_for_test(
                 b"test-agent-engine".to_vec(),
-            ),
+            );
+        let engine = crate::LocalEngine::from_prepared(
+            Some(authoritative),
+            Bytes::from_static(b"test-agent-engine"),
+            1,
+            None,
+            None,
         );
-        state_mut
-            .authoritative_elapsed_override
-            .store(u64::MAX, Ordering::Relaxed);
+        state_mut._capacity_registration =
+            engine.register_capacity(crate::UDP_RECEIVE_LIMITS.advertised());
+        state_mut.local_engine = engine;
         let handler = SnmpEngineHandler { state };
 
         let error = handler

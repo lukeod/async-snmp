@@ -414,8 +414,8 @@ impl TrapSink {
         let local_authoritative_engine =
             agent_state.and_then(|state| state.authoritative_engine.clone());
         let local_authoritative_time_source = agent_state.map(|state| {
-            let state = Arc::clone(state);
-            Arc::new(move || state.authoritative_boots_time()) as LocalAuthoritativeTimeSource
+            let engine = state.local_engine.clone();
+            Arc::new(move || engine.current_boots_time()) as LocalAuthoritativeTimeSource
         });
         let config = ClientConfig {
             auth: self.auth.clone(),
@@ -1003,8 +1003,8 @@ impl super::Agent {
                     engine_time,
                     security,
                     derived.as_ref(),
-                    self.inner.salt_counter.as_deref(),
-                    self.inner.des_salt_state.as_ref(),
+                    self.inner.state.local_engine.salt_counter().as_deref(),
+                    self.inner.state.local_engine.des_salt_state().as_ref(),
                     Some(engine_boots),
                     false, // reportable=false for traps
                     sink.peer.receive_limits().advertised(),
@@ -1034,7 +1034,7 @@ impl super::Agent {
         self.ensure_notification_active()?;
         let client = sink
             .get_or_create_inform_client(
-                self.inner.des_salt_state.as_ref(),
+                self.inner.state.local_engine.des_salt_state().as_ref(),
                 Some(&self.inner.state),
             )
             .await?;
@@ -1083,7 +1083,7 @@ impl super::Agent {
             if security
                 .priv_protocol()
                 .is_some_and(crate::PrivProtocol::is_des_family)
-                && self.inner.des_salt_state.is_none()
+                && self.inner.state.local_engine.des_salt_state().is_none()
             {
                 return Err(Error::Config(
                     "durable DES sender state is required for DES/3DES notifications".into(),
@@ -1091,7 +1091,7 @@ impl super::Agent {
                 .boxed());
             }
             if security.priv_protocol().is_some_and(|p| !p.is_des_family())
-                && self.inner.salt_counter.is_none()
+                && self.inner.state.local_engine.salt_counter().is_none()
             {
                 return Err(Error::Config(
                     "configure an AES USM role before preparing an AES notification originator"

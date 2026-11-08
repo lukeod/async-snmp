@@ -64,8 +64,8 @@ impl AgentProcessor {
                     context_engine_id.clone(),
                     context_name.clone(),
                     derived_keys,
-                    self.inner.salt_counter.as_deref(),
-                    self.inner.des_salt_state.as_ref(),
+                    self.inner.state.local_engine.salt_counter().as_deref(),
+                    self.inner.state.local_engine.des_salt_state().as_ref(),
                     source,
                 )
             },

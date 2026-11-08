@@ -162,8 +162,10 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -192,9 +194,8 @@ use crate::util::{
     EmptyCommunityPolicy, PreparedAuthoritativeUsm, ValidatedAuthoritativeUsm, bind_udp_socket,
     community_matches, validate_authoritative_usm_deferred,
 };
-use crate::v3::process::UsmStats;
+use crate::v3::SaltCounter;
 use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, UsmUser};
-use crate::v3::{SaltCounter, compute_engine_boots_time};
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -412,30 +413,8 @@ pub enum AgentShutdownPolicy {
     AbortCancellationSafeRetrievalsAfter(Duration),
 }
 
-/// Current health of the Agent's local authoritative V3 state.
-///
-/// Health changes use a bounded, coalescing watch channel. Repeated packets
-/// during one persistence outage increment `consecutive_failures` in the
-/// current value instead of enqueueing an unbounded sequence. A later
-/// successful authoritative-state publication restores `Healthy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum AgentHealth {
-    /// No unresolved authoritative-engine persistence failure is known.
-    Healthy,
-    /// Local-authoritative V3 processing is degraded until persistence
-    /// succeeds on a later attempt.
-    AuthoritativePersistenceDegraded {
-        /// Failed publication attempts observed in this outage.
-        consecutive_failures: u64,
-        /// Durable transition that most recently failed.
-        operation: crate::v3::AuthoritativeEnginePersistenceOperation,
-        /// Last durable boots value before the attempted transition.
-        previous_engine_boots: Option<u32>,
-        /// Boots value passed to the persistence callback.
-        attempted_engine_boots: u32,
-    },
-}
+/// Shared local authoritative-engine persistence health.
+pub use crate::v3::LocalEngineHealth as AgentHealth;
 
 /// Registered handler with its OID prefix.
 pub(crate) struct RegisteredHandler {
@@ -518,6 +497,7 @@ pub struct AgentBuilder {
     communities: Vec<crate::Community>,
     usm_users: HashMap<Bytes, UsmUser>,
     handlers: Vec<RegisteredHandler>,
+    local_engine: Option<crate::LocalEngine>,
     authoritative_engine: Option<AuthoritativeEngine>,
     des_salt_state: Option<DesSaltState>,
     max_message_size: usize,
@@ -565,6 +545,7 @@ struct ValidatedAgentBuilder {
     bind_addr: SocketAddr,
     communities: Vec<crate::Community>,
     usm: ValidatedAuthoritativeUsm,
+    local_engine: Option<crate::LocalEngine>,
     handlers: Vec<RegisteredHandler>,
     max_message_size: usize,
     engine_receive_capacity: MessageSize,
@@ -677,6 +658,7 @@ impl AgentBuilder {
             communities: Vec::new(),
             usm_users: HashMap::new(),
             handlers: Vec::new(),
+            local_engine: None,
             authoritative_engine: None,
             des_salt_state: None,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
@@ -859,6 +841,16 @@ impl AgentBuilder {
         let config = configure(UsmUser::new(username_bytes.clone()))?;
         self.usm_users.insert(username_bytes, config);
         Ok(self)
+    }
+
+    /// Share local engine identity, clock, counters and privacy-sender state.
+    ///
+    /// Conflicts with `authoritative_engine` or `des_salt_state` configuration.
+    /// Credentials and authorization remain specific to this agent.
+    #[must_use]
+    pub fn local_engine(mut self, engine: crate::LocalEngine) -> Self {
+        self.local_engine = Some(engine);
+        self
     }
 
     /// Set the persisted local authoritative engine state for `SNMPv3`.
@@ -1532,30 +1524,33 @@ impl AgentBuilder {
             construction.check(ConstructionStage::Prepare, None, None)?;
             config.usm.prepare(generate_engine_id)?
         };
-        let salt_counter = config
-            .requires_privacy
-            .then(create_salt_counter)
-            .transpose()?
-            .map(Arc::new);
+        let local_engine = match config.local_engine {
+            Some(engine) => {
+                if config.requires_privacy {
+                    engine.ensure_salt_counter(create_salt_counter)?;
+                }
+                engine
+            }
+            None => crate::LocalEngine::from_prepared(
+                authoritative_engine,
+                engine_id,
+                engine_boots,
+                config
+                    .requires_privacy
+                    .then(create_salt_counter)
+                    .transpose()?
+                    .map(Arc::new),
+                config.des_salt_state,
+            ),
+        };
         construction.check(ConstructionStage::Prepare, None, None)?;
-
+        let capacity_registration = local_engine.register_capacity(config.engine_receive_capacity);
         let state = Arc::new(AgentState {
-            authoritative_engine,
-            engine_id,
-            engine_start: Instant::now(),
-            engine_boots_base: engine_boots,
-            #[cfg(test)]
-            authoritative_elapsed_override: std::sync::atomic::AtomicU64::new(u64::MAX),
+            local_engine,
+            _capacity_registration: capacity_registration,
             max_message_size: config.max_message_size,
             engine_receive_capacity: config.engine_receive_capacity,
             decode_config: config.decode_config,
-            snmp_in_asn_parse_errs: Arc::new(AtomicU32::new(0)),
-            snmp_invalid_msgs: Arc::new(AtomicU32::new(0)),
-            snmp_unknown_security_models: Arc::new(AtomicU32::new(0)),
-            snmp_silent_drops: Arc::new(AtomicU32::new(0)),
-            snmp_unknown_contexts: AtomicU32::new(0),
-            usm_stats: Arc::new(UsmStats::default()),
-            health: tokio::sync::watch::channel(AgentHealth::Healthy).0,
         });
 
         // Register built-in handlers for any not disabled
@@ -1598,8 +1593,6 @@ impl AgentBuilder {
             usm_users,
             handlers: config.handlers,
             state,
-            salt_counter,
-            des_salt_state: config.des_salt_state,
             set_coordinator: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             concurrency_limit: config.concurrency_limit,
@@ -1774,6 +1767,17 @@ impl AgentBuilder {
             );
         }
 
+        if let Some(engine) = &self.local_engine {
+            if self.authoritative_engine.is_some() || self.des_salt_state.is_some() {
+                return Err(Error::Config(
+                    "local_engine conflicts with authoritative_engine or des_salt_state".into(),
+                )
+                .boxed());
+            }
+            self.authoritative_engine = engine.authoritative_engine().cloned();
+            self.des_salt_state = engine.des_salt_state();
+        }
+
         let uses_des = self.usm_users.values().any(|security| {
             security
                 .priv_protocol()
@@ -1863,6 +1867,7 @@ impl AgentBuilder {
             bind_addr,
             communities: self.communities,
             usm,
+            local_engine: self.local_engine,
             handlers: self.handlers,
             max_message_size: self.max_message_size,
             engine_receive_capacity,
@@ -2033,108 +2038,23 @@ impl Default for AgentBuilder {
 
 /// Engine state and counters shared across agent clones and (future) built-in handlers.
 pub(crate) struct AgentState {
-    pub(crate) authoritative_engine: Option<AuthoritativeEngine>,
-    pub(crate) engine_id: Bytes,
-    pub(crate) engine_start: Instant,
-    /// Initial `engine_boots` value at startup, used to compute overflow-adjusted boots.
-    pub(crate) engine_boots_base: u32,
-    #[cfg(test)]
-    authoritative_elapsed_override: std::sync::atomic::AtomicU64,
-    /// Configured upper bound for outbound response messages.
+    pub(crate) local_engine: crate::LocalEngine,
+    _capacity_registration: crate::v3::local::EngineCapacityRegistration,
     pub(crate) max_message_size: usize,
-    /// Engine MIB receive capacity: the minimum across configured transports.
     pub(crate) engine_receive_capacity: MessageSize,
-    /// Inbound decode configuration snapshot.
     pub(crate) decode_config: crate::DecodeConfig,
-    /// snmpInASNParseErrs (1.3.6.1.2.1.11.6.0) - messages rejected because
-    /// their ASN.1 representation is invalid for the received SNMP version
-    pub(crate) snmp_in_asn_parse_errs: Arc<AtomicU32>,
-    // RFC 3412 statistics counters
-    /// snmpInvalidMsgs (1.3.6.1.6.3.11.2.1.2) - messages with invalid msgFlags
-    /// (e.g., privacy without authentication)
-    pub(crate) snmp_invalid_msgs: Arc<AtomicU32>,
-    /// snmpUnknownSecurityModels (1.3.6.1.6.3.11.2.1.1) - messages with
-    /// unrecognized security model
-    pub(crate) snmp_unknown_security_models: Arc<AtomicU32>,
-    /// snmpSilentDrops (1.3.6.1.6.3.11.2.1.3) - confirmed-class PDUs silently
-    /// dropped because even an empty response would exceed max message size
-    pub(crate) snmp_silent_drops: Arc<AtomicU32>,
-    /// snmpUnknownContexts (1.3.6.1.6.3.12.1.5) - requests whose scopedPDU
-    /// contextEngineID did not name a context served by this engine
-    pub(crate) snmp_unknown_contexts: AtomicU32,
-    /// RFC 3414 usmStats counters
-    pub(crate) usm_stats: Arc<UsmStats>,
-    /// Bounded/coalescing current-health publication.
-    health: tokio::sync::watch::Sender<AgentHealth>,
+}
+
+impl std::ops::Deref for AgentState {
+    type Target = crate::v3::local::LocalEngineInner;
+    fn deref(&self) -> &Self::Target {
+        &self.local_engine.inner
+    }
 }
 
 impl AgentState {
-    /// Return one coherent authoritative boots/time pair for the current instant.
     pub(crate) fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
-        #[cfg(test)]
-        let override_elapsed = self.authoritative_elapsed_override.load(Ordering::Relaxed);
-        #[cfg(test)]
-        let result = if override_elapsed != u64::MAX {
-            Ok(compute_engine_boots_time(
-                self.engine_boots_base,
-                override_elapsed,
-            ))
-        } else {
-            self.sample_authoritative_boots_time()
-        };
-        #[cfg(not(test))]
-        let result = self.sample_authoritative_boots_time();
-
-        self.observe_authoritative_result(&result);
-        result
-    }
-
-    fn sample_authoritative_boots_time(&self) -> Result<(u32, u32)> {
-        match &self.authoritative_engine {
-            Some(engine) => engine.current_boots_time(),
-            None => {
-                let total_secs = self.engine_start.elapsed().as_secs();
-                Ok(compute_engine_boots_time(
-                    self.engine_boots_base,
-                    total_secs,
-                ))
-            }
-        }
-    }
-
-    fn observe_authoritative_result(&self, result: &Result<(u32, u32)>) {
-        match result {
-            Ok(_) => {
-                self.health.send_if_modified(|health| {
-                    if matches!(health, AgentHealth::Healthy) {
-                        false
-                    } else {
-                        *health = AgentHealth::Healthy;
-                        true
-                    }
-                });
-            }
-            Err(error) => {
-                let Some(persistence) = error.authoritative_engine_persistence() else {
-                    return;
-                };
-                self.health.send_modify(|health| {
-                    let consecutive_failures = match *health {
-                        AgentHealth::AuthoritativePersistenceDegraded {
-                            consecutive_failures,
-                            ..
-                        } => consecutive_failures.saturating_add(1),
-                        AgentHealth::Healthy => 1,
-                    };
-                    *health = AgentHealth::AuthoritativePersistenceDegraded {
-                        consecutive_failures,
-                        operation: persistence.operation(),
-                        previous_engine_boots: persistence.previous_engine_boots(),
-                        attempted_engine_boots: persistence.attempted_engine_boots(),
-                    };
-                });
-            }
-        }
+        self.local_engine.current_boots_time()
     }
 
     #[cfg(test)]
@@ -2154,8 +2074,6 @@ pub(crate) struct AgentInner {
     pub(crate) usm_users: HashMap<Bytes, UsmUser>,
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
-    pub(crate) salt_counter: Option<Arc<SaltCounter>>,
-    pub(crate) des_salt_state: Option<DesSaltState>,
     /// Serializes complete SET transactions without restricting retrieval.
     pub(crate) set_coordinator: tokio::sync::Mutex<()>,
     #[cfg(test)]
@@ -2285,6 +2203,11 @@ impl Agent {
         &self,
     ) -> impl ExactSizeIterator<Item = &NotificationSinkSummary> + DoubleEndedIterator {
         self.sinks.iter().map(|sink| &sink.summary)
+    }
+
+    /// Shared local engine state, independent of this service's endpoints.
+    pub fn local_engine(&self) -> crate::LocalEngine {
+        self.inner.state.local_engine.clone()
     }
 
     /// Returns the local engine ID.
@@ -7230,7 +7153,7 @@ mod tests {
         let empty = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
         assert!(!empty.processor().validate_community(b"public"));
         assert!(!empty.processor().validate_community(b""));
-        assert!(empty.inner.salt_counter.is_none());
+        assert!(empty.inner.state.local_engine.salt_counter().is_none());
 
         let configured = Agent::builder()
             .bind("127.0.0.1:0")
@@ -7241,7 +7164,7 @@ mod tests {
             .unwrap();
         assert!(configured.processor().validate_community(b"public"));
         assert!(configured.processor().validate_community(b"monitor"));
-        assert!(configured.inner.salt_counter.is_none());
+        assert!(configured.inner.state.local_engine.salt_counter().is_none());
         for community in [b"private".as_slice(), b"pub", b"publicx", b""] {
             assert!(!configured.processor().validate_community(community));
         }

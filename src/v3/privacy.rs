@@ -338,6 +338,10 @@ impl DesSaltState {
         })
     }
 
+    pub(crate) fn same_allocator(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Return the local generating-engine boots epoch used in DES salts.
     #[must_use]
     pub fn engine_boots(&self) -> u32 {

@@ -535,8 +535,8 @@ fn build_v3_response(
         context_engine_id,
         context_name,
         derived_keys,
-        inner.salt_counter.as_deref(),
-        inner.des_salt_state.as_ref(),
+        inner.local_engine.salt_counter().as_deref(),
+        inner.local_engine.des_salt_state().as_ref(),
         source,
     )
 }
