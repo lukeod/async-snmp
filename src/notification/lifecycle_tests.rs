@@ -65,7 +65,10 @@ async fn unpolled_consumer_acknowledges_and_queue_capacity_precedes_policy() {
     assert_eq!(accepted.load(Ordering::Relaxed), 1);
     assert_eq!(receiver.control().overload_drops(), 1);
     let event = receiver.recv().await.unwrap();
-    assert!(matches!(event.inform_ack, Some(InformAckOutcome::Sent)));
+    assert!(matches!(
+        event.inform_ack,
+        crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+    ));
     receiver.close();
     assert!(receiver.recv().await.is_none());
     receiver.shutdown().await.unwrap();
@@ -87,7 +90,7 @@ async fn close_preserves_admitted_permit_through_acknowledgement_and_publication
     await_ack(&sender).await;
     assert!(matches!(
         receiver.recv().await.unwrap().inform_ack,
-        Some(InformAckOutcome::Sent)
+        crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
     ));
     assert!(receiver.recv().await.is_none());
     sender
@@ -172,7 +175,7 @@ async fn graceful_shutdown_drains_admitted_ack_without_waiting_for_consumption()
         .unwrap();
     assert!(matches!(
         receiver.recv().await.unwrap().inform_ack,
-        Some(InformAckOutcome::Failed(_))
+        crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(_))
     ));
     assert!(receiver.recv().await.is_none());
 }
@@ -207,7 +210,10 @@ async fn protocol_work_limit_drops_without_blocking_reader() {
     .unwrap();
     gate.add_permits(1);
     await_ack(&sender).await;
-    assert!(receiver.recv().await.unwrap().inform_ack.is_some());
+    assert!(matches!(
+        receiver.recv().await.unwrap().inform_ack,
+        crate::NotificationAcknowledgement::Completed(_)
+    ));
     receiver.close();
     assert!(receiver.recv().await.is_none());
 }
@@ -238,7 +244,7 @@ async fn slow_ack_does_not_hold_up_other_notifications() {
     gate.add_permits(1);
     assert!(matches!(
         receiver.recv().await.unwrap().inform_ack,
-        Some(InformAckOutcome::Sent)
+        crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
     ));
 }
 
@@ -326,7 +332,7 @@ async fn transient_receive_recovers_and_fatal_receive_closes_after_queued_events
     ));
     assert!(matches!(
         receiver.recv().await.unwrap().inform_ack,
-        Some(InformAckOutcome::Sent)
+        crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
     ));
     assert!(receiver.recv().await.is_none());
 }
@@ -517,7 +523,7 @@ async fn persistence_degradation_withholds_local_acceptance_and_recovers_without
     await_ack(&sender).await;
     assert!(matches!(
         receiver.recv().await.unwrap().inform_ack,
-        Some(InformAckOutcome::Sent)
+        crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
     ));
     assert_eq!(control.health(), NotificationHealth::Healthy);
 }
@@ -665,7 +671,7 @@ async fn tcp_shutdown_drains_reserved_acknowledgement_and_abort_terminates_route
             driver.await.unwrap().unwrap();
             assert!(matches!(
                 receiver.recv().await.unwrap().inform_ack,
-                Some(InformAckOutcome::Sent)
+                crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
             ));
             assert!(receiver.recv().await.is_none());
             assert_eq!(receiver.control().status(), NotificationStatus::Stopped);

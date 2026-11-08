@@ -396,13 +396,13 @@ impl NotificationProcessor {
     /// performing transport I/O. Reports are protocol results and may already
     /// be encoded independently of application persistence/acknowledgement.
     pub fn process(&self, input: ProcessingInput) -> Result<NotificationProcessResult> {
-        self.process_admitted(input, &mut || true)
+        self.process_admitted(input, &mut |_| true)
     }
 
     pub(super) fn process_admitted(
         &self,
         input: ProcessingInput,
-        reserve: &mut impl FnMut() -> bool,
+        reserve: &mut impl FnMut(super::NotificationPduClass) -> bool,
     ) -> Result<NotificationProcessResult> {
         let result = self.process_inner(input, reserve);
         self.observe_error(&result);
@@ -426,9 +426,13 @@ impl NotificationProcessor {
         info: crate::ReceivedMessageInfo,
         identity: NotificationWireIdentity,
         response: Option<InformResponse>,
-        reserve: &mut impl FnMut() -> bool,
+        reserve: &mut impl FnMut(super::NotificationPduClass) -> bool,
     ) -> NotificationProcessResult {
-        if !reserve() {
+        if !reserve(if response.is_some() {
+            super::NotificationPduClass::Inform
+        } else {
+            super::NotificationPduClass::Trap
+        }) {
             return NotificationProcessResult::Rejected;
         }
         if let Some(policy) = &self.inner.acceptance_policy {
@@ -461,7 +465,7 @@ impl NotificationProcessor {
     fn process_inner(
         &self,
         input: ProcessingInput,
-        reserve: &mut impl FnMut() -> bool,
+        reserve: &mut impl FnMut(super::NotificationPduClass) -> bool,
     ) -> Result<NotificationProcessResult> {
         let version =
             crate::message::peek_version(input.bytes().clone(), input.info().peer_addr())?;

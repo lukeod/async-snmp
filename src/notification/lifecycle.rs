@@ -45,6 +45,7 @@ impl Delivery {
 pub(crate) struct NotificationAdmission {
     failure: Option<NotificationDisposition>,
     permit: Option<OwnedPermit<ReceivedNotification>>,
+    pub(super) pending_permit: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 impl NotificationAdmission {
     pub(super) fn reserve(&mut self, delivery: &Delivery) -> bool {
@@ -76,6 +77,37 @@ impl NotificationAdmission {
             }
         }
     }
+    pub(super) fn reserve_inform(
+        &mut self,
+        inner: &ReceiverInner,
+        kind: NotificationPduClass,
+    ) -> bool {
+        if !self.reserve(&inner.delivery) {
+            return false;
+        }
+        if kind != NotificationPduClass::Inform
+            || inner.acknowledgement_mode == InformAcknowledgementMode::Automatic
+            || self.pending_permit.is_some()
+        {
+            return true;
+        }
+        match inner.pending.slots.clone().try_acquire_owned() {
+            Ok(permit) => {
+                self.pending_permit = Some(permit);
+                true
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                self.failure = Some(NotificationDisposition::Disabled);
+                false
+            }
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                inner.delivery.overloaded.fetch_add(1, Ordering::Relaxed);
+                self.failure = Some(NotificationDisposition::Overloaded);
+                false
+            }
+        }
+    }
+
     fn publish(mut self, notification: ReceivedNotification) {
         self.permit
             .take()
@@ -137,10 +169,12 @@ impl NotificationLease {
 pub(crate) struct RunnerCleanup {
     pub(super) delivery: Arc<Delivery>,
     pub(super) state: Arc<ServiceState>,
+    pub(super) pending: Arc<pending::PendingRegistry>,
 }
 impl RunnerCleanup {
     pub(crate) fn stop_admission(&self) {
         self.delivery.close_admission();
+        self.pending.shutdown();
     }
     pub(crate) fn started(&self) {
         if !self.state.shutdown.is_cancelled() {
@@ -148,6 +182,7 @@ impl RunnerCleanup {
         }
     }
     pub(crate) fn finished(&self, result: &Result<()>) {
+        self.pending.shutdown();
         self.delivery.finish();
         *self.state.status.lock().unwrap() = match result {
             Ok(()) => NotificationStatus::Stopped,
@@ -158,6 +193,7 @@ impl RunnerCleanup {
 }
 impl Drop for RunnerCleanup {
     fn drop(&mut self) {
+        self.pending.shutdown();
         self.delivery.finish();
         self.state.shutdown.cancel();
         let mut status = self.state.status.lock().unwrap();
@@ -187,6 +223,7 @@ impl NotificationControl {
     /// the runner is driven; queued events need not be consumed for it to finish.
     pub fn request_shutdown(&self) {
         self.inner.delivery.close_admission();
+        self.inner.pending.shutdown();
         self.state.shutdown.cancel();
         if self.state.attached.load(Ordering::Acquire) {
             self.inner.delivery.finish();
@@ -273,15 +310,16 @@ impl NotificationReceiver {
         self.state.attached.store(true, Ordering::Release);
     }
     /// Receive one accepted event. Cancellation does not consume an event or
-    /// close admission. The runner receives and acknowledges independently of
-    /// this method. `None` means the queue and all admitted producers finished;
+    /// close admission. The runner receives independently; automatic mode
+    /// acknowledges before delivery, manual mode requires explicit completion. `None` means the queue and all admitted producers finished;
     /// inspect control status or the runner result to distinguish failure.
     pub async fn recv(&mut self) -> Option<ReceivedNotification> {
         self.events.recv().await
     }
     /// Stop new notification admission and drain queued/admitted events. An
-    /// already reserved Inform still completes its bounded acknowledgement and
-    /// publishes its outcome. This disables only the notification role.
+    /// already admitted automatic Inform finishes its response attempt. Manual
+    /// capabilities remain usable until their deadline while the runner runs.
+    /// This disables only the notification role.
     pub fn close(&mut self) {
         self.inner.delivery.close_admission();
         self.events.close();
@@ -304,6 +342,7 @@ impl NotificationReceiver {
 impl Drop for NotificationReceiver {
     fn drop(&mut self) {
         self.close();
+        self.inner.pending.shutdown();
     }
 }
 
@@ -440,6 +479,13 @@ impl NotificationRunner {
         } = self;
         cleanup.started();
         let mut children = tokio::task::JoinSet::new();
+        if processor.has_pending_worker() {
+            children.spawn(
+                processor
+                    .clone()
+                    .run_pending(cleanup.state.shutdown.clone()),
+            );
+        }
         let (failures, mut failure_rx) = mpsc::channel(listeners.len());
         for source in listeners {
             let state = network.0.clone();
@@ -477,6 +523,10 @@ pub(crate) enum NotificationDisposition {
 }
 
 impl NotificationRole {
+    pub(crate) fn has_pending_worker(&self) -> bool {
+        self.inner.acknowledgement_mode == InformAcknowledgementMode::ApplicationControlled
+    }
+
     pub(crate) fn processing_limit(&self) -> usize {
         self.inner.max_processing
     }
@@ -498,6 +548,7 @@ impl NotificationRole {
             tokio::pin!(notified);
             notified.as_mut().enable();
             if self.inner.active.load(Ordering::Acquire) == 0 {
+                self.inner.pending.drain().await;
                 return;
             }
             notified.await;
@@ -543,6 +594,7 @@ impl NotificationRole {
         Ok(Some(NotificationAdmission {
             failure: None,
             permit: Some(permit),
+            pending_permit: None,
         }))
     }
     pub(crate) async fn process(

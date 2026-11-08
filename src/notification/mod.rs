@@ -8,8 +8,8 @@
 //! # Execution and delivery
 //!
 //! Preparation returns a single consumer and an owned runner. Drive the runner
-//! independently to receive and acknowledge notifications even while the consumer
-//! is unpolled:
+//! independently to receive notifications even while the consumer is unpolled.
+//! Automatic acknowledgement is the default and occurs before delivery:
 //!
 //! ```rust,no_run
 //! use async_snmp::NotificationReceiver;
@@ -30,10 +30,19 @@
 //!
 //! `spawn()` and `spawn_on()` provide an owner retaining both the consumer and
 //! task. Their owner requests shutdown on drop. Delivery is bounded (256 events
-//! by default), with at most 64 concurrent protocol/response tasks and bounded
+//! by default), with at most 64 concurrent protocol tasks and bounded
 //! UDP input. A full queue drops an Inform before acceptance and acknowledgement.
-//! `close()` stops notification admission and drains already admitted events;
-//! cancelling `recv()` leaves the event queue intact. Dropping the consumer or
+//! In application-controlled mode, events carry [`PendingInformAck`]. Persist or
+//! process the event, then call its `acknowledge()` method. At most 256 Informs
+//! remain outstanding by default, including dequeued events; their default
+//! lifetime is 30 seconds. Saturation rejects new Informs without affecting traps
+//! or shared roles. Expiry releases service-owned request/key memory even if the
+//! token is retained. Protocol Reports are independent of application completion.
+//!
+//! `close()` stops admission and permits admitted manual tokens until their
+//! deadlines while the runner remains driven. Consumer drop or control/root
+//! shutdown invalidates pending work without waiting for application-held tokens.
+//! Cancelling `recv()` leaves the event queue intact. Dropping the consumer or
 //! aborting the runner can lose volatile events, including acknowledged events.
 //! Acknowledgement is not a durability guarantee. Queue EOF does not report the
 //! runner's terminal result; join the runner or inspect its control status.
@@ -247,7 +256,7 @@
 //! depends on the version, allowlist, and security level described above.
 //! Returning [`NotificationAcceptance::Reject`]
 //! drops the notification and withholds an Inform response. Policy errors and
-//! panics have the same behavior. After acceptance, an Inform response is
+//! panics have the same behavior. In automatic mode, an accepted Inform is
 //! finalized and, when encodable within the effective response limit, sent
 //! before [`NotificationReceiver::recv`] delivers the notification. If both
 //! the ordinary response and its `tooBig` alternate exceed that limit, no
@@ -277,6 +286,8 @@
 
 mod handlers;
 mod lifecycle;
+mod pending;
+pub use pending::{InformAcknowledgementMode, NotificationAcknowledgement, PendingInformAck};
 mod processor;
 #[cfg(test)]
 mod processor_tests;
@@ -385,8 +396,9 @@ pub enum InformAckOutcome {
 
 /// One application-accepted notification and its local acknowledgement result.
 ///
-/// Traps always have `inform_ack` set to `None`. Informs always have one
-/// outcome, and the response attempt completes before this value is returned.
+/// Traps use [`NotificationAcknowledgement::NotRequired`]. Automatic Informs
+/// carry a completed local outcome; application-controlled Informs carry an
+/// owned pending capability. Persistence is the application's responsibility.
 /// The source and wire identity are transmission metadata and must not be
 /// treated as a semantic-event deduplication key.
 #[derive(Debug)]
@@ -397,8 +409,8 @@ pub struct ReceivedNotification {
     pub receive_info: crate::ReceivedMessageInfo,
     /// Version, request ID, and V3 message/security identity from the wire.
     pub wire_identity: NotificationWireIdentity,
-    /// Local acknowledgement outcome for an Inform, or `None` for a trap.
-    pub inform_ack: Option<InformAckOutcome>,
+    /// Distinguishes traps, completed attempts and application-controlled Informs.
+    pub inform_ack: NotificationAcknowledgement,
 }
 
 impl ReceivedNotification {
@@ -411,7 +423,7 @@ impl ReceivedNotification {
             notification,
             receive_info,
             wire_identity,
-            inform_ack: None,
+            inform_ack: NotificationAcknowledgement::NotRequired,
         }
     }
 
@@ -425,7 +437,7 @@ impl ReceivedNotification {
             notification,
             receive_info,
             wire_identity,
-            inform_ack: Some(outcome),
+            inform_ack: NotificationAcknowledgement::Completed(outcome),
         }
     }
 }
@@ -808,9 +820,53 @@ pub struct NotificationReceiverBuilder {
     decode_config: crate::DecodeConfig,
     acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
     response_send_timeout: Duration,
+    acknowledgement_mode: InformAcknowledgementMode,
+    max_pending_informs: usize,
+    pending_inform_timeout: Duration,
 }
 
 impl NotificationReceiverBuilder {
+    /// Choose automatic (default) or application-controlled Inform responses.
+    #[must_use]
+    pub fn acknowledgement_mode(mut self, mode: InformAcknowledgementMode) -> Self {
+        self.acknowledgement_mode = mode;
+        self
+    }
+
+    /// Bound outstanding manual Informs, including events already dequeued.
+    /// Defaults to 256. The permit remains service-owned through completion.
+    /// Saturation rejects new Informs before application acceptance on UDP/TCP,
+    /// without disabling traps or other roles on shared transports.
+    #[must_use]
+    pub fn max_pending_informs(mut self, limit: usize) -> Self {
+        self.max_pending_informs = limit;
+        self
+    }
+
+    /// Absolute lifetime of a manual Inform from acceptance (default 30 seconds).
+    /// Expiry releases request/keys and permits even if its token is retained.
+    #[must_use]
+    pub fn pending_inform_timeout(mut self, timeout: Duration) -> Self {
+        self.pending_inform_timeout = timeout;
+        self
+    }
+
+    fn validate_acknowledgement(&self) -> Result<()> {
+        if self.max_pending_informs == 0
+            || self.max_pending_informs > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(
+                "max_pending_informs must be nonzero and representable".into(),
+            )
+            .boxed());
+        }
+        if self.pending_inform_timeout.is_zero() {
+            return Err(Error::Config("pending_inform_timeout must be nonzero".into()).boxed());
+        }
+        crate::transport::checked_deadline(self.pending_inform_timeout, "pending Inform timeout")?;
+        Ok(())
+    }
+
     /// Create a builder with the default settings.
     ///
     /// Defaults:
@@ -844,6 +900,9 @@ impl NotificationReceiverBuilder {
             decode_config: crate::DecodeConfig::default(),
             acceptance_policy: None,
             response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
+            acknowledgement_mode: InformAcknowledgementMode::Automatic,
+            max_pending_informs: 256,
+            pending_inform_timeout: Duration::from_secs(30),
         }
     }
 
@@ -934,7 +993,7 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Set the local upper bound for automatic Inform responses and V3 Reports.
+    /// Set the local upper bound for managed Inform responses and V3 Reports.
     ///
     /// The default is the maximum UDP payload. Values below the SNMPv3
     /// advertisement minimum are permitted as response/drop policy and are not
@@ -1220,6 +1279,7 @@ impl NotificationReceiverBuilder {
         mut self,
         generate_engine_id: impl FnOnce() -> Result<Bytes>,
     ) -> Result<PreparedNotificationReceiver> {
+        self.validate_acknowledgement()?;
         if self.security_context.is_some() && !self.usm_users.is_empty() {
             return Err(Error::Config(
                 "security_context conflicts with usm_user configuration".into(),
@@ -1294,7 +1354,10 @@ impl NotificationReceiverBuilder {
                     .priv_protocol()
                     .is_some_and(|protocol| !protocol.is_des_family())
             });
-        if uses_des && self.des_salt_state.is_none() {
+        if uses_des
+            && self.des_salt_state.is_none()
+            && self.acknowledgement_mode == InformAcknowledgementMode::Automatic
+        {
             return Err(Error::Config(
                 "durable DES sender state is required for DES/3DES notification receiving".into(),
             )
@@ -1429,6 +1492,7 @@ impl NotificationReceiverBuilder {
         engine: PreparedNotificationRole,
         network: Arc<crate::transport::network::NetworkState>,
     ) -> Result<(NotificationReceiver, NotificationRole, RunnerCleanup)> {
+        self.validate_acknowledgement()?;
         if self.queue_capacity == 0
             || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
             || self.max_processing == 0
@@ -1456,6 +1520,7 @@ impl NotificationReceiverBuilder {
         }
         let (sender, events) = mpsc::channel(self.queue_capacity);
         let delivery = Arc::new(Delivery::new(sender));
+        let pending = pending::PendingRegistry::new(self.max_pending_informs);
         let inner = Arc::new(ReceiverInner {
             protocol: NotificationProcessor::configured(
                 engine.local_engine,
@@ -1474,6 +1539,9 @@ impl NotificationReceiverBuilder {
             #[cfg(test)]
             endpoint_id: network.bound[0].endpoint_id,
             delivery: delivery.clone(),
+            pending: pending.clone(),
+            acknowledgement_mode: self.acknowledgement_mode,
+            pending_inform_timeout: self.pending_inform_timeout,
             max_processing: self.max_processing,
             active: std::sync::atomic::AtomicUsize::new(0),
             idle: tokio::sync::Notify::new(),
@@ -1503,12 +1571,17 @@ impl NotificationReceiverBuilder {
         Ok((
             receiver,
             NotificationRole { inner },
-            RunnerCleanup { delivery, state },
+            RunnerCleanup {
+                delivery,
+                state,
+                pending,
+            },
         ))
     }
 
     #[cfg(feature = "agent")]
     pub(crate) fn validate_attached(&self, has_users: bool) -> Result<()> {
+        self.validate_acknowledgement()?;
         if self.socket.is_some()
             || self.network_explicit
             || !self.listeners.is_empty()
@@ -1593,8 +1666,8 @@ impl Default for NotificationReceiverBuilder {
 ///
 /// - SNMPv1 Trap (different PDU structure)
 /// - SNMPv2c/v3 Trap (standard PDU with sysUpTime.0 and snmpTrapOID.0)
-/// - `InformRequest` (confirmed notification, with a response attempted after
-///   application acceptance and before delivery)
+/// - `InformRequest` (confirmed notification; managed automatic mode attempts
+///   its response before delivery, manual mode returns a pending capability)
 ///
 /// V1/v2c community and content are cleartext and have no cryptographic
 /// integrity; without a configured community allowlist they are unverified.
@@ -1655,7 +1728,8 @@ pub enum Notification {
     /// `InformRequest` (confirmed notification) - v2c.
     ///
     /// When returned by [`NotificationReceiver`], application acceptance
-    /// occurred first and the receiver attempted the response before delivery.
+    /// occurs first. Automatic mode attempts its response before delivery;
+    /// application-controlled mode delivers a pending acknowledgement.
     /// Response-size finalization may instead have counted an
     /// `snmpSilentDrops` size drop and delivered the value without sending one.
     InformV2c {
@@ -1676,7 +1750,8 @@ pub enum Notification {
     /// `InformRequest` (confirmed notification) - v3.
     ///
     /// When returned by [`NotificationReceiver`], application acceptance
-    /// occurred first and the receiver attempted the response before delivery.
+    /// occurs first. Automatic mode attempts its response before delivery;
+    /// application-controlled mode delivers a pending acknowledgement.
     /// Response-size finalization may instead have counted an
     /// `snmpSilentDrops` size drop and delivered the value without sending one.
     InformV3 {
@@ -1805,8 +1880,9 @@ impl Notification {
 /// SNMP Notification Receiver.
 ///
 /// Listens for incoming SNMP notifications (traps and informs) on a UDP socket.
-/// For accepted `InformRequest` notifications, finalizes and attempts a
-/// Response-PDU before delivery. If the response and its `tooBig` alternate
+/// For accepted `InformRequest` notifications, automatic mode finalizes and
+/// attempts a Response-PDU before delivery. Application-controlled mode returns
+/// a pending acknowledgement for explicit completion. If the response and its `tooBig` alternate
 /// exceed the effective response limit, it sends neither, increments
 /// [`Self::snmp_silent_drops`], and still delivers the notification.
 ///
@@ -1877,6 +1953,9 @@ struct ReceiverInner {
     #[cfg(test)]
     endpoint_id: crate::EndpointId,
     delivery: Arc<Delivery>,
+    pending: Arc<pending::PendingRegistry>,
+    acknowledgement_mode: InformAcknowledgementMode,
+    pending_inform_timeout: Duration,
     response_send_timeout: Duration,
     #[cfg(test)]
     response_send_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -2112,6 +2191,15 @@ impl NotificationRole {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.response_send_timeout)
             .expect("response send timeout validated by builder");
+        self.send_response_before(data, route, deadline).await
+    }
+
+    async fn send_response_before(
+        &self,
+        data: bytes::Bytes,
+        route: &crate::transport::ReplyRoute,
+        deadline: tokio::time::Instant,
+    ) -> std::io::Result<()> {
         let timeout_error = || {
             std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
@@ -2679,7 +2767,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             inform.inform_ack,
-            Some(InformAckOutcome::Failed(error))
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error))
                 if error.kind() == crate::ErrorKind::AuthoritativeEnginePersistence
         ));
         let calls_after_failure = calls.load(Ordering::Relaxed);
@@ -2693,7 +2781,10 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(trap.notification, Notification::TrapV3 { .. }));
-        assert!(trap.inform_ack.is_none());
+        assert!(matches!(
+            trap.inform_ack,
+            NotificationAcknowledgement::NotRequired
+        ));
         assert_eq!(
             calls.load(Ordering::Relaxed),
             calls_after_failure,
@@ -4028,7 +4119,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             received.inform_ack,
-            Some(InformAckOutcome::Failed(error))
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error))
                 if matches!(
                     *error,
                     Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
@@ -4136,7 +4227,10 @@ mod tests {
                 received.notification,
                 Notification::InformV3 { .. }
             ));
-            assert!(matches!(received.inform_ack, Some(InformAckOutcome::Sent)));
+            assert!(matches!(
+                received.inform_ack,
+                crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+            ));
             assert_eq!(received.wire_identity.version, Version::V3);
             assert_eq!(received.wire_identity.request_id, Some(1));
             let v3_identity = received
@@ -4193,7 +4287,7 @@ mod tests {
             ));
             assert!(matches!(
                 received.inform_ack,
-                Some(InformAckOutcome::SuppressedBySize)
+                crate::NotificationAcknowledgement::Completed(InformAckOutcome::SuppressedBySize)
             ));
             assert_eq!(receiver.snmp_silent_drops(), 1);
             let mut buf = [0_u8; 1];
@@ -5591,7 +5685,10 @@ mod tests {
         assert_eq!(received.wire_identity.version, Version::V2c);
         assert_eq!(received.wire_identity.request_id, Some(1));
         assert!(received.wire_identity.v3.is_none());
-        assert!(matches!(received.inform_ack, Some(InformAckOutcome::Sent)));
+        assert!(matches!(
+            received.inform_ack,
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+        ));
 
         let mut buf = vec![0u8; 4096];
         let (len, ack_source) = tokio::time::timeout(
@@ -5630,7 +5727,10 @@ mod tests {
             .unwrap();
         assert_eq!(first.receive_info.peer_addr(), sender.local_addr().unwrap());
         assert_eq!(first.wire_identity.request_id, Some(1));
-        assert!(matches!(first.inform_ack, Some(InformAckOutcome::Sent)));
+        assert!(matches!(
+            first.inform_ack,
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+        ));
 
         assert!(
             tokio::time::timeout(Duration::from_millis(25), receiver.recv())
@@ -5650,7 +5750,10 @@ mod tests {
             .expect("accepted Inform retry was not returned")
             .unwrap();
         assert_eq!(retry.wire_identity, first.wire_identity);
-        assert!(matches!(retry.inform_ack, Some(InformAckOutcome::Sent)));
+        assert!(matches!(
+            retry.inform_ack,
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+        ));
     }
 
     #[tokio::test]
@@ -5670,7 +5773,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             received.inform_ack,
-            Some(InformAckOutcome::Failed(error))
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error))
                 if matches!(&*error, Error::Network { source, .. }
                     if source.kind() == std::io::ErrorKind::TimedOut)
         ));
@@ -5699,7 +5802,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             received.inform_ack,
-            Some(InformAckOutcome::Failed(error))
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error))
                 if error.kind() == crate::ErrorKind::InvalidMessage
         ));
 
@@ -5716,7 +5819,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             received.inform_ack,
-            Some(InformAckOutcome::Failed(error))
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error))
                 if matches!(&*error, Error::Network { source, .. }
                     if source.kind() == std::io::ErrorKind::BrokenPipe)
         ));
@@ -5766,15 +5869,24 @@ mod tests {
                 .unwrap()
                 .unwrap();
             match (failure, received.inform_ack) {
-                ("construction", Some(InformAckOutcome::Failed(error))) => {
+                (
+                    "construction",
+                    crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error)),
+                ) => {
                     assert_eq!(error.kind(), crate::ErrorKind::InvalidMessage);
                 }
-                ("send", Some(InformAckOutcome::Failed(error))) => assert!(matches!(
+                (
+                    "send",
+                    crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error)),
+                ) => assert!(matches!(
                     &*error,
                     Error::Network { source, .. }
                         if source.kind() == std::io::ErrorKind::BrokenPipe
                 )),
-                ("timeout", Some(InformAckOutcome::Failed(error))) => assert!(matches!(
+                (
+                    "timeout",
+                    crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error)),
+                ) => assert!(matches!(
                     &*error,
                     Error::Network { source, .. }
                         if source.kind() == std::io::ErrorKind::TimedOut
@@ -5806,7 +5918,10 @@ mod tests {
             received.notification,
             Notification::InformV2c { .. }
         ));
-        assert!(matches!(received.inform_ack, Some(InformAckOutcome::Sent)));
+        assert!(matches!(
+            received.inform_ack,
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+        ));
 
         let mut buf = vec![0; 1024];
         let (len, _) = client.recv_from(&mut buf).await.unwrap();
@@ -5842,7 +5957,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             received.inform_ack,
-            Some(InformAckOutcome::SuppressedBySize)
+            crate::NotificationAcknowledgement::Completed(InformAckOutcome::SuppressedBySize)
         ));
         assert_eq!(receiver.snmp_silent_drops(), 1);
 

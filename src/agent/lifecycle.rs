@@ -307,6 +307,14 @@ impl AgentRunner {
             role.started();
         }
         let mut children: JoinSet<Result<()>> = JoinSet::new();
+        if let Some((role, _)) = &self.notification_role
+            && role.has_pending_worker()
+        {
+            children.spawn(
+                role.clone()
+                    .run_pending(self.processor.inner.cancel.clone()),
+            );
+        }
         let (failures, mut failure_rx) = mpsc::channel(self.listeners.len());
         let mut requests = RequestTasks::new(
             self.processor.inner.cancel.child_token(),

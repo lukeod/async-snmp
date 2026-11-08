@@ -632,14 +632,15 @@ pub use message_size::{
     ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS,
 };
 pub use notification::{
-    EncodedInformResponse, InformAckOutcome, InformResponse, Notification, NotificationAcceptance,
-    NotificationAcceptanceError, NotificationAcceptancePolicy, NotificationAcceptanceResult,
+    EncodedInformResponse, InformAckOutcome, InformAcknowledgementMode, InformResponse,
+    Notification, NotificationAcceptance, NotificationAcceptanceError,
+    NotificationAcceptancePolicy, NotificationAcceptanceResult, NotificationAcknowledgement,
     NotificationControl, NotificationEnvelope, NotificationHealth, NotificationPduClass,
     NotificationProcessResult, NotificationProcessor, NotificationProcessorBuilder,
     NotificationReceiver, NotificationReceiverBuilder, NotificationRunner, NotificationStatus,
-    NotificationVarbindValidation, NotificationWireIdentity, PreparedNotificationReceiver,
-    ProcessedNotification, ReceivedNotification, RunningNotificationReceiver,
-    V3NotificationWireIdentity, validate_notification_varbinds,
+    NotificationVarbindValidation, NotificationWireIdentity, PendingInformAck,
+    PreparedNotificationReceiver, ProcessedNotification, ReceivedNotification,
+    RunningNotificationReceiver, V3NotificationWireIdentity, validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{

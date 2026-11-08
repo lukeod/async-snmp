@@ -170,7 +170,9 @@ fn spawn_receiver(
                 Some(received) => {
                     println!("[{label} receiver]");
                     handle_notification(&received.notification, received.receive_info.peer_addr());
-                    if let Some(outcome) = received.inform_ack {
+                    if let async_snmp::NotificationAcknowledgement::Completed(outcome) =
+                        received.inform_ack
+                    {
                         println!("  Inform acknowledgement: {outcome:?}");
                     }
                 }

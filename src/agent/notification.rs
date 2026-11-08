@@ -1436,7 +1436,7 @@ mod tests {
             let notification = receiver.recv().await.unwrap();
             assert!(matches!(
                 notification.inform_ack,
-                Some(crate::InformAckOutcome::Sent)
+                crate::NotificationAcknowledgement::Completed(crate::InformAckOutcome::Sent)
             ));
         }
         agent.shutdown().await.unwrap();

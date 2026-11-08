@@ -1,7 +1,8 @@
 //! Managed notification admission, automatic response sending and delivery.
 
 use super::{
-    EncodedInformResponse, InformAckOutcome, NotificationAdmission, NotificationProcessResult,
+    EncodedInformResponse, InformAckOutcome, InformAcknowledgementMode, InformResponse,
+    NotificationAcknowledgement, NotificationAdmission, NotificationProcessResult,
     NotificationRole, ProcessedNotification, ReceivedNotification,
 };
 use crate::error::{Error, Result};
@@ -15,10 +16,9 @@ impl NotificationRole {
     ) -> Result<Option<ReceivedNotification>> {
         let (input, route) = message.into_processing()?;
         let source = input.info().peer_addr();
-        let result = self
-            .inner
-            .protocol
-            .process_admitted(input, &mut || admission.reserve(&self.inner.delivery))?;
+        let result = self.inner.protocol.process_admitted(input, &mut |kind| {
+            admission.reserve_inform(&self.inner, kind)
+        })?;
         match result {
             NotificationProcessResult::Rejected => Ok(None),
             NotificationProcessResult::UsmFailed { failure, report } => {
@@ -54,36 +54,32 @@ impl NotificationRole {
                         wire_identity,
                     )));
                 };
-                #[cfg(test)]
-                let injected = self
-                    .inner
-                    .response_construction_errors
-                    .lock()
-                    .unwrap()
-                    .pop_front();
-                #[cfg(not(test))]
-                let injected: Option<Box<Error>> = None;
-                let encoded = match injected {
-                    Some(error) => Err(error),
-                    None => response.encode(),
-                };
-                let outcome = match encoded {
-                    Ok(EncodedInformResponse::Suppressed) => InformAckOutcome::SuppressedBySize,
-                    Ok(
-                        EncodedInformResponse::Response(bytes)
-                        | EncodedInformResponse::TooBig(bytes),
-                    ) => match self.send_response(bytes, &route).await {
-                        Ok(()) => InformAckOutcome::Sent,
-                        Err(error) => InformAckOutcome::Failed(
-                            Error::Network {
-                                target: source,
-                                source: error,
-                            }
-                            .boxed(),
-                        ),
-                    },
-                    Err(error) => InformAckOutcome::Failed(error),
-                };
+                if self.inner.acknowledgement_mode
+                    == InformAcknowledgementMode::ApplicationControlled
+                {
+                    let permit = admission
+                        .pending_permit
+                        .take()
+                        .expect("manual Inform admission reserved outstanding work");
+                    let deadline = tokio::time::Instant::now() + self.inner.pending_inform_timeout;
+                    let inform_ack = match self
+                        .inner
+                        .pending
+                        .install(response, route, source, permit, deadline)
+                    {
+                        Ok(pending) => NotificationAcknowledgement::Pending(pending),
+                        Err(outcome) => NotificationAcknowledgement::Completed(outcome),
+                    };
+                    return Ok(Some(ReceivedNotification {
+                        notification,
+                        receive_info,
+                        wire_identity,
+                        inform_ack,
+                    }));
+                }
+                let outcome = self
+                    .complete_response(response, route, source, None, None)
+                    .await;
                 Ok(Some(ReceivedNotification::inform(
                     notification,
                     receive_info,
@@ -91,6 +87,63 @@ impl NotificationRole {
                     outcome,
                 )))
             }
+        }
+    }
+
+    pub(super) async fn complete_response(
+        &self,
+        response: InformResponse,
+        route: crate::transport::ReplyRoute,
+        source: std::net::SocketAddr,
+        deadline: Option<tokio::time::Instant>,
+        cancel: Option<tokio_util::sync::CancellationToken>,
+    ) -> InformAckOutcome {
+        #[cfg(test)]
+        let injected = self
+            .inner
+            .response_construction_errors
+            .lock()
+            .unwrap()
+            .pop_front();
+        #[cfg(not(test))]
+        let injected: Option<Box<Error>> = None;
+        let encoded = match injected {
+            Some(error) => Err(error),
+            None => response.encode(),
+        };
+        if cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
+            return super::pending::failed(
+                source,
+                std::io::ErrorKind::NotConnected,
+                "notification completion cancelled",
+            );
+        }
+        if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+            return super::pending::failed(
+                source,
+                std::io::ErrorKind::TimedOut,
+                "pending Inform expired",
+            );
+        }
+        match encoded {
+            Ok(EncodedInformResponse::Suppressed) => InformAckOutcome::SuppressedBySize,
+            Ok(EncodedInformResponse::Response(bytes) | EncodedInformResponse::TooBig(bytes)) => {
+                let sent = match deadline {
+                    Some(deadline) => self.send_response_before(bytes, &route, deadline).await,
+                    None => self.send_response(bytes, &route).await,
+                };
+                match sent {
+                    Ok(()) => InformAckOutcome::Sent,
+                    Err(error) => InformAckOutcome::Failed(
+                        Error::Network {
+                            target: source,
+                            source: error,
+                        }
+                        .boxed(),
+                    ),
+                }
+            }
+            Err(error) => InformAckOutcome::Failed(error),
         }
     }
 

@@ -759,7 +759,10 @@ async fn closing_commands_keeps_fresh_inform_discovery_and_notification_security
         .send_inform(&crate::notification::oids::cold_start(), 1, vec![])
         .await
         .unwrap();
-    assert!(notifications.recv().await.unwrap().inform_ack.is_some());
+    assert!(matches!(
+        notifications.recv().await.unwrap().inform_ack,
+        crate::NotificationAcknowledgement::Completed(_)
+    ));
     service.shutdown().await.unwrap();
 }
 
@@ -1232,7 +1235,7 @@ async fn replaced_credentials_preserve_udp_application_collisions_and_reject_old
                 .unwrap()
                 .unwrap()
                 .inform_ack,
-            Some(crate::InformAckOutcome::Sent)
+            crate::NotificationAcknowledgement::Completed(crate::InformAckOutcome::Sent)
         ));
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         let response = secured(

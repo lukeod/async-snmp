@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Managed receivers support application-controlled Inform acknowledgement with
+  bounded outstanding work, expiry and supervised completion. `inform_ack` now
+  uses `NotificationAcknowledgement` to distinguish traps, completed outcomes
+  and pending capabilities. Automatic acknowledgement remains the default.
+
 - `NotificationProcessor` processes complete v1/v2c/v3 inputs without owning I/O
   or tasks, sharing protocol processing with managed receivers. Accepted Informs
   carry an owned `InformResponse` encoded only on explicit completion, with

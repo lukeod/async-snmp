@@ -957,7 +957,7 @@ async fn tcp_only_notification_accepts_and_acknowledges_frames_above_udp_capacit
     assert_eq!(event.receive_info.received_len(), bytes.len());
     assert!(matches!(
         event.inform_ack,
-        Some(crate::notification::InformAckOutcome::Sent)
+        crate::NotificationAcknowledgement::Completed(crate::notification::InformAckOutcome::Sent)
     ));
     service.shutdown().await.unwrap();
 }

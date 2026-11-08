@@ -123,7 +123,10 @@ async fn replacement_reaches_shared_command_and_notification_roles_without_crypt
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(event.inform_ack, Some(InformAckOutcome::Sent)));
+    assert!(matches!(
+        event.inform_ack,
+        async_snmp::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+    ));
     assert!(
         context
             .replace_users([UsmUserEntry::new(UsmUser::new(""))])
@@ -257,7 +260,7 @@ async fn replacement_can_add_aes_after_empty_context_preparation() {
             .unwrap()
             .unwrap()
             .inform_ack,
-        Some(InformAckOutcome::Sent)
+        async_snmp::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
     ));
     agent.shutdown().await.unwrap();
 }
@@ -312,7 +315,7 @@ async fn runtime_des_credentials_require_durable_sender_state_before_acknowledge
         .unwrap();
     assert!(matches!(
         failed.inform_ack,
-        Some(InformAckOutcome::Failed(_))
+        async_snmp::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(_))
     ));
     receiver
         .local_engine()
@@ -325,6 +328,9 @@ async fn runtime_des_credentials_require_durable_sender_state_before_acknowledge
         .await
         .unwrap()
         .unwrap();
-    assert!(matches!(completed.inform_ack, Some(InformAckOutcome::Sent)));
+    assert!(matches!(
+        completed.inform_ack,
+        async_snmp::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+    ));
     receiver.shutdown().await.unwrap();
 }

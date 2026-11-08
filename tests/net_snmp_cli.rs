@@ -321,9 +321,15 @@ async fn receive(
         Value::Integer(77)
     );
     if inform {
-        assert!(matches!(event.inform_ack, Some(InformAckOutcome::Sent)));
+        assert!(matches!(
+            event.inform_ack,
+            async_snmp::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+        ));
     } else {
-        assert!(event.inform_ack.is_none());
+        assert!(matches!(
+            event.inform_ack,
+            async_snmp::NotificationAcknowledgement::NotRequired
+        ));
     }
     event
 }

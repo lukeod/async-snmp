@@ -68,7 +68,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await {
                 Ok(Some(received)) => {
                     print_notification(&received.notification, received.receive_info.peer_addr());
-                    if let Some(outcome) = received.inform_ack {
+                    if let async_snmp::NotificationAcknowledgement::Completed(outcome) =
+                        received.inform_ack
+                    {
                         println!("  Inform acknowledgement: {outcome:?}");
                     }
                 }
