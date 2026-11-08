@@ -25,7 +25,7 @@ use tokio::task::JoinSet;
 
 pub(crate) struct DispatchRoles {
     pub(crate) commands: Option<ApplicationIngress>,
-    pub(crate) notifications: Option<crate::notification::NotificationProcessor>,
+    pub(crate) notifications: Option<crate::notification::NotificationRole>,
     pub(crate) security_context: UsmSecurityContext,
     pub(crate) client_exchanges: bool,
     application: Arc<Semaphore>,
@@ -37,7 +37,7 @@ pub(crate) struct DispatchRoles {
 impl DispatchRoles {
     pub(crate) fn new(
         commands: Option<ApplicationIngress>,
-        notifications: Option<crate::notification::NotificationProcessor>,
+        notifications: Option<crate::notification::NotificationRole>,
         security_context: UsmSecurityContext,
         client_exchanges: bool,
         application_limit: usize,

@@ -262,9 +262,28 @@
 //! spoofable `noAuthNoPriv` messages, so use a policy that requires at least
 //! [`SecurityLevel::AuthNoPriv`] when authenticated identity and content are
 //! required.
+//!
+//! # Caller-owned I/O
+//!
+//! [`NotificationProcessor`] accepts complete [`crate::ProcessingInput`] values
+//! without owning sockets, tasks or delivery queues. It uses the same protocol,
+//! acceptance and response encoding as managed receivers for v1/v2c/v3. An
+//! accepted Inform includes an owned [`InformResponse`]; applications can persist
+//! the notification before consuming that capability with [`InformResponse::encode`]
+//! and sending the encoded bytes through their own transport. Dropping it does
+//! not acknowledge. USM failure results retain any encoded Report alongside the
+//! failure indication. [`NotificationProcessor::report_unknown_engine`] handles
+//! discovery or unclaimed foreign engine IDs after caller-controlled selection.
 
 mod handlers;
 mod lifecycle;
+mod processor;
+#[cfg(test)]
+mod processor_tests;
+pub use processor::{
+    EncodedInformResponse, InformResponse, NotificationProcessResult, NotificationProcessor,
+    NotificationProcessorBuilder, ProcessedNotification,
+};
 #[cfg(test)]
 mod lifecycle_tests;
 mod varbind;
@@ -414,10 +433,11 @@ impl ReceivedNotification {
 /// Decision returned by a [`NotificationAcceptancePolicy`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NotificationAcceptance {
-    /// Deliver the notification and attempt a response when it is an Inform.
+    /// Accept the notification, enabling a response when it is an Inform.
     ///
-    /// The response attempt completes before delivery. Its local result is
-    /// retained in [`ReceivedNotification::inform_ack`].
+    /// Managed automatic receivers complete the response attempt before
+    /// delivery and retain its result in [`ReceivedNotification::inform_ack`].
+    /// Socketless processors return an [`InformResponse`] without encoding it.
     Accept,
     /// Drop the notification without acknowledging it.
     Reject,
@@ -647,7 +667,7 @@ impl<'a> NotificationEnvelope<'a> {
 /// any Inform response attempt.
 ///
 /// The blanket implementation accepts fallible closures with the same
-/// signature. A policy error or panic is contained by the receiver and treated as
+/// signature. A policy error or panic is contained by the processor and treated as
 /// [`NotificationAcceptance::Reject`]. Keeping this decision synchronous means
 /// it has no independent timeout or cancellation lifecycle; applications that
 /// need external state should expose a bounded in-memory snapshot to the
@@ -1408,7 +1428,7 @@ impl NotificationReceiverBuilder {
         self,
         engine: PreparedNotificationRole,
         network: Arc<crate::transport::network::NetworkState>,
-    ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
+    ) -> Result<(NotificationReceiver, NotificationRole, RunnerCleanup)> {
         if self.queue_capacity == 0
             || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
             || self.max_processing == 0
@@ -1437,7 +1457,15 @@ impl NotificationReceiverBuilder {
         let (sender, events) = mpsc::channel(self.queue_capacity);
         let delivery = Arc::new(Delivery::new(sender));
         let inner = Arc::new(ReceiverInner {
-            local_engine: engine.local_engine,
+            protocol: NotificationProcessor::configured(
+                engine.local_engine,
+                engine.security_context,
+                self.communities,
+                self.varbind_validation,
+                self.max_message_size,
+                self.decode_config,
+                self.acceptance_policy,
+            ),
             _capacity_registration: engine.capacity_registration,
             #[cfg(test)]
             socket: network.udp.first().map(crate::UdpEndpoint::test_socket),
@@ -1446,15 +1474,9 @@ impl NotificationReceiverBuilder {
             #[cfg(test)]
             endpoint_id: network.bound[0].endpoint_id,
             delivery: delivery.clone(),
-            security_context: engine.security_context,
-            communities: self.communities,
-            varbind_validation: self.varbind_validation,
             max_processing: self.max_processing,
             active: std::sync::atomic::AtomicUsize::new(0),
             idle: tokio::sync::Notify::new(),
-            max_message_size: self.max_message_size,
-            decode_config: self.decode_config,
-            acceptance_policy: self.acceptance_policy,
             response_send_timeout: self.response_send_timeout,
             #[cfg(test)]
             response_send_gate: Mutex::new(None),
@@ -1480,7 +1502,7 @@ impl NotificationReceiverBuilder {
         };
         Ok((
             receiver,
-            NotificationProcessor { inner },
+            NotificationRole { inner },
             RunnerCleanup { delivery, state },
         ))
     }
@@ -1534,7 +1556,7 @@ impl NotificationReceiverBuilder {
         self,
         agent: &crate::agent::AgentProcessor,
         network: &Arc<crate::transport::network::NetworkState>,
-    ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
+    ) -> Result<(NotificationReceiver, NotificationRole, RunnerCleanup)> {
         self.validate_attached(agent.inner.security_context_required)?;
         let engine = PreparedNotificationRole {
             local_engine: agent.inner.state.local_engine.clone(),
@@ -1831,7 +1853,7 @@ pub struct NotificationReceiver {
 
 /// Application protocol state, independent of socket and public lifetime ownership.
 #[derive(Clone)]
-pub(crate) struct NotificationProcessor {
+pub(crate) struct NotificationRole {
     inner: Arc<ReceiverInner>,
 }
 
@@ -1843,7 +1865,7 @@ struct PreparedNotificationRole {
 }
 
 struct ReceiverInner {
-    local_engine: crate::LocalEngine,
+    protocol: NotificationProcessor,
     _capacity_registration: Option<crate::v3::local::EngineCapacityRegistration>,
     max_processing: usize,
     active: std::sync::atomic::AtomicUsize,
@@ -1855,18 +1877,6 @@ struct ReceiverInner {
     #[cfg(test)]
     endpoint_id: crate::EndpointId,
     delivery: Arc<Delivery>,
-    /// Selected inbound USM credentials and remote timeliness.
-    security_context: crate::UsmSecurityContext,
-    /// Accepted v1/v2c community strings. Empty means accept any community
-    /// (community filtering is opt-in); otherwise a v1/v2c notification whose
-    /// community matches none of these is dropped.
-    communities: Vec<Community>,
-    /// Validation policy for SNMPv2c/v3 standard notification varbind prefixes.
-    varbind_validation: NotificationVarbindValidation,
-    /// Local outbound response policy limit.
-    max_message_size: usize,
-    decode_config: crate::DecodeConfig,
-    acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
     response_send_timeout: Duration,
     #[cfg(test)]
     response_send_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
@@ -1883,39 +1893,6 @@ struct ReceiverInner {
 }
 
 impl ReceiverInner {
-    fn accepts(
-        &self,
-        receive_info: crate::ReceivedMessageInfo,
-        notification: &Notification,
-        admission: &mut NotificationAdmission,
-    ) -> bool {
-        if !admission.reserve(&self.delivery) {
-            return false;
-        }
-        let Some(policy) = &self.acceptance_policy else {
-            return true;
-        };
-        let source = receive_info.peer_addr();
-        let envelope = NotificationEnvelope::new(receive_info, notification);
-        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| policy.evaluate(&envelope)))
-        {
-            Ok(Ok(NotificationAcceptance::Accept)) => true,
-            Ok(Ok(NotificationAcceptance::Reject)) => false,
-            Ok(Err(error)) => {
-                tracing::error!(target: "async_snmp::notification", { snmp.source = %source, error = %error }, "notification acceptance policy failed; rejected notification");
-                false
-            }
-            Err(_) => {
-                tracing::error!(target: "async_snmp::notification", { snmp.source = %source }, "notification acceptance policy panicked; rejected notification");
-                false
-            }
-        }
-    }
-
-    fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
-        self.local_engine.current_boots_time()
-    }
-
     #[cfg(test)]
     fn publish_authoritative_boots_time(&self, pair: (u32, u32)) -> (u32, u32) {
         self.local_engine.publish_boots_time(pair)
@@ -1923,9 +1900,9 @@ impl ReceiverInner {
 }
 
 impl std::ops::Deref for ReceiverInner {
-    type Target = crate::v3::local::LocalEngineInner;
+    type Target = processor::ProcessorInner;
     fn deref(&self) -> &Self::Target {
-        &self.local_engine.inner
+        &self.protocol.inner
     }
 }
 
@@ -2095,23 +2072,7 @@ impl NotificationReceiver {
     }
 }
 
-impl NotificationProcessor {
-    /// Parse received data and send response if needed.
-    ///
-    /// Returns `None` if the message is not a notification PDU.
-    async fn parse_and_respond(
-        &self,
-        message: crate::transport::ReceivedMessage,
-        admission: &mut NotificationAdmission,
-    ) -> Result<Option<ReceivedNotification>> {
-        let (input, route) = message.into_processing()?;
-        match crate::message::peek_version(input.bytes().clone(), input.info().peer_addr())? {
-            Version::V1 => self.handle_v1_message(input, route, admission).await,
-            Version::V2c => self.handle_v2c_message(input, route, admission).await,
-            Version::V3 => self.handle_v3_message(input, route, admission).await,
-        }
-    }
-
+impl NotificationRole {
     #[cfg(test)]
     fn test_message(
         &self,
@@ -4285,9 +4246,9 @@ mod tests {
             AuthProtocol::Sha1,
         );
 
-        let earliest = receiver.inner.authoritative_boots_time().unwrap();
+        let earliest = receiver.inner.local_engine.current_boots_time().unwrap();
         let result = receiver.handle_v3(msg, client_addr).await.unwrap();
-        let latest = receiver.inner.authoritative_boots_time().unwrap();
+        let latest = receiver.inner.local_engine.current_boots_time().unwrap();
         assert!(matches!(
             result,
             Some(ReceivedNotification {

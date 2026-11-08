@@ -51,6 +51,16 @@ pub(crate) struct UsmStats {
 }
 
 impl UsmStats {
+    pub(crate) fn snapshot(&self) -> UsmStatsSnapshot {
+        UsmStatsSnapshot {
+            unknown_engine_ids: self.unknown_engine_ids.load(Ordering::Relaxed),
+            unknown_usernames: self.unknown_usernames.load(Ordering::Relaxed),
+            wrong_digests: self.wrong_digests.load(Ordering::Relaxed),
+            not_in_time_windows: self.not_in_time_windows.load(Ordering::Relaxed),
+            unsupported_sec_levels: self.unsupported_sec_levels.load(Ordering::Relaxed),
+            decryption_errors: self.decryption_errors.load(Ordering::Relaxed),
+        }
+    }
     fn counter(&self, failure: UsmFailure) -> &AtomicU32 {
         match failure {
             UsmFailure::UnknownEngineIds => &self.unknown_engine_ids,
@@ -70,15 +80,39 @@ impl UsmStats {
     }
 }
 
+/// Snapshot of local RFC 3414 USM counters. Fields are sampled independently;
+/// this is not an atomic snapshot of concurrent message processing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UsmStatsSnapshot {
+    /// usmStatsUnknownEngineIDs.
+    pub unknown_engine_ids: u32,
+    /// usmStatsUnknownUserNames.
+    pub unknown_usernames: u32,
+    /// usmStatsWrongDigests.
+    pub wrong_digests: u32,
+    /// usmStatsNotInTimeWindows (local-authoritative failures).
+    pub not_in_time_windows: u32,
+    /// usmStatsUnsupportedSecLevels.
+    pub unsupported_sec_levels: u32,
+    /// usmStatsDecryptionErrors.
+    pub decryption_errors: u32,
+}
+
 /// A USM processing failure, binding the usmStats counter to the report OID
 /// sent for it (RFC 3414 Section 3.2) so the pair cannot be mismatched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum UsmFailure {
+pub enum UsmFailure {
+    /// Missing, invalid or unrecognized authoritative engine identity.
     UnknownEngineIds,
+    /// Username has no matching credential entry.
     UnknownUserNames,
+    /// Authentication digest verification failed.
     WrongDigests,
+    /// Local-authoritative timeliness validation failed.
     NotInTimeWindows,
+    /// Requested security level is unsupported by the selected user.
     UnsupportedSecLevels,
+    /// Privacy processing failed after authentication/timeliness.
     DecryptionErrors,
 }
 
@@ -110,7 +144,6 @@ pub(crate) enum V3Role<'a> {
     /// Authoritative engine (agent): only messages under its own engine ID
     /// are accepted (RFC 3414 Section 3.2 Step 3), timeliness is Step 7a
     /// against its own boots/time.
-    #[cfg(any(feature = "agent", test))]
     Authoritative,
     /// Non-authoritative receiver (notification receiver): messages under
     /// its own engine ID (informs) use Step 7a; messages under a remote
@@ -124,27 +157,14 @@ pub(crate) enum V3Role<'a> {
 pub(crate) type RemoteEngineTable = RecencyMap<Bytes, EngineState>;
 
 impl V3Role<'_> {
-    #[cfg(any(feature = "agent", test))]
     fn is_authoritative(&self) -> bool {
         matches!(self, Self::Authoritative)
     }
 
-    #[cfg(not(any(feature = "agent", test)))]
-    fn is_authoritative(&self) -> bool {
-        false
-    }
-
     fn remote_engines(&self) -> &Mutex<RemoteEngineTable> {
-        #[cfg(any(feature = "agent", test))]
         match self {
             Self::Authoritative => unreachable!("authoritative role rejected a foreign engine ID"),
             Self::Receiver { remote_engines } => remote_engines,
-        }
-
-        #[cfg(not(any(feature = "agent", test)))]
-        {
-            let Self::Receiver { remote_engines } = self;
-            remote_engines
         }
     }
 }

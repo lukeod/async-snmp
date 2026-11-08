@@ -196,7 +196,7 @@ impl NotificationControl {
     pub async fn wait_closed(&self) {
         if self.state.attached.load(Ordering::Acquire) {
             self.state.shutdown.cancelled().await;
-            NotificationProcessor {
+            NotificationRole {
                 inner: self.inner.clone(),
             }
             .drain()
@@ -295,8 +295,8 @@ impl NotificationReceiver {
         }
     }
     #[cfg(test)]
-    pub(crate) fn processor(&self) -> NotificationProcessor {
-        NotificationProcessor {
+    pub(crate) fn processor(&self) -> NotificationRole {
+        NotificationRole {
             inner: self.inner.clone(),
         }
     }
@@ -403,14 +403,14 @@ impl RunningNotificationReceiver {
 pub struct NotificationRunner {
     network: crate::transport::network::NetworkCleanup,
     listeners: Vec<crate::transport::listener::PreparedListener>,
-    processor: NotificationProcessor,
+    processor: NotificationRole,
     cleanup: RunnerCleanup,
 }
 impl NotificationRunner {
     pub(super) fn from_network(
         network: Arc<crate::transport::network::NetworkState>,
         #[allow(unused_mut)] mut listeners: Vec<crate::transport::listener::PreparedListener>,
-        processor: NotificationProcessor,
+        processor: NotificationRole,
         cleanup: RunnerCleanup,
     ) -> Self {
         #[cfg(test)]
@@ -476,7 +476,7 @@ pub(crate) enum NotificationDisposition {
     Overloaded,
 }
 
-impl NotificationProcessor {
+impl NotificationRole {
     pub(crate) fn processing_limit(&self) -> usize {
         self.inner.max_processing
     }
@@ -585,14 +585,6 @@ impl NotificationProcessor {
                     .failure
                     .unwrap_or(NotificationDisposition::Rejected),
                 Err(error) => {
-                    if matches!(&*error, Error::Decode(error) if !matches!(error.kind,
-                    crate::DecodeErrorKind::UnknownVersion(_) | crate::DecodeErrorKind::InvalidMsgFlags | crate::DecodeErrorKind::UnknownSecurityModel(_)))
-                    {
-                        processor
-                            .inner
-                            .snmp_in_asn_parse_errs
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
                     tracing::debug!(target: "async_snmp::notification", %source, %error, "notification rejected before admission");
                     NotificationDisposition::Rejected
                 }

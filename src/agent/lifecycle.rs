@@ -272,7 +272,7 @@ pub struct AgentRunner {
     incoming: mpsc::Receiver<InboundWork>,
     cleanup: AgentRunCleanup,
     pub(super) notification_role: Option<(
-        crate::notification::NotificationProcessor,
+        crate::notification::NotificationRole,
         crate::notification::RunnerCleanup,
     )>,
 }

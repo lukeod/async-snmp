@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `NotificationProcessor` processes complete v1/v2c/v3 inputs without owning I/O
+  or tasks, sharing protocol processing with managed receivers. Accepted Informs
+  carry an owned `InformResponse` encoded only on explicit completion, with
+  current authoritative time/sender state and the original selected keys.
+  USM failures retain their Report bytes; `LocalEngine::usm_stats` exposes a
+  counter snapshot. Caller-selected unclaimed engine IDs use common discovery
+  reporting through `report_unknown_engine`.
+
 - `UsmSecurityContext` shares selectable inbound credentials and bounded remote
   timeliness state. Engine-specific user entries precede explicit defaults;
   atomic user replacement preserves each in-flight input's credential snapshot.

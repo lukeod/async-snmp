@@ -61,6 +61,7 @@ pub(crate) mod prepared;
 )]
 mod privacy;
 pub(crate) mod process;
+pub use process::{UsmFailure, UsmStatsSnapshot};
 mod recency_map;
 pub(crate) mod security;
 pub use security::{UsmSecurityContext, UsmUserEntry};

@@ -20,6 +20,7 @@ pub(crate) enum FinalizedResponse {
 }
 
 impl FinalizedResponse {
+    #[cfg(feature = "agent")]
     pub(crate) fn into_bytes(self) -> Option<Bytes> {
         match self {
             Self::Candidate(bytes) | Self::Alternate(bytes) => Some(bytes),

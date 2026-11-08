@@ -246,6 +246,11 @@ impl LocalEngine {
         *self.inner.health.borrow()
     }
 
+    /// Sample the shared local USM statistics without exposing mutable counters.
+    pub fn usm_stats(&self) -> super::UsmStatsSnapshot {
+        self.inner.usm_stats.snapshot()
+    }
+
     /// Observe the latest shared persistence health without unbounded events.
     pub fn subscribe_health(&self) -> tokio::sync::watch::Receiver<LocalEngineHealth> {
         self.inner.health.subscribe()

@@ -632,13 +632,14 @@ pub use message_size::{
     ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE, UDP_RECEIVE_LIMITS,
 };
 pub use notification::{
-    InformAckOutcome, Notification, NotificationAcceptance, NotificationAcceptanceError,
-    NotificationAcceptancePolicy, NotificationAcceptanceResult, NotificationControl,
-    NotificationEnvelope, NotificationHealth, NotificationPduClass, NotificationReceiver,
-    NotificationReceiverBuilder, NotificationRunner, NotificationStatus,
+    EncodedInformResponse, InformAckOutcome, InformResponse, Notification, NotificationAcceptance,
+    NotificationAcceptanceError, NotificationAcceptancePolicy, NotificationAcceptanceResult,
+    NotificationControl, NotificationEnvelope, NotificationHealth, NotificationPduClass,
+    NotificationProcessResult, NotificationProcessor, NotificationProcessorBuilder,
+    NotificationReceiver, NotificationReceiverBuilder, NotificationRunner, NotificationStatus,
     NotificationVarbindValidation, NotificationWireIdentity, PreparedNotificationReceiver,
-    ReceivedNotification, RunningNotificationReceiver, V3NotificationWireIdentity,
-    validate_notification_varbinds,
+    ProcessedNotification, ReceivedNotification, RunningNotificationReceiver,
+    V3NotificationWireIdentity, validate_notification_varbinds,
 };
 pub use oid::Oid;
 pub use pdu::{
@@ -660,8 +661,8 @@ pub use v3::{
     AuthoritativeEnginePersistenceOperation, CryptoBackend, CryptoError, CryptoResult,
     DesSaltPersistenceError, DesSaltPersistenceOperation, DesSaltState, DesSaltStateError,
     DiscoveredEngine, EngineCache, LocalEngine, LocalEngineHealth, ParseProtocolError,
-    PersistedAuthoritativeEngine, PersistedDesSaltState, PrivProtocol, UsmConfig,
-    UsmSecurityContext, UsmUser, UsmUserEntry, generate_engine_id,
+    PersistedAuthoritativeEngine, PersistedDesSaltState, PrivProtocol, UsmConfig, UsmFailure,
+    UsmSecurityContext, UsmStatsSnapshot, UsmUser, UsmUserEntry, generate_engine_id,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 pub use v3::{LocalizedKey, MasterKey, MasterKeys};
