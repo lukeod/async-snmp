@@ -147,6 +147,65 @@ async fn shared_engine_mib_uses_minimum_across_independent_service_lifetimes() {
 }
 
 #[tokio::test]
+async fn shared_engine_mib_includes_client_capacity_until_its_last_clone_drops() {
+    let engine = LocalEngine::new(
+        AuthoritativeEngine::install(b"shared-client-capacity".as_slice(), |_| {
+            Ok::<_, Infallible>(())
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let agent = Agent::builder()
+        .local_engine(engine.clone())
+        .community("public")
+        .allow_all_access()
+        .listener(tcp_source(32768))
+        .spawn()
+        .await
+        .unwrap();
+    let query = Client::builder(
+        agent.bound_addresses()[0].local_addr.to_string(),
+        Auth::v2c("public"),
+    )
+    .retry(Retry::none())
+    .request_timeout(WAIT)
+    .connect_tcp()
+    .await
+    .unwrap();
+    let (endpoint, runner) = async_snmp::UdpEndpoint::builder()
+        .bind("127.0.0.1:0")
+        .receive_capacity(8192)
+        .prepare()
+        .await
+        .unwrap()
+        .into_parts();
+    let originator = async_snmp::ClientBuilder::new(Auth::usm("trapuser"))
+        .local_engine(engine.clone())
+        .build_with_transport(endpoint.handle("127.0.0.1:9".parse().unwrap()).unwrap())
+        .unwrap();
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 8192);
+    let mib = oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0);
+    assert_eq!(
+        query.get(&mib).await.unwrap().varbinds[0].value,
+        Value::Integer(8192)
+    );
+    let retained = originator.clone();
+    drop(originator);
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 8192);
+    drop(retained);
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 32768);
+    assert_eq!(
+        query.get(&mib).await.unwrap().varbinds[0].value,
+        Value::Integer(32768)
+    );
+    drop(query);
+    drop(endpoint);
+    drop(runner);
+    agent.shutdown().await.unwrap();
+    assert_eq!(engine.receive_capacity(), None);
+}
+
+#[tokio::test]
 async fn shared_engine_configuration_conflicts_are_rejected() {
     let authoritative = AuthoritativeEngine::install(b"shared-conflict-engine".as_slice(), |_| {
         Ok::<_, Infallible>(())

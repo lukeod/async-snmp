@@ -377,6 +377,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Share local authoritative time, health and privacy-sender state with
+    /// other clients, agents or notification receivers.
+    ///
+    /// Conflicts with separate `local_authoritative_engine` or `des_salt_state`
+    /// configuration. DES state changes on the engine affect existing clients.
+    #[must_use]
+    pub fn local_engine(mut self, engine: crate::LocalEngine) -> Self {
+        self.config.local_engine = Some(engine);
+        self
+    }
+
     /// Set the persisted local authoritative engine state for V3 trap sending.
     ///
     /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
@@ -384,6 +395,8 @@ impl ClientBuilder {
     /// (which use engine discovery against the receiver). Construct the value
     /// with [`AuthoritativeEngine::install`] on first installation or
     /// [`AuthoritativeEngine::restart`] on subsequent process starts.
+    /// Construction wraps it in a client-owned [`crate::LocalEngine`]; use
+    /// [`Self::local_engine`] to share the full local state with other roles.
     ///
     /// # Example
     ///
@@ -648,6 +661,14 @@ impl TargetClientBuilder {
     #[must_use]
     pub fn walk_options(mut self, options: WalkOptions) -> Self {
         self.client = self.client.walk_options(options);
+        self
+    }
+
+    /// Share local authoritative time, health and privacy-sender state.
+    /// Conflicts with separate authoritative-engine or DES sender configuration.
+    #[must_use]
+    pub fn local_engine(mut self, engine: crate::LocalEngine) -> Self {
+        self.client = self.client.local_engine(engine);
         self
     }
 
@@ -1685,6 +1706,29 @@ mod tests {
         .unwrap();
         let valid = ClientBuilder::new(Auth::usm("trapuser")).local_authoritative_engine(engine);
         assert!(valid.validate().is_ok());
+    }
+
+    #[test]
+    fn local_engine_configuration_rejects_independent_sender_state() {
+        let authoritative = AuthoritativeEngine::for_test(b"client-shared-engine".as_slice(), 1);
+        let local = crate::LocalEngine::new(authoritative.clone()).unwrap();
+        let des = DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
+        let builder = || ClientBuilder::new(Auth::usm("user")).local_engine(local.clone());
+        assert!(builder().validate().is_ok());
+        assert!(
+            builder()
+                .local_authoritative_engine(authoritative)
+                .validate()
+                .is_err()
+        );
+        assert!(builder().des_salt_state(des).validate().is_err());
+        let targeted =
+            Client::builder("127.0.0.1:161", Auth::usm("user")).local_engine(local.clone());
+        assert!(targeted.validate().is_ok());
+        assert!(Arc::ptr_eq(
+            &targeted.client.config.local_engine.unwrap().inner,
+            &local.inner,
+        ));
     }
 
     #[test]

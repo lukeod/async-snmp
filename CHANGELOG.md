@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Clients accept `local_engine` to share authoritative time, persistence health
+  and privacy-sender state with other roles. Existing clients and cached agent
+  Inform clients observe DES state removal and replacement; AES clients share
+  the local engine's salt allocator. Client receive capacities contribute to
+  the shared engine minimum until the last client clone is dropped.
+
 - `LocalEngine` shares local identity, authoritative time, engine counters,
   persistence health and privacy-sender state across independently prepared
   agent and notification services. Builders accept `local_engine`; engine MIB

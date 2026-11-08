@@ -19,9 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::Community;
 use crate::RequestTransport;
-use crate::client::{
-    Auth, Client, ClientConfig, CommunityVersion, LocalAuthoritativeTimeSource, Retry,
-};
+use crate::client::{Auth, Client, ClientConfig, CommunityVersion, Retry};
 use crate::error::{Error, Result};
 use crate::handler::SecurityModel;
 use crate::message::{CommunityMessage, SecurityLevel};
@@ -400,8 +398,7 @@ impl TrapSink {
     /// Get or create the cached inform client for this sink.
     async fn get_or_create_inform_client(
         &self,
-        des_salt_state: Option<&crate::v3::DesSaltState>,
-        agent_state: Option<&Arc<super::AgentState>>,
+        local_engine: &crate::LocalEngine,
     ) -> Result<Client<BuiltinTransport>> {
         let mut guard = self.inform_client.lock().await;
         if let Some(ref client) = *guard {
@@ -411,19 +408,11 @@ impl TrapSink {
         if self.summary.version == Version::V1 {
             unreachable!("v1 does not support informs");
         }
-        let local_authoritative_engine =
-            agent_state.and_then(|state| state.authoritative_engine.clone());
-        let local_authoritative_time_source = agent_state.map(|state| {
-            let engine = state.local_engine.clone();
-            Arc::new(move || engine.current_boots_time()) as LocalAuthoritativeTimeSource
-        });
         let config = ClientConfig {
             auth: self.auth.clone(),
             request_timeout: self.inform_timeout,
             retry: self.inform_retry.clone(),
-            des_salt_state: des_salt_state.cloned(),
-            local_authoritative_engine,
-            local_authoritative_time_source,
+            local_engine: Some(local_engine.clone()),
             ..ClientConfig::default()
         };
 
@@ -1033,10 +1022,7 @@ impl super::Agent {
     ) -> Result<crate::client::ResponseMetadata> {
         self.ensure_notification_active()?;
         let client = sink
-            .get_or_create_inform_client(
-                self.inner.state.local_engine.des_salt_state().as_ref(),
-                Some(&self.inner.state),
-            )
+            .get_or_create_inform_client(&self.inner.state.local_engine)
             .await?;
         tokio::select! {
             biased;
@@ -1339,6 +1325,122 @@ mod tests {
 
         receiver_task.abort();
         let _ = receiver_task.await;
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[tokio::test]
+    async fn cached_inform_client_uses_current_shared_des_state() {
+        use std::convert::Infallible;
+
+        let receiver_engine =
+            crate::AuthoritativeEngine::for_test(b"cached-inform-receiver".as_slice(), 5);
+        let receiver_des =
+            crate::DesSaltState::restart(crate::PersistedDesSaltState::new(4).unwrap(), |_| {
+                Ok::<_, Infallible>(())
+            })
+            .unwrap();
+        let mut receiver = crate::NotificationReceiver::builder()
+            .bind("127.0.0.1:0")
+            .authoritative_engine(receiver_engine)
+            .des_salt_state(receiver_des)
+            .usm_user("user", |user| {
+                user.auth_priv(
+                    AuthProtocol::Sha1,
+                    b"authentication",
+                    PrivProtocol::Des,
+                    b"privacy-password",
+                )
+            })
+            .unwrap()
+            .accept_all_notifications()
+            .spawn()
+            .await
+            .unwrap();
+        let authoritative =
+            crate::AuthoritativeEngine::for_test(b"cached-inform-sender".as_slice(), 1);
+        let local = crate::LocalEngine::new(authoritative.clone()).unwrap();
+        let first_state = crate::DesSaltState::install(|_| Ok::<_, Infallible>(())).unwrap();
+        local.set_des_salt_state(Some(first_state.clone())).unwrap();
+        let auth = crate::UsmConfig::new("user")
+            .auth_priv(
+                AuthProtocol::Sha1,
+                b"authentication",
+                PrivProtocol::Des,
+                b"privacy-password",
+            )
+            .unwrap();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .local_engine(local.clone())
+            .notification_sink(
+                NotificationSinkId::new("cached-des").unwrap(),
+                crate::NotificationTarget::shared_udp(0, receiver.local_addr().to_string()),
+                auth,
+            )
+            .inform_timeout(std::time::Duration::from_secs(1))
+            .inform_retry(crate::Retry::none())
+            .allow_all_access()
+            .spawn()
+            .await
+            .unwrap();
+        let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+        assert!(
+            agent
+                .send_inform(&trap_oid, 0, vec![])
+                .await
+                .all_succeeded()
+        );
+        let cached = agent.sinks[0].inform_client.lock().await.clone().unwrap();
+        assert!(Arc::ptr_eq(
+            &cached.local_engine().unwrap().inner,
+            &local.inner,
+        ));
+
+        local.set_des_salt_state(None).unwrap();
+        let removed = agent.send_inform(&trap_oid, 0, vec![]).await;
+        assert!(matches!(
+            &removed.sinks()[0].status,
+            SinkStatus::Failed(error) if matches!(&**error, Error::Config(_))
+        ));
+        local.set_des_salt_state(Some(first_state.clone())).unwrap();
+        assert!(
+            agent
+                .send_inform(&trap_oid, 0, vec![])
+                .await
+                .all_succeeded()
+        );
+
+        authoritative.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let stale = agent.send_inform(&trap_oid, 0, vec![]).await;
+        assert!(matches!(
+            &stale.sinks()[0].status,
+            SinkStatus::Failed(error) if matches!(
+                &**error,
+                Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch { .. })
+            )
+        ));
+        let next_state =
+            crate::DesSaltState::restart(
+                first_state.persisted_state(),
+                |_| Ok::<_, Infallible>(()),
+            )
+            .unwrap();
+        local.set_des_salt_state(Some(next_state)).unwrap();
+        assert!(
+            agent
+                .send_inform(&trap_oid, 0, vec![])
+                .await
+                .all_succeeded()
+        );
+        for _ in 0..3 {
+            let notification = receiver.recv().await.unwrap();
+            assert!(matches!(
+                notification.inform_ack,
+                Some(crate::InformAckOutcome::Sent)
+            ));
+        }
+        agent.shutdown().await.unwrap();
+        receiver.shutdown().await.unwrap();
     }
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]

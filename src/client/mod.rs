@@ -81,6 +81,7 @@ use crate::v3::{DesSaltState, EngineCache, EngineState, PrivProtocol, SaltCounte
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
+use bytes::Bytes;
 use response_shape::{RequestShape, classify};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -383,7 +384,9 @@ struct ClientInner<T: RequestTransport> {
     /// Coherent V3 identity, trusted time, and identity-localized keys.
     engine: RwLock<Option<ClientEngine>>,
     /// Salt counter for privacy (V3)
-    salt_counter: Option<SaltCounter>,
+    salt_counter: Option<Arc<SaltCounter>>,
+    /// Registered local transport capacity, retained through the last client clone.
+    _capacity_registration: Option<crate::v3::local::EngineCapacityRegistration>,
     /// Shared engine cache (V3, optional)
     engine_cache: Option<Arc<EngineCache>>,
     /// Serializes explicit rediscovery against ordinary discovery.
@@ -395,8 +398,6 @@ struct ClientInner<T: RequestTransport> {
     #[cfg(test)]
     authenticated_response_validated_hook: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
-
-pub(crate) type LocalAuthoritativeTimeSource = Arc<dyn Fn() -> Result<(u32, u32)> + Send + Sync>;
 
 /// Client configuration.
 ///
@@ -456,6 +457,14 @@ pub struct ClientConfig {
     pub allow_unauthenticated_v3_time_correction: bool,
     /// Default walk method, repetitions, ordering, and result limit.
     pub walk_options: WalkOptions,
+    /// Shared local generating-engine state (default: None).
+    ///
+    /// Clients sharing this handle use one authoritative clock, persistence
+    /// health, AES salt allocator and current DES sender state. Conflicts with
+    /// separate `local_authoritative_engine` or `des_salt_state` configuration.
+    /// The transport's advertised receive capacity contributes to the engine
+    /// minimum until the last clone of this client is dropped.
+    pub local_engine: Option<crate::LocalEngine>,
     /// Local authoritative engine state for V3 trap sending (default: None).
     ///
     /// Per RFC 3412 Section 6.4, the sender is authoritative for trap PDUs.
@@ -464,8 +473,6 @@ pub struct ClientConfig {
     pub local_authoritative_engine: Option<crate::v3::AuthoritativeEngine>,
     /// Durable local generating-engine state required by DES and 3DES.
     pub des_salt_state: Option<DesSaltState>,
-    /// Internal observer-aware source for Agent-owned authoritative time.
-    pub(crate) local_authoritative_time_source: Option<LocalAuthoritativeTimeSource>,
 }
 
 impl std::fmt::Debug for ClientConfig {
@@ -485,18 +492,12 @@ impl std::fmt::Debug for ClientConfig {
                 &self.allow_unauthenticated_v3_time_correction,
             )
             .field("walk_options", &self.walk_options)
+            .field("local_engine", &self.local_engine)
             .field(
                 "local_authoritative_engine",
                 &self.local_authoritative_engine,
             )
             .field("des_salt_state", &self.des_salt_state)
-            .field(
-                "local_authoritative_time_source",
-                &self
-                    .local_authoritative_time_source
-                    .as_ref()
-                    .map(|_| "<callback>"),
-            )
             .finish()
     }
 }
@@ -518,9 +519,9 @@ impl Default for ClientConfig {
             response_shape_policy: ResponseShapePolicy::Compatible,
             allow_unauthenticated_v3_time_correction: false,
             walk_options: WalkOptions::default(),
+            local_engine: None,
             local_authoritative_engine: None,
             des_salt_state: None,
-            local_authoritative_time_source: None,
         }
     }
 }
@@ -548,6 +549,14 @@ impl ClientConfig {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
+        if self.local_engine.is_some()
+            && (self.local_authoritative_engine.is_some() || self.des_salt_state.is_some())
+        {
+            return Err(Error::Config(
+                "local_engine conflicts with local_authoritative_engine or des_salt_state".into(),
+            )
+            .boxed());
+        }
         crate::transport::checked_deadline(self.request_timeout, "request timeout")?;
         crate::transport::checked_deadline(self.send_timeout, "send timeout")?;
         if let Some(timeout) = self.exchange_timeout {
@@ -569,15 +578,23 @@ impl ClientConfig {
             .usm_config()
             .and_then(UsmConfig::priv_protocol)
             .is_some_and(PrivProtocol::is_des_family);
-        if uses_des && self.des_salt_state.is_none() {
+        let des_state = self.local_engine.as_ref().map_or_else(
+            || self.des_salt_state.clone(),
+            crate::LocalEngine::des_salt_state,
+        );
+        if uses_des && des_state.is_none() {
             return Err(Error::Config(
                 "durable DES sender state is required for DES/3DES privacy".into(),
             )
             .boxed());
         }
+        if uses_des && let (Some(engine), Some(state)) = (&self.local_engine, &des_state) {
+            state
+                .validate_generating_engine_boots(engine.current_boots_time()?.0)
+                .map_err(|error| Error::Privacy(error).boxed())?;
+        }
         if uses_des
-            && let (Some(engine), Some(state)) =
-                (&self.local_authoritative_engine, &self.des_salt_state)
+            && let (Some(engine), Some(state)) = (&self.local_authoritative_engine, &des_state)
             && engine.engine_boots() != state.engine_boots()
         {
             return Err(Error::Config(
@@ -611,8 +628,10 @@ impl<T: RequestTransport> Client<T> {
     /// # Errors
     ///
     /// Returns [`Error::Config`] when the configuration violates a client
-    /// invariant, or [`Error::RandomSource`] when an `authPriv` client cannot
-    /// initialize its privacy salt.
+    /// invariant, [`Error::Privacy`] for stale shared DES sender state, an
+    /// authoritative persistence error when its clock cannot be acquired, or
+    /// [`Error::RandomSource`] when an `authPriv` client cannot initialize its
+    /// privacy salt.
     pub fn new(transport: T, config: ClientConfig) -> Result<Self> {
         Self::with_optional_engine_cache(transport, config, None)
     }
@@ -622,8 +641,10 @@ impl<T: RequestTransport> Client<T> {
     /// # Errors
     ///
     /// Returns [`Error::Config`] when the configuration violates a client
-    /// invariant, or [`Error::RandomSource`] when an `authPriv` client cannot
-    /// initialize its privacy salt.
+    /// invariant, [`Error::Privacy`] for stale shared DES sender state, an
+    /// authoritative persistence error when its clock cannot be acquired, or
+    /// [`Error::RandomSource`] when an `authPriv` client cannot initialize its
+    /// privacy salt.
     pub fn with_engine_cache(
         transport: T,
         config: ClientConfig,
@@ -638,6 +659,15 @@ impl<T: RequestTransport> Client<T> {
         engine_cache: Option<Arc<EngineCache>>,
     ) -> Result<Self> {
         config.validate_and_precompute()?;
+        if let Some(authoritative) = config.local_authoritative_engine.take() {
+            config.local_engine = Some(crate::LocalEngine::from_prepared(
+                Some(authoritative.clone()),
+                Bytes::copy_from_slice(authoritative.engine_id()),
+                authoritative.engine_boots(),
+                None,
+                config.des_salt_state.take(),
+            ));
+        }
         let salt_counter = config
             .usm_config()
             .filter(|security| {
@@ -646,18 +676,29 @@ impl<T: RequestTransport> Client<T> {
                         .priv_protocol()
                         .is_some_and(PrivProtocol::is_des_family)
             })
-            .map(|_| SaltCounter::new())
+            .map(|_| match &config.local_engine {
+                Some(engine) => {
+                    engine.ensure_salt_counter(SaltCounter::new)?;
+                    Ok(engine.salt_counter().expect("AES salt initialized"))
+                }
+                None => SaltCounter::new().map(Arc::new),
+            })
             .transpose()?;
         let discovery_coordinator = engine_cache.as_ref().map_or_else(
             || Arc::new(DiscoveryCoordinator::new()),
             |cache| Arc::clone(&cache.discovery_coordinator),
         );
+        let capacity_registration = config
+            .local_engine
+            .as_ref()
+            .map(|engine| engine.register_capacity(transport.receive_limits().advertised()));
         Ok(Self {
             inner: Arc::new(ClientInner {
                 transport,
                 config,
                 engine: RwLock::new(None),
                 salt_counter,
+                _capacity_registration: capacity_registration,
                 engine_cache,
                 discovery_lock: AsyncMutex::new(()),
                 discovery_coordinator,
@@ -675,6 +716,22 @@ impl<T: RequestTransport> Client<T> {
     #[must_use]
     pub fn peer_addr(&self) -> SocketAddr {
         self.inner.transport.peer_addr()
+    }
+
+    /// Shared local engine, when configured directly or through
+    /// [`ClientBuilder::local_authoritative_engine`].
+    ///
+    /// The returned clone observes current privacy-sender state and persistence
+    /// health across every client and managed role using the same engine.
+    pub fn local_engine(&self) -> Option<crate::LocalEngine> {
+        self.inner.config.local_engine.clone()
+    }
+
+    fn des_salt_state(&self) -> Option<DesSaltState> {
+        self.inner.config.local_engine.as_ref().map_or_else(
+            || self.inner.config.des_salt_state.clone(),
+            crate::LocalEngine::des_salt_state,
+        )
     }
 
     /// Returns the SNMP version configured for this client.
@@ -1208,7 +1265,8 @@ impl<T: RequestTransport> Client<T> {
     /// and snmpTrapOID.0 prefix.
     ///
     /// For V3: uses the persisted local authoritative engine state configured
-    /// through `ClientBuilder::local_authoritative_engine`.
+    /// through [`ClientBuilder::local_engine`] or
+    /// [`ClientBuilder::local_authoritative_engine`].
     ///
     /// # Arguments
     ///

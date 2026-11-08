@@ -306,8 +306,9 @@ impl LocalEngine {
         Ok(())
     }
 
-    /// Minimum advertised receive capacity of all registered managed services.
-    /// Returns `None` while no managed service is registered. Per-message v3
+    /// Minimum advertised receive capacity of registered services and clients.
+    /// Client registrations remain until their last clone is dropped. Returns
+    /// `None` while no service or client is registered. Per-message v3
     /// advertisement continues to use the receiving endpoint's own capacity.
     pub fn receive_capacity(&self) -> Option<MessageSize> {
         self.inner

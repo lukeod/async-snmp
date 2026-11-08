@@ -727,16 +727,16 @@ impl<T: RequestTransport> Client<T> {
             .usm_config()
             .ok_or_else(|| Error::Config("V3 security not configured".into()).boxed())?;
 
+        let des_salt_state = security
+            .priv_protocol()
+            .filter(|protocol| protocol.is_des_family())
+            .and_then(|_| self.des_salt_state());
         let des_generating_engine_boots = match security.priv_protocol() {
             Some(crate::v3::PrivProtocol::Des | crate::v3::PrivProtocol::Des3) => Some(
-                if let Some(sample) = &self.inner.config.local_authoritative_time_source {
-                    sample()?.0
-                } else if let Some(local_engine) = &self.inner.config.local_authoritative_engine {
+                if let Some(local_engine) = &self.inner.config.local_engine {
                     local_engine.current_boots_time()?.0
                 } else {
-                    self.inner
-                        .config
-                        .des_salt_state
+                    des_salt_state
                         .as_ref()
                         .ok_or_else(|| {
                             Error::Config(
@@ -784,8 +784,8 @@ impl<T: RequestTransport> Client<T> {
             engine_time,
             security,
             Some(&engine.derived_keys),
-            self.inner.salt_counter.as_ref(),
-            self.inner.config.des_salt_state.as_ref(),
+            self.inner.salt_counter.as_deref(),
+            des_salt_state.as_ref(),
             des_generating_engine_boots,
             true, // reportable=true for requests
             // RFC 3412 Section 6.3: msgMaxSize advertises THIS sender's own
@@ -1618,11 +1618,12 @@ impl<T: RequestTransport> Client<T> {
         Ok(())
     }
 
-    fn local_engine_for_trap(&self) -> Result<&crate::v3::AuthoritativeEngine> {
+    fn local_engine_for_trap(&self) -> Result<&crate::LocalEngine> {
         self.inner
             .config
-            .local_authoritative_engine
+            .local_engine
             .as_ref()
+            .filter(|engine| engine.authoritative_engine().is_some())
             .ok_or_else(|| {
                 Error::Config(
                     "local authoritative engine state required for V3 trap sending".into(),
@@ -1652,6 +1653,10 @@ impl<T: RequestTransport> Client<T> {
             .map_err(|_| Error::Config("local_derived_keys lock poisoned".into()).boxed())?;
 
         let (engine_boots, engine_time) = local_engine.current_boots_time()?;
+        let des_salt_state = security
+            .priv_protocol()
+            .filter(|protocol| protocol.is_des_family())
+            .and_then(|_| local_engine.des_salt_state());
 
         crate::v3::encode::encode_v3_message(
             pdu,
@@ -1661,8 +1666,8 @@ impl<T: RequestTransport> Client<T> {
             engine_time,
             security,
             derived.as_ref(),
-            self.inner.salt_counter.as_ref(),
-            self.inner.config.des_salt_state.as_ref(),
+            self.inner.salt_counter.as_deref(),
+            des_salt_state.as_ref(),
             Some(engine_boots),
             false, // reportable=false for traps
             self.inner.transport.receive_limits().advertised(),
@@ -2014,6 +2019,182 @@ mod tests {
             })
         ));
         assert_eq!(des_state.reserve().unwrap().salt(), 1);
+    }
+
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn independently_built_clients_share_the_local_engine_aes_allocator() {
+        let local = crate::LocalEngine::new(crate::AuthoritativeEngine::for_test(
+            b"shared-client-aes".as_slice(),
+            1,
+        ))
+        .unwrap();
+        let security = UsmConfig::new("user")
+            .auth_priv(
+                crate::AuthProtocol::Sha256,
+                b"authentication",
+                crate::PrivProtocol::Aes128,
+                b"privacy-password",
+            )
+            .unwrap();
+        let build = || {
+            let client = crate::ClientBuilder::new(security.clone())
+                .local_engine(local.clone())
+                .build_with_transport(TestTransport::new())
+                .unwrap();
+            let remote = EngineState::new(Bytes::from_static(b"remote-aes"), 77, 123);
+            let keys = security.derive_keys(remote.engine_id()).unwrap();
+            *client.inner.engine.write().unwrap() = Some(ClientEngine::new(remote, keys));
+            client
+        };
+        let first = build();
+        let second = build();
+        let allocator = local.salt_counter().unwrap();
+        for client in [&first, &second] {
+            assert!(Arc::ptr_eq(
+                client.inner.salt_counter.as_ref().unwrap(),
+                &allocator,
+            ));
+            assert!(Arc::ptr_eq(
+                &client.local_engine().unwrap().inner,
+                &local.inner,
+            ));
+        }
+        let request = Pdu::get_request(7, &[]);
+        let mut salts = Vec::new();
+        for client in [&first, &second, &first] {
+            let encoded = client.build_v3_message(&request, 9, None).unwrap();
+            let raw = RawV3Message::decode(encoded.data, crate::DecodeConfig::DEFAULT)
+                .unwrap()
+                .value;
+            let usm = UsmSecurityParams::decode(raw.security_params, crate::DecodeConfig::DEFAULT)
+                .unwrap()
+                .value;
+            salts.push(usm.priv_params);
+        }
+        assert!(salts.windows(2).all(|pair| pair[0] != pair[1]));
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn existing_client_snapshots_current_local_des_state_for_requests_and_traps() {
+        use std::convert::Infallible;
+
+        let authoritative =
+            crate::AuthoritativeEngine::for_test(b"shared-client-des".as_slice(), 1);
+        let local = crate::LocalEngine::new(authoritative.clone()).unwrap();
+        let first_state = crate::DesSaltState::install(|_| Ok::<_, Infallible>(())).unwrap();
+        local.set_des_salt_state(Some(first_state.clone())).unwrap();
+        let security = UsmConfig::new("user")
+            .auth_priv(
+                crate::AuthProtocol::Sha1,
+                b"authentication",
+                crate::PrivProtocol::Des,
+                b"privacy-password",
+            )
+            .unwrap();
+        let client = crate::ClientBuilder::new(security.clone())
+            .local_engine(local.clone())
+            .build_with_transport(TestTransport::new())
+            .unwrap();
+        let remote = EngineState::new(Bytes::from_static(b"remote-des"), 77, 123);
+        let remote_keys = security.derive_keys(remote.engine_id()).unwrap();
+        *client.inner.engine.write().unwrap() = Some(ClientEngine::new(remote, remote_keys));
+        client.ensure_local_keys_derived().unwrap();
+        let request = Pdu::get_request(7, &[]);
+        let notification = crate::NotificationPdu::trap_v2(
+            crate::Version::V3,
+            7,
+            0,
+            &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1),
+            vec![],
+        )
+        .unwrap();
+        let decode = |wire| {
+            let raw = RawV3Message::decode(wire, crate::DecodeConfig::DEFAULT)
+                .unwrap()
+                .value;
+            UsmSecurityParams::decode(raw.security_params, crate::DecodeConfig::DEFAULT)
+                .unwrap()
+                .value
+        };
+        let encoded = client.build_v3_message(&request, 9, None).unwrap();
+        let first = decode(encoded.data);
+        assert_eq!(first.engine_boots, 77);
+        assert_eq!(&first.priv_params[..4], &1u32.to_be_bytes());
+        client
+            .build_v3_trap_message(notification.as_raw(), 10)
+            .unwrap();
+
+        local.set_des_salt_state(None).unwrap();
+        assert!(client.build_v3_message(&request, 11, None).is_err());
+        assert!(
+            client
+                .build_v3_trap_message(notification.as_raw(), 12)
+                .is_err()
+        );
+        local.set_des_salt_state(Some(first_state.clone())).unwrap();
+        client.build_v3_message(&request, 13, None).unwrap();
+
+        authoritative.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        assert!(matches!(
+            *client.build_v3_message(&request, 14, None).err().unwrap(),
+            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+        let replacement =
+            crate::DesSaltState::restart(
+                first_state.persisted_state(),
+                |_| Ok::<_, Infallible>(()),
+            )
+            .unwrap();
+        local.set_des_salt_state(Some(replacement)).unwrap();
+        let encoded = client.build_v3_message(&request, 15, None).unwrap();
+        let request_usm = decode(encoded.data);
+        assert_eq!(request_usm.engine_boots, 77);
+        assert_eq!(&request_usm.priv_params[..4], &2u32.to_be_bytes());
+        let trap = client
+            .build_v3_trap_message(notification.as_raw(), 16)
+            .unwrap();
+        let trap_usm = decode(Bytes::from(trap));
+        assert_eq!(trap_usm.engine_boots, 2);
+        assert_eq!(&trap_usm.priv_params[..4], &2u32.to_be_bytes());
+    }
+
+    #[cfg(feature = "crypto-rustcrypto")]
+    #[test]
+    fn stale_shared_des_state_is_rejected_at_client_construction() {
+        use std::convert::Infallible;
+
+        let authoritative = crate::AuthoritativeEngine::for_test(b"stale-client-des".as_slice(), 1);
+        let local = crate::LocalEngine::new(authoritative.clone()).unwrap();
+        let state = crate::DesSaltState::install(|_| Ok::<_, Infallible>(())).unwrap();
+        local.set_des_salt_state(Some(state.clone())).unwrap();
+        authoritative.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let security = UsmConfig::new("user")
+            .auth_priv(
+                crate::AuthProtocol::Sha1,
+                b"authentication",
+                crate::PrivProtocol::Des,
+                b"privacy-password",
+            )
+            .unwrap();
+        let error = crate::ClientBuilder::new(security)
+            .local_engine(local.clone())
+            .build_with_transport(TestTransport::new())
+            .err()
+            .expect("stale local DES epoch must fail client construction");
+        assert!(matches!(
+            *error,
+            Error::Privacy(crate::v3::PrivacyError::DesEngineBootsMismatch {
+                state_engine_boots: 1,
+                generating_engine_boots: 2,
+            })
+        ));
+        assert_eq!(local.health(), crate::LocalEngineHealth::Healthy);
+        assert_eq!(state.reserve().unwrap().salt(), 1);
     }
 
     #[test]
