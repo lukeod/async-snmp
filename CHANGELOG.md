@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `UsmSecurityContext` shares selectable inbound credentials and bounded remote
+  timeliness state. Engine-specific user entries precede explicit defaults;
+  atomic user replacement preserves each in-flight input's credential snapshot.
+  Agent and notification builders accept an explicit `security_context`.
+
 - Clients accept `local_engine` to share authoritative time, persistence health
   and privacy-sender state with other roles. Existing clients and cached agent
   Inform clients observe DES state removal and replacement; AES clients share

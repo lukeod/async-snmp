@@ -204,6 +204,10 @@ impl AgentProcessor {
         let limits = lifecycle.endpoint_limits;
         let state = &self.inner.state;
         let (engine_boots, engine_time) = state.authoritative_boots_time()?;
+        let users = self
+            .inner
+            .security_context
+            .users_for_input(&data, prepared.as_deref())?;
         let usm_ctx = V3LocalContext {
             engine_id: &state.engine_id,
             engine_boots,
@@ -213,7 +217,7 @@ impl AgentProcessor {
             accepted_receive_size: limits.receive.accepted(),
             decode_config: state.decode_config,
             outbound_limit: state.max_message_size.min(limits.send),
-            usm_users: &self.inner.usm_users,
+            usm_users: users,
             stats: &state.usm_stats,
             mpd: Some(MpdCounters {
                 invalid_msgs: &state.snmp_invalid_msgs,

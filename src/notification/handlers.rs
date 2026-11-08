@@ -295,6 +295,10 @@ impl super::NotificationProcessor {
                 .load(std::sync::atomic::Ordering::Relaxed),
         );
         let sample_authoritative_time = || self.inner.authoritative_boots_time();
+        let users = self
+            .inner
+            .security_context
+            .users_for_input(&data, prepared.as_deref())?;
         let usm_ctx = V3LocalContext {
             engine_id: &self.inner.engine_id,
             engine_boots: our_boots,
@@ -304,7 +308,7 @@ impl super::NotificationProcessor {
             accepted_receive_size: limits.receive().accepted(),
             decode_config: self.inner.decode_config,
             outbound_limit: self.inner.max_message_size.min(route.limits.send),
-            usm_users: &self.inner.usm_users,
+            usm_users: users,
             stats: &self.inner.usm_stats,
             mpd: Some(crate::v3::process::MpdCounters {
                 invalid_msgs: &self.inner.snmp_invalid_msgs,
@@ -313,7 +317,7 @@ impl super::NotificationProcessor {
             source,
         };
         let role = V3Role::Receiver {
-            remote_engines: &self.inner.remote_engines,
+            remote_engines: self.inner.security_context.remote_engines(),
         };
 
         let inbound = match process_prepared_v3_inbound(data, &usm_ctx, &role, prepared)? {
@@ -522,6 +526,16 @@ fn build_v3_response(
         engine_time,
         incoming_usm.username.clone(),
     )?;
+
+    if incoming.msg_flags.security_level.requires_priv()
+        && derived_keys
+            .and_then(|keys| keys.priv_key.as_ref())
+            .is_some_and(|key| !key.protocol().is_des_family())
+    {
+        inner
+            .local_engine
+            .ensure_salt_counter(crate::v3::SaltCounter::new)?;
+    }
 
     encode_v3_response(
         response_pdu,

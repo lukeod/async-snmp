@@ -13,6 +13,8 @@ pub(crate) struct PreparedV3 {
     pub(crate) raw: Option<DecodeOutcome<RawV3Message>>,
     pub(crate) usm: Option<DecodeOutcome<UsmSecurityParams>>,
     pub(crate) crypto: Option<PreparedCrypto>,
+    pub(crate) selected_users: Option<Arc<super::security::UsmUsers>>,
+    pub(crate) client_conflict: bool,
 }
 pub(crate) struct PreparedCrypto {
     pub(crate) identity: Arc<()>,
@@ -21,6 +23,7 @@ pub(crate) struct PreparedCrypto {
     pub(crate) plaintext: Option<Bytes>,
 }
 impl PreparedV3 {
+    #[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
     pub(crate) fn new(
         wire: Bytes,
         config: DecodeConfig,
@@ -33,8 +36,27 @@ impl PreparedV3 {
             raw: Some(raw),
             usm: Some(usm),
             crypto: None,
+            selected_users: None,
+            client_conflict: false,
         }
     }
+
+    pub(crate) fn selected(
+        wire: Bytes,
+        config: DecodeConfig,
+        users: Arc<super::security::UsmUsers>,
+    ) -> Self {
+        Self {
+            wire,
+            config,
+            raw: None,
+            usm: None,
+            crypto: None,
+            selected_users: Some(users),
+            client_conflict: false,
+        }
+    }
+
     pub(crate) fn matches(&self, wire: &Bytes) -> bool {
         self.wire.as_ptr() == wire.as_ptr() && self.wire.len() == wire.len()
     }

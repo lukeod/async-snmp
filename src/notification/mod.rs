@@ -296,7 +296,6 @@ use crate::pdu::TrapV1Pdu;
 #[cfg(test)]
 use crate::udp_responder::{ReceivedDatagram, UdpResponder};
 use crate::util::{PreparedAuthoritativeUsm, validate_authoritative_usm};
-use crate::v3::process::RemoteEngineTable;
 use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, SaltCounter};
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -309,7 +308,8 @@ pub use varbind::{NotificationVarbindValidation, validate_notification_varbinds}
 /// authenticate under arbitrarily many fabricated engine IDs (keys are
 /// localized per engine ID), so the table is bounded and the
 /// least-recently-updated engine is evicted when full.
-const MAX_REMOTE_ENGINES: usize = 8192;
+#[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+const MAX_REMOTE_ENGINES: usize = crate::v3::security::DEFAULT_REMOTE_ENGINE_LIMIT;
 
 /// Notification PDU class presented to an acceptance policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -778,6 +778,7 @@ pub struct NotificationReceiverBuilder {
     queue_capacity: usize,
     max_processing: usize,
     usm_users: HashMap<Bytes, UsmUser>,
+    security_context: Option<crate::UsmSecurityContext>,
     communities: Vec<Community>,
     local_engine: Option<crate::LocalEngine>,
     authoritative_engine: Option<AuthoritativeEngine>,
@@ -813,6 +814,7 @@ impl NotificationReceiverBuilder {
             queue_capacity: 256,
             max_processing: 64,
             usm_users: HashMap::new(),
+            security_context: None,
             communities: Vec::new(),
             local_engine: None,
             authoritative_engine: None,
@@ -1131,6 +1133,16 @@ impl NotificationReceiverBuilder {
         self
     }
 
+    /// Select shared inbound USM credentials and remote timeliness state.
+    /// Conflicts with separately configured `usm_user` entries. An explicit
+    /// context requires persisted local engine state and an acceptance policy
+    /// even when initially empty, including across later user replacement.
+    #[must_use]
+    pub fn security_context(mut self, context: crate::UsmSecurityContext) -> Self {
+        self.security_context = Some(context);
+        self
+    }
+
     /// Share local engine identity, clock, counters and privacy-sender state.
     /// Conflicts with `authoritative_engine` or `des_salt_state` configuration.
     /// Credentials, remote timeliness and acceptance remain receiver-specific.
@@ -1188,6 +1200,14 @@ impl NotificationReceiverBuilder {
         mut self,
         generate_engine_id: impl FnOnce() -> Result<Bytes>,
     ) -> Result<PreparedNotificationReceiver> {
+        if self.security_context.is_some() && !self.usm_users.is_empty() {
+            return Err(Error::Config(
+                "security_context conflicts with usm_user configuration".into(),
+            )
+            .boxed());
+        }
+        let security_context_required =
+            self.security_context.is_some() || !self.usm_users.is_empty();
         if self.queue_capacity == 0
             || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
             || self.max_processing == 0
@@ -1204,7 +1224,7 @@ impl NotificationReceiverBuilder {
             )
             .boxed());
         }
-        if !self.usm_users.is_empty() && self.acceptance_policy.is_none() {
+        if security_context_required && self.acceptance_policy.is_none() {
             return Err(Error::Config(
                 "a notification receiver with USM users requires an acceptance policy".into(),
             )
@@ -1232,16 +1252,28 @@ impl NotificationReceiverBuilder {
             self.des_salt_state = engine.des_salt_state();
         }
 
-        let uses_des = self.usm_users.values().any(|security| {
-            security
-                .priv_protocol()
-                .is_some_and(PrivProtocol::is_des_family)
-        });
-        let uses_aes = self.usm_users.values().any(|security| {
-            security
-                .priv_protocol()
-                .is_some_and(|protocol| !protocol.is_des_family())
-        });
+        let context_users = self
+            .security_context
+            .as_ref()
+            .map(crate::UsmSecurityContext::snapshot);
+        let uses_des = self
+            .usm_users
+            .values()
+            .chain(context_users.iter().flat_map(|users| users.values()))
+            .any(|security| {
+                security
+                    .priv_protocol()
+                    .is_some_and(PrivProtocol::is_des_family)
+            });
+        let uses_aes = self
+            .usm_users
+            .values()
+            .chain(context_users.iter().flat_map(|users| users.values()))
+            .any(|security| {
+                security
+                    .priv_protocol()
+                    .is_some_and(|protocol| !protocol.is_des_family())
+            });
         if uses_des && self.des_salt_state.is_none() {
             return Err(Error::Config(
                 "durable DES sender state is required for DES/3DES notification receiving".into(),
@@ -1257,7 +1289,7 @@ impl NotificationReceiverBuilder {
             )
             .boxed());
         }
-        let requires_authoritative_engine = !self.usm_users.is_empty();
+        let requires_authoritative_engine = security_context_required;
         let validated_usm = validate_authoritative_usm(
             std::mem::take(&mut self.usm_users),
             self.authoritative_engine.take(),
@@ -1326,6 +1358,10 @@ impl NotificationReceiverBuilder {
             engine_id,
             engine_boots,
         } = validated_usm.prepare(generate_engine_id)?;
+        let security_context = self
+            .security_context
+            .take()
+            .unwrap_or_else(|| crate::UsmSecurityContext::from_prepared(usm_users));
         let local_engine = match self.local_engine.take() {
             Some(engine) => {
                 if uses_aes {
@@ -1350,14 +1386,15 @@ impl NotificationReceiverBuilder {
         let enabled = self.client_exchanges;
         let engine = PreparedNotificationRole {
             local_engine,
-            usm_users,
+            security_context,
+            requires_policy: security_context_required,
             capacity_registration: Some(capacity_registration),
         };
         let (receiver, processor, cleanup) = self.prepare_role(engine, network.clone())?;
         let roles = Arc::new(crate::transport::dispatch::DispatchRoles::new(
             None,
             Some(processor.clone()),
-            processor.inner.usm_users.clone(),
+            processor.inner.security_context.clone(),
             enabled,
             processor.processing_limit(),
         ));
@@ -1391,7 +1428,7 @@ impl NotificationReceiverBuilder {
             self.response_send_timeout,
             "notification response send timeout",
         )?;
-        if !engine.usm_users.is_empty() && self.acceptance_policy.is_none() {
+        if engine.requires_policy && self.acceptance_policy.is_none() {
             return Err(Error::Config(
                 "shared USM notification role requires an explicit acceptance policy".into(),
             )
@@ -1409,13 +1446,12 @@ impl NotificationReceiverBuilder {
             #[cfg(test)]
             endpoint_id: network.bound[0].endpoint_id,
             delivery: delivery.clone(),
-            usm_users: engine.usm_users,
+            security_context: engine.security_context,
             communities: self.communities,
             varbind_validation: self.varbind_validation,
             max_processing: self.max_processing,
             active: std::sync::atomic::AtomicUsize::new(0),
             idle: tokio::sync::Notify::new(),
-            remote_engines: Mutex::new(RemoteEngineTable::new(MAX_REMOTE_ENGINES)),
             max_message_size: self.max_message_size,
             decode_config: self.decode_config,
             acceptance_policy: self.acceptance_policy,
@@ -1457,6 +1493,7 @@ impl NotificationReceiverBuilder {
             || self.bind_explicit
             || self.local_engine.is_some()
             || self.authoritative_engine.is_some()
+            || self.security_context.is_some()
             || !self.usm_users.is_empty()
             || self.des_salt_state.is_some()
             || self.client_exchanges
@@ -1498,10 +1535,11 @@ impl NotificationReceiverBuilder {
         agent: &crate::agent::AgentProcessor,
         network: &Arc<crate::transport::network::NetworkState>,
     ) -> Result<(NotificationReceiver, NotificationProcessor, RunnerCleanup)> {
-        self.validate_attached(!agent.inner.usm_users.is_empty())?;
+        self.validate_attached(agent.inner.security_context_required)?;
         let engine = PreparedNotificationRole {
             local_engine: agent.inner.state.local_engine.clone(),
-            usm_users: agent.inner.usm_users.clone(),
+            security_context: agent.inner.security_context.clone(),
+            requires_policy: agent.inner.security_context_required,
             capacity_registration: None,
         };
         self.prepare_role(engine, network.clone())
@@ -1799,7 +1837,8 @@ pub(crate) struct NotificationProcessor {
 
 struct PreparedNotificationRole {
     local_engine: crate::LocalEngine,
-    usm_users: HashMap<Bytes, UsmUser>,
+    security_context: crate::UsmSecurityContext,
+    requires_policy: bool,
     capacity_registration: Option<crate::v3::local::EngineCapacityRegistration>,
 }
 
@@ -1816,22 +1855,14 @@ struct ReceiverInner {
     #[cfg(test)]
     endpoint_id: crate::EndpointId,
     delivery: Arc<Delivery>,
-    /// Configured USM users for V3 authentication
-    usm_users: HashMap<Bytes, UsmUser>,
+    /// Selected inbound USM credentials and remote timeliness.
+    security_context: crate::UsmSecurityContext,
     /// Accepted v1/v2c community strings. Empty means accept any community
     /// (community filtering is opt-in); otherwise a v1/v2c notification whose
     /// community matches none of these is dropped.
     communities: Vec<Community>,
     /// Validation policy for SNMPv2c/v3 standard notification varbind prefixes.
     varbind_validation: NotificationVarbindValidation,
-    /// Timeliness state for remote authoritative engines (trap senders),
-    /// keyed by engine ID (RFC 3414 Section 2.3). Seeded from the first
-    /// authenticated message from each engine, so only holders of configured
-    /// credentials can add entries. Bounded to `MAX_REMOTE_ENGINES` with
-    /// least-recently-updated eviction so a credential holder cannot grow it
-    /// without limit by fabricating engine IDs. An exact ordered index keeps
-    /// eviction bounded without retaining stale auxiliary records.
-    remote_engines: Mutex<RemoteEngineTable>,
     /// Local outbound response policy limit.
     max_message_size: usize,
     decode_config: crate::DecodeConfig,
@@ -2295,7 +2326,7 @@ mod tests {
 
         for receiver in [&bound, &built] {
             assert!(receiver.inner.authoritative_engine.is_none());
-            assert!(receiver.inner.usm_users.is_empty());
+            assert!(receiver.inner.security_context.snapshot().is_empty());
             assert!(receiver.inner.communities.is_empty());
             assert_eq!(
                 receiver.inner.varbind_validation,
@@ -2304,7 +2335,15 @@ mod tests {
             crate::v3::validate_engine_id(receiver.engine_id()).unwrap();
             assert!(receiver.inner.local_engine.salt_counter().is_none());
             assert_eq!(receiver.inner.engine_boots_base, 1);
-            assert!(receiver.inner.remote_engines.lock().unwrap().is_empty());
+            assert!(
+                receiver
+                    .inner
+                    .security_context
+                    .remote_engines()
+                    .lock()
+                    .unwrap()
+                    .is_empty()
+            );
             assert_eq!(
                 receiver.inner.max_message_size,
                 crate::UDP_RECEIVE_LIMITS.advertised().as_usize()
@@ -3317,7 +3356,12 @@ mod tests {
 
         // Pre-fill the table to capacity with cheap dummy entries.
         {
-            let mut engines = receiver.inner.remote_engines.lock().unwrap();
+            let mut engines = receiver
+                .inner
+                .security_context
+                .remote_engines()
+                .lock()
+                .unwrap();
             for i in 0..MAX_REMOTE_ENGINES {
                 let id = Bytes::from(format!("dummy-engine-{i}"));
                 let state = crate::v3::EngineState::new(id.clone(), 1, 1);
@@ -3335,7 +3379,12 @@ mod tests {
 
         // The table stayed at capacity (an old entry was evicted) and the new
         // engine is now tracked.
-        let engines = receiver.inner.remote_engines.lock().unwrap();
+        let engines = receiver
+            .inner
+            .security_context
+            .remote_engines()
+            .lock()
+            .unwrap();
         assert_eq!(engines.len(), MAX_REMOTE_ENGINES);
         assert!(engines.contains_key(&Bytes::from_static(b"fresh-remote-engine")));
         assert!(!engines.contains_key(&Bytes::from_static(b"dummy-engine-0")));

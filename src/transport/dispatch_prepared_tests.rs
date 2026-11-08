@@ -28,12 +28,18 @@ fn user(password: &[u8]) -> UsmUser {
     user
 }
 async fn message() -> ReceivedMessage {
+    message_with(
+        crate::Pdu::get_request(42, &[]),
+        security(b"prepared-authentication"),
+    )
+    .await
+}
+async fn message_with(pdu: crate::Pdu, config: crate::UsmConfig) -> ReceivedMessage {
     let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
     let source = "127.0.0.1:9999".parse().unwrap();
-    let config = security(b"prepared-authentication");
     let keys = config.derive_keys(b"prepared-engine").unwrap();
     let wire: Bytes = crate::v3::encode::encode_v3_message(
-        &crate::Pdu::get_request(42, &[]),
+        &pdu,
         9,
         b"prepared-engine",
         7,
@@ -85,7 +91,7 @@ fn context<'a>(
         accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
         decode_config: config,
         outbound_limit: 8192,
-        usm_users: users,
+        usm_users: crate::UsmSecurityContext::from_prepared(users.clone()).snapshot(),
         stats,
         mpd: None,
         source: "127.0.0.1:9999".parse().unwrap(),
@@ -97,7 +103,13 @@ async fn prepared_application_reuses_crypto_with_policy_and_budget_fallbacks() {
         Bytes::from_static(b"prepared-user"),
         user(b"prepared-authentication"),
     )]);
-    let roles = DispatchRoles::new(None, None, users.clone(), false, 1);
+    let roles = DispatchRoles::new(
+        None,
+        None,
+        crate::UsmSecurityContext::from_prepared(users.clone()),
+        false,
+        1,
+    );
     let engine = Bytes::from_static(b"prepared-engine");
     for (config, retain_plaintext) in [
         (crate::DecodeConfig::DEFAULT, true),
@@ -163,7 +175,13 @@ async fn udp_command_admission_accounts_for_optional_plaintext() {
         Bytes::from_static(b"prepared-user"),
         user(b"prepared-authentication"),
     )]);
-    let roles = DispatchRoles::new(None, None, users.clone(), false, 1);
+    let roles = DispatchRoles::new(
+        None,
+        None,
+        crate::UsmSecurityContext::from_prepared(users.clone()),
+        false,
+        1,
+    );
     for retain_plaintext in [false, true] {
         let mut message = message().await;
         let mut classifier: super::super::framing::BufferPermits = Arc::new(Semaphore::new(8192))
@@ -215,7 +233,13 @@ async fn prepared_evidence_does_not_cross_credentials_or_replaced_input() {
         Bytes::from_static(b"prepared-user"),
         user(b"different-authentication"),
     )]);
-    let roles = DispatchRoles::new(None, None, users.clone(), false, 1);
+    let roles = DispatchRoles::new(
+        None,
+        None,
+        crate::UsmSecurityContext::from_prepared(users.clone()),
+        false,
+        1,
+    );
     let engine = Bytes::from_static(b"prepared-engine");
     for replace_input in [false, true] {
         let mut message = message().await;
@@ -270,7 +294,13 @@ async fn strict_application_rejects_cached_compatible_suffix_before_security_pub
         Bytes::from_static(b"prepared-user"),
         user(b"prepared-authentication"),
     )]);
-    let roles = DispatchRoles::new(None, None, users.clone(), false, 1);
+    let roles = DispatchRoles::new(
+        None,
+        None,
+        crate::UsmSecurityContext::from_prepared(users.clone()),
+        false,
+        1,
+    );
     let mut message = message().await;
     let mut bytes = message.bytes.to_vec();
     bytes.extend_from_slice(b"suffix");
@@ -310,4 +340,212 @@ async fn strict_application_rejects_cached_compatible_suffix_before_security_pub
             .load(std::sync::atomic::Ordering::Relaxed),
         0
     );
+}
+
+#[tokio::test]
+async fn credential_selection_survives_success_and_failed_auth_classification() {
+    for initially_valid in [true, false] {
+        let old_password = if initially_valid {
+            b"prepared-authentication".as_slice()
+        } else {
+            b"different-authentication".as_slice()
+        };
+        let security_context =
+            crate::UsmSecurityContext::new([crate::UsmUserEntry::new(user(old_password))]).unwrap();
+        let old = security_context.snapshot();
+        let roles = DispatchRoles::new(None, None, security_context.clone(), false, 1);
+        let mut message = message().await;
+        let mut buffers: super::super::framing::BufferPermits = Arc::new(Semaphore::new(8192))
+            .try_acquire_many_owned(message.bytes.len() as u32)
+            .unwrap()
+            .into();
+        let engine = Bytes::from_static(b"prepared-engine");
+        let empty = HashMap::new();
+        let stats = UsmStats::default();
+        let (result, counts) = measure(|| {
+            let envelope = CorrelationEnvelope::parse(&message.bytes);
+            let classified = roles.classify(&mut message, None, envelope, &mut false, &mut buffers);
+            assert_eq!(classified.is_ok(), initially_valid);
+            let next_password = if initially_valid {
+                b"different-authentication".as_slice()
+            } else {
+                b"prepared-authentication".as_slice()
+            };
+            security_context
+                .replace_users([crate::UsmUserEntry::new(user(next_password))])
+                .unwrap();
+            let (input, _) = message.into_processing().unwrap();
+            let (packet, _) = input.into_parts();
+            let (bytes, _, prepared) = packet.into_prepared();
+            let selected = security_context
+                .users_for_input(&bytes, prepared.as_deref())
+                .unwrap();
+            assert!(Arc::ptr_eq(&old, &selected));
+            assert!(!Arc::ptr_eq(&selected, &security_context.snapshot()));
+            let mut ctx = context(&engine, &empty, &stats, crate::DecodeConfig::DEFAULT);
+            ctx.usm_users = selected;
+            process_prepared_v3_inbound(bytes, &ctx, &V3Role::Authoritative, prepared)
+        });
+        if initially_valid {
+            assert!(matches!(result.unwrap(), V3Inbound::Message(_)));
+            assert_eq!(counts.auth, 1);
+            assert_eq!(counts.decrypt, 1);
+        } else {
+            assert!(matches!(
+                result.unwrap(),
+                V3Inbound::Failed {
+                    failure: UsmFailure::WrongDigests,
+                    ..
+                }
+            ));
+            assert_eq!(counts.auth, 2);
+            assert_eq!(counts.decrypt, 0);
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_v3_selection_survives_without_decoded_headers_or_crypto() {
+    let security_context = crate::UsmSecurityContext::new([crate::UsmUserEntry::new(user(
+        b"prepared-authentication",
+    ))])
+    .unwrap();
+    let old = security_context.snapshot();
+    let roles = DispatchRoles::new(None, None, security_context.clone(), false, 1);
+    let mut message = message().await;
+    message.bytes = Bytes::from_static(&[0x30, 0x03, 0x02, 0x01, 0x03]);
+    let info = message.info;
+    message.info = crate::ReceivedMessageInfo::udp(
+        info.endpoint_id(),
+        info.local_addr(),
+        info.peer_addr(),
+        info.datagram_destination(),
+        info.received_at(),
+        message.bytes.len(),
+    );
+    let mut buffers: super::super::framing::BufferPermits = Arc::new(Semaphore::new(8192))
+        .try_acquire_many_owned(message.bytes.len() as u32)
+        .unwrap()
+        .into();
+    let envelope = CorrelationEnvelope::parse(&message.bytes);
+    assert!(
+        roles
+            .classify(&mut message, None, envelope, &mut false, &mut buffers)
+            .is_err()
+    );
+    let prepared = message.prepared.as_ref().unwrap();
+    assert!(prepared.raw.is_none());
+    assert!(prepared.crypto.is_none());
+    security_context.replace_users([]).unwrap();
+    let (input, _) = message.into_processing().unwrap();
+    let (packet, _) = input.into_parts();
+    let (bytes, _, prepared) = packet.into_prepared();
+    assert!(Arc::ptr_eq(
+        &old,
+        &security_context
+            .users_for_input(&bytes, prepared.as_deref())
+            .unwrap()
+    ));
+    let other = crate::UsmSecurityContext::default();
+    assert!(other.users_for_input(&bytes, prepared.as_deref()).is_err());
+}
+
+#[tokio::test]
+async fn replacement_preserves_colliding_application_pdus_and_rejects_old_client_responses() {
+    for encrypted in [false, true] {
+        let config = |password: &[u8]| {
+            if encrypted {
+                security(password)
+            } else {
+                crate::UsmConfig::new("prepared-user")
+                    .auth(crate::AuthProtocol::Sha256, password)
+                    .unwrap()
+            }
+        };
+        let security_context = crate::UsmSecurityContext::new([crate::UsmUserEntry::new(user(
+            b"prepared-authentication",
+        ))])
+        .unwrap();
+        let roles = DispatchRoles::new(None, None, security_context.clone(), true, 1);
+        let registration = crate::RequestRegistration::v3(
+            9,
+            tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+        )
+        .with_classification_usm(
+            config(b"prepared-authentication"),
+            Some(Bytes::from_static(b"prepared-engine")),
+        );
+        roles.validate_registration(&registration).unwrap();
+        security_context
+            .replace_users([crate::UsmUserEntry::new(user(b"different-authentication"))])
+            .unwrap();
+        assert!(roles.validate_registration(&registration).is_err());
+        let trap = crate::pdu::NotificationPdu::trap_v2(
+            crate::Version::V3,
+            42,
+            0,
+            &crate::notification::oids::snmp_trap_oid(),
+            vec![],
+        )
+        .unwrap()
+        .into_raw();
+        let inform = crate::pdu::NotificationPdu::inform(
+            crate::Version::V3,
+            42,
+            0,
+            &crate::notification::oids::snmp_trap_oid(),
+            vec![],
+        )
+        .unwrap()
+        .into_raw();
+        for pdu in [crate::Pdu::get_request(42, &[]), trap, inform] {
+            let expected = pdu.pdu_type();
+            let mut message = message_with(pdu, config(b"different-authentication")).await;
+            let mut buffers: super::super::framing::BufferPermits = Arc::new(Semaphore::new(8192))
+                .try_acquire_many_owned(message.bytes.len() as u32)
+                .unwrap()
+                .into();
+            let envelope = CorrelationEnvelope::parse(&message.bytes);
+            assert_eq!(
+                roles
+                    .classify(
+                        &mut message,
+                        Some(&registration),
+                        envelope,
+                        &mut true,
+                        &mut buffers
+                    )
+                    .unwrap(),
+                Some(expected)
+            );
+            assert!(
+                !message.prepared.as_ref().unwrap().client_conflict,
+                "application ownership lost: {expected:?}, encrypted={encrypted}"
+            );
+        }
+        let response =
+            crate::Pdu::standard(crate::pdu::StandardPduType::Response, 42, 0, 0, vec![]);
+        let mut message = message_with(response, config(b"prepared-authentication")).await;
+        let mut buffers: super::super::framing::BufferPermits = Arc::new(Semaphore::new(8192))
+            .try_acquire_many_owned(message.bytes.len() as u32)
+            .unwrap()
+            .into();
+        let envelope = CorrelationEnvelope::parse(&message.bytes);
+        let class = roles.classify(
+            &mut message,
+            Some(&registration),
+            envelope,
+            &mut true,
+            &mut buffers,
+        );
+        if encrypted {
+            assert!(class.is_err());
+        } else {
+            assert_eq!(class.unwrap(), Some(PduType::Response));
+        }
+        assert!(
+            message.prepared.as_ref().unwrap().client_conflict,
+            "old exchange credentials must not be tried after conflicting replacement"
+        );
+    }
 }

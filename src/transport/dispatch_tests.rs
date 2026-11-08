@@ -68,7 +68,6 @@ async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses
     use super::dispatch::DispatchRoles;
     use super::framing::BufferBudget;
     use super::ingress::ApplicationIngress;
-    use std::collections::HashMap;
     use tokio::sync::{Semaphore, mpsc};
     use tokio::task::JoinSet;
     use tokio_util::sync::CancellationToken;
@@ -97,7 +96,7 @@ async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses
         let roles = Arc::new(DispatchRoles::new(
             Some(ingress),
             None,
-            HashMap::new(),
+            crate::UsmSecurityContext::default(),
             false,
             1,
         ));
@@ -1127,4 +1126,144 @@ async fn attached_notification_silent_drop_is_visible_on_shared_engine() {
     assert_eq!(service.snmp_silent_drops(), 1);
     assert_eq!(notifications.snmp_silent_drops(), 1);
     service.shutdown().await.unwrap();
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
+async fn replaced_credentials_preserve_udp_application_collisions_and_reject_old_response() {
+    for encrypted in [false, true] {
+        let name = if encrypted { "priv" } else { "auth" };
+        let entry = |password: &[u8]| {
+            crate::UsmUserEntry::new(
+                crate::UsmUser::new(name.to_owned())
+                    .auth_priv(
+                        crate::AuthProtocol::Sha256,
+                        password,
+                        crate::PrivProtocol::Aes128,
+                        b"shared-priv-password",
+                    )
+                    .unwrap(),
+            )
+        };
+        let config = |password: &[u8]| {
+            let config = crate::UsmConfig::new(name.to_owned());
+            if encrypted {
+                config
+                    .auth_priv(
+                        crate::AuthProtocol::Sha256,
+                        password,
+                        crate::PrivProtocol::Aes128,
+                        b"shared-priv-password",
+                    )
+                    .unwrap()
+            } else {
+                config.auth(crate::AuthProtocol::Sha256, password).unwrap()
+            }
+        };
+        let security_context =
+            crate::UsmSecurityContext::new([entry(b"shared-auth-password")]).unwrap();
+        let (observer, mut observations) = TransportObserver::channel(64).unwrap();
+        let mut service = Agent::builder()
+            .authoritative_engine(engine(b"replacement-collision-engine"))
+            .security_context(security_context.clone())
+            .allow_all_access()
+            .client_exchanges(true)
+            .notifications(NotificationReceiver::builder().accept_all_notifications())
+            .listener(crate::ListenerSource::Udp(
+                UdpEndpoint::builder()
+                    .bind("127.0.0.1:0")
+                    .observer(observer),
+            ))
+            .spawn()
+            .await
+            .unwrap();
+        let mut notifications = service.take_notifications().unwrap();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let handle = endpoint(&service)
+            .handle(peer.local_addr().unwrap())
+            .unwrap()
+            .strict_source(true);
+        let registration =
+            RequestRegistration::v3(77, tokio::time::Instant::now() + Duration::from_secs(5))
+                .with_classification_usm(
+                    config(b"shared-auth-password"),
+                    Some(bytes::Bytes::copy_from_slice(service.engine_id())),
+                );
+        let request_bytes = secured(
+            crate::Pdu::get_request(77, &[get_oid()]),
+            77,
+            service.engine_id(),
+            &config(b"shared-auth-password"),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let pending = tokio::spawn(async move {
+            handle
+                .request_with(request_bytes, registration, move |_| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    Ok(Candidate::Accept(()))
+                })
+                .await
+        });
+        let (_, source) = receive(&peer).await;
+        security_context
+            .replace_users([entry(b"new-authentication-password")])
+            .unwrap();
+        for pdu in [
+            crate::Pdu::get_request(77, &[get_oid()]),
+            crate::Pdu::inform_request(77, 1, &crate::notification::oids::cold_start(), vec![]),
+        ] {
+            peer.send_to(
+                &secured(
+                    pdu,
+                    77,
+                    service.engine_id(),
+                    &config(b"new-authentication-password"),
+                ),
+                source,
+            )
+            .await
+            .unwrap();
+            receive(&peer).await;
+        }
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), notifications.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .inform_ack,
+            Some(crate::InformAckOutcome::Sent)
+        ));
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        let response = secured(
+            crate::Pdu::response(77, 0, 0, vec![]),
+            77,
+            service.engine_id(),
+            &config(b"shared-auth-password"),
+        );
+        peer.send_to(&response, source).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    observations.recv().await,
+                    Some(ObservationEvent::Disposition {
+                        disposition: MessageDisposition::Rejected,
+                        ..
+                    })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        security_context
+            .replace_users([entry(b"shared-auth-password")])
+            .unwrap();
+        peer.send_to(&response, source).await.unwrap();
+        pending.await.unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        service.shutdown().await.unwrap();
+    }
 }

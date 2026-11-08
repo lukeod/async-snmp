@@ -62,6 +62,8 @@ pub(crate) mod prepared;
 mod privacy;
 pub(crate) mod process;
 mod recency_map;
+pub(crate) mod security;
+pub use security::{UsmSecurityContext, UsmUserEntry};
 mod report;
 mod usm;
 

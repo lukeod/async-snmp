@@ -10,7 +10,9 @@ use super::{
 };
 use crate::ber::Decoder;
 use crate::message::{RawMsgData, RawV3Message};
-use crate::v3::{UsmSecurityParams, UsmUser};
+#[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
+use crate::v3::UsmUser;
+use crate::v3::{UsmSecurityContext, UsmSecurityParams};
 use crate::{Error, PduType, Result, Version};
 use bytes::Bytes;
 use std::{
@@ -24,7 +26,7 @@ use tokio::task::JoinSet;
 pub(crate) struct DispatchRoles {
     pub(crate) commands: Option<ApplicationIngress>,
     pub(crate) notifications: Option<crate::notification::NotificationProcessor>,
-    pub(crate) users: HashMap<Bytes, UsmUser>,
+    pub(crate) security_context: UsmSecurityContext,
     pub(crate) client_exchanges: bool,
     application: Arc<Semaphore>,
     exchanges: Arc<Semaphore>,
@@ -36,14 +38,14 @@ impl DispatchRoles {
     pub(crate) fn new(
         commands: Option<ApplicationIngress>,
         notifications: Option<crate::notification::NotificationProcessor>,
-        users: HashMap<Bytes, UsmUser>,
+        security_context: UsmSecurityContext,
         client_exchanges: bool,
         application_limit: usize,
     ) -> Self {
         Self {
             commands,
             notifications,
-            users,
+            security_context,
             client_exchanges,
             application: Arc::new(Semaphore::new(application_limit)),
             exchanges: Arc::new(Semaphore::new(64)),
@@ -63,8 +65,12 @@ impl DispatchRoles {
             )
             .boxed());
         }
+        let users = self.security_context.snapshot();
         if let Some(context) = &registration.classification_security
-            && let Some(user) = self.users.get(context.usm.username())
+            && let Some(user) = users.lookup(
+                context.engine_id.as_deref().unwrap_or(&[]),
+                context.usm.username(),
+            )
             && !user.supports_outbound_credentials(&context.usm)?
         {
             return Err(Error::Config("shared endpoint USM identity has conflicting client credentials; use a distinct identity or endpoint".into()).boxed());
@@ -185,6 +191,14 @@ impl DispatchRoles {
                 &mut client_context,
                 &mut buffers,
             );
+            if message
+                .prepared
+                .as_ref()
+                .is_some_and(|prepared| prepared.client_conflict)
+            {
+                message.observe(super::MessageDisposition::Rejected);
+                return;
+            }
             let is_response = matches!(class, Ok(Some(PduType::Response | PduType::Report)));
             if is_response || (client_context && !matches!(class, Ok(Some(_)))) {
                 if let Some(registration) = registration {
@@ -296,6 +310,14 @@ impl DispatchRoles {
             &mut client_context,
             &mut buffers,
         );
+        if message
+            .prepared
+            .as_ref()
+            .is_some_and(|prepared| prepared.client_conflict)
+        {
+            message.observe(super::MessageDisposition::Rejected);
+            return Ok(());
+        }
         if matches!(class, Ok(Some(PduType::Response | PduType::Report)))
             || (client_context && !matches!(class, Ok(Some(_))))
         {
@@ -421,33 +443,39 @@ impl DispatchRoles {
                 community_pdu_class(message, envelope)
             }
             Version::V3 => {
-                let raw = RawV3Message::decode_bounded_with_target(
-                    message.bytes.clone(),
-                    message.reply.limits.receive.accepted(),
-                    source,
-                    decode,
-                )?;
-                let usm = UsmSecurityParams::decode_with_context(
-                    raw.value.security_params.clone(),
-                    raw.value.security_params_offset,
-                    source,
-                    decode,
-                )?;
-                let mut prepared = Box::new(crate::v3::prepared::PreparedV3::new(
+                // Capture the selected credentials before any fallible decode.
+                // Failed parsing/security classification must retain the same
+                // snapshot when the application performs ordered USM processing.
+                let mut prepared = Box::new(crate::v3::prepared::PreparedV3::selected(
                     message.bytes.clone(),
                     decode,
-                    raw,
-                    usm,
+                    self.security_context.snapshot(),
                 ));
-                let result = self.classify_v3(
-                    &message.bytes,
-                    source,
-                    registration,
-                    envelope,
-                    client_context,
-                    buffers,
-                    &mut prepared,
-                );
+                let result = (|| {
+                    let raw = RawV3Message::decode_bounded_with_target(
+                        message.bytes.clone(),
+                        message.reply.limits.receive.accepted(),
+                        source,
+                        decode,
+                    )?;
+                    let usm = UsmSecurityParams::decode_with_context(
+                        raw.value.security_params.clone(),
+                        raw.value.security_params_offset,
+                        source,
+                        decode,
+                    )?;
+                    prepared.raw = Some(raw);
+                    prepared.usm = Some(usm);
+                    self.classify_v3(
+                        &message.bytes,
+                        source,
+                        registration,
+                        envelope,
+                        client_context,
+                        buffers,
+                        &mut prepared,
+                    )
+                })();
                 message.prepared = Some(prepared);
                 result
             }
@@ -479,10 +507,29 @@ impl DispatchRoles {
                             .is_none_or(|id| id == &usm.engine_id)
                 })
         });
+        let users = prepared
+            .selected_users
+            .as_ref()
+            .expect("classification selected a USM snapshot");
+        prepared.client_conflict = *client_context
+            && registration
+                .and_then(|registration| registration.classification_security.as_ref())
+                .zip(users.lookup(&usm.engine_id, &usm.username))
+                .map(|(context, user)| {
+                    user.supports_outbound_credentials(&context.usm)
+                        .map(|same| !same)
+                })
+                .transpose()?
+                .unwrap_or(false);
         if let RawMsgData::Plaintext { data, offset } = &raw.msg_data {
-            return scoped_pdu_class(data.clone(), *offset, source);
+            let class = scoped_pdu_class(data.clone(), *offset, source);
+            if matches!(class, Ok(Some(kind)) if !matches!(kind, PduType::Response | PduType::Report))
+            {
+                prepared.client_conflict = false;
+            }
+            return class;
         }
-        let (keys, identity) = if let Some(user) = self.users.get(&usm.username) {
+        let (keys, identity) = if let Some(user) = users.lookup(&usm.engine_id, &usm.username) {
             (user.derive_keys(&usm.engine_id), user.credential_identity())
         } else if let Some(config) = registration
             .and_then(|r| r.classification_security.as_ref())
@@ -536,6 +583,9 @@ impl DispatchRoles {
             }
             Err(error) => (Err(error), None),
         };
+        if matches!(class, Ok(Some(kind)) if !matches!(kind, PduType::Response | PduType::Report)) {
+            prepared.client_conflict = false;
+        }
         prepared.crypto = Some(crate::v3::prepared::PreparedCrypto {
             identity,
             engine_id: usm.engine_id.clone(),

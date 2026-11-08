@@ -44,6 +44,17 @@ impl AgentProcessor {
             incoming_usm.username.clone(),
         )?;
 
+        if security_level.requires_priv()
+            && derived_keys
+                .and_then(|keys| keys.priv_key.as_ref())
+                .is_some_and(|key| !key.protocol().is_des_family())
+        {
+            self.inner
+                .state
+                .local_engine
+                .ensure_salt_counter(crate::v3::SaltCounter::new)?;
+        }
+
         // RFC 3412 Section 6.3: msgMaxSize advertises this agent's own receive
         // capacity, not the requester's echoed value or the outbound response
         // size limit.
@@ -218,7 +229,10 @@ mod tests {
             .build()
             .await
             .unwrap();
-        let user = agent.inner.usm_users.get(b"testuser".as_slice()).unwrap();
+        let users = agent.inner.security_context.snapshot();
+        let user = users
+            .lookup(&agent.inner.state.engine_id, b"testuser")
+            .unwrap();
         let keys = user.derive_keys(b"agent-engine").unwrap();
 
         let error = agent

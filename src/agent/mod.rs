@@ -496,6 +496,7 @@ pub struct AgentBuilder {
     bind_addr: String,
     communities: Vec<crate::Community>,
     usm_users: HashMap<Bytes, UsmUser>,
+    security_context: Option<crate::UsmSecurityContext>,
     handlers: Vec<RegisteredHandler>,
     local_engine: Option<crate::LocalEngine>,
     authoritative_engine: Option<AuthoritativeEngine>,
@@ -545,6 +546,8 @@ struct ValidatedAgentBuilder {
     bind_addr: SocketAddr,
     communities: Vec<crate::Community>,
     usm: ValidatedAuthoritativeUsm,
+    security_context: Option<crate::UsmSecurityContext>,
+    security_context_required: bool,
     local_engine: Option<crate::LocalEngine>,
     handlers: Vec<RegisteredHandler>,
     max_message_size: usize,
@@ -657,6 +660,7 @@ impl AgentBuilder {
             bind_addr: "0.0.0.0:161".to_string(),
             communities: Vec::new(),
             usm_users: HashMap::new(),
+            security_context: None,
             handlers: Vec::new(),
             local_engine: None,
             authoritative_engine: None,
@@ -841,6 +845,16 @@ impl AgentBuilder {
         let config = configure(UsmUser::new(username_bytes.clone()))?;
         self.usm_users.insert(username_bytes, config);
         Ok(self)
+    }
+
+    /// Select shared inbound USM credentials and remote timeliness state.
+    /// Conflicts with separately configured `usm_user` entries. An explicit
+    /// context requires persisted local engine state and authorization even
+    /// when initially empty, so later user replacement preserves prerequisites.
+    #[must_use]
+    pub fn security_context(mut self, context: crate::UsmSecurityContext) -> Self {
+        self.security_context = Some(context);
+        self
     }
 
     /// Share local engine identity, clock, counters and privacy-sender state.
@@ -1524,6 +1538,9 @@ impl AgentBuilder {
             construction.check(ConstructionStage::Prepare, None, None)?;
             config.usm.prepare(generate_engine_id)?
         };
+        let security_context = config
+            .security_context
+            .unwrap_or_else(|| crate::UsmSecurityContext::from_prepared(usm_users));
         let local_engine = match config.local_engine {
             Some(engine) => {
                 if config.requires_privacy {
@@ -1590,7 +1607,8 @@ impl AgentBuilder {
             task_changed: tokio::sync::Notify::new(),
             mutation_failures: AtomicU64::new(0),
             communities: config.communities,
-            usm_users,
+            security_context,
+            security_context_required: config.security_context_required,
             handlers: config.handlers,
             state,
             set_coordinator: tokio::sync::Mutex::new(()),
@@ -1648,7 +1666,7 @@ impl AgentBuilder {
                 notification_role
                     .as_ref()
                     .map(|(processor, _)| processor.clone()),
-                inner.usm_users.clone(),
+                inner.security_context.clone(),
                 config.client_exchanges || shared_sink_exchanges,
                 notification_role
                     .as_ref()
@@ -1668,8 +1686,16 @@ impl AgentBuilder {
     }
 
     fn validate_and_normalize(mut self) -> Result<ValidatedAgentBuilder> {
+        if self.security_context.is_some() && !self.usm_users.is_empty() {
+            return Err(Error::Config(
+                "security_context conflicts with usm_user configuration".into(),
+            )
+            .boxed());
+        }
+        let security_context_required =
+            self.security_context.is_some() || !self.usm_users.is_empty();
         if let Some(role) = &self.notifications {
-            role.validate_attached(!self.usm_users.is_empty())?;
+            role.validate_attached(security_context_required)?;
         }
         // Stable validation precedence: deadline representability (which reads
         // the monotonic clock), authorization, sink IDs, sizes/concurrency,
@@ -1699,7 +1725,7 @@ impl AgentBuilder {
         if let AgentAuthorization::InvalidVacm(error) = &self.authorization {
             return Err(Error::Config(error.to_string().into()).boxed());
         }
-        if (!self.communities.is_empty() || !self.usm_users.is_empty())
+        if (!self.communities.is_empty() || security_context_required)
             && matches!(self.authorization, AgentAuthorization::Unset)
         {
             return Err(Error::Config(
@@ -1778,22 +1804,36 @@ impl AgentBuilder {
             self.des_salt_state = engine.des_salt_state();
         }
 
-        let uses_des = self.usm_users.values().any(|security| {
-            security
-                .priv_protocol()
-                .is_some_and(PrivProtocol::is_des_family)
-        }) || self.trap_sinks.iter().any(|(_, _, auth)| {
-            matches!(auth, crate::client::Auth::Usm(security)
+        let context_users = self
+            .security_context
+            .as_ref()
+            .map(crate::UsmSecurityContext::snapshot);
+        let uses_des = self
+            .usm_users
+            .values()
+            .chain(context_users.iter().flat_map(|users| users.values()))
+            .any(|security| {
+                security
+                    .priv_protocol()
+                    .is_some_and(PrivProtocol::is_des_family)
+            })
+            || self.trap_sinks.iter().any(|(_, _, auth)| {
+                matches!(auth, crate::client::Auth::Usm(security)
                 if security.priv_protocol().is_some_and(PrivProtocol::is_des_family))
-        });
-        let uses_aes = self.usm_users.values().any(|security| {
-            security
-                .priv_protocol()
-                .is_some_and(|protocol| !protocol.is_des_family())
-        }) || self.trap_sinks.iter().any(|(_, _, auth)| {
-            matches!(auth, crate::client::Auth::Usm(security)
+            });
+        let uses_aes = self
+            .usm_users
+            .values()
+            .chain(context_users.iter().flat_map(|users| users.values()))
+            .any(|security| {
+                security
+                    .priv_protocol()
+                    .is_some_and(|protocol| !protocol.is_des_family())
+            })
+            || self.trap_sinks.iter().any(|(_, _, auth)| {
+                matches!(auth, crate::client::Auth::Usm(security)
                 if security.priv_protocol().is_some_and(|protocol| !protocol.is_des_family()))
-        });
+            });
         if uses_des && self.des_salt_state.is_none() {
             return Err(Error::Config(
                 "durable DES sender state is required for DES/3DES agent roles".into(),
@@ -1809,7 +1849,7 @@ impl AgentBuilder {
             )
             .boxed());
         }
-        let requires_authoritative_engine = !self.usm_users.is_empty()
+        let requires_authoritative_engine = security_context_required
             || self
                 .trap_sinks
                 .iter()
@@ -1867,6 +1907,8 @@ impl AgentBuilder {
             bind_addr,
             communities: self.communities,
             usm,
+            security_context: self.security_context,
+            security_context_required,
             local_engine: self.local_engine,
             handlers: self.handlers,
             max_message_size: self.max_message_size,
@@ -2071,7 +2113,8 @@ pub(crate) struct AgentInner {
     task_changed: tokio::sync::Notify,
     mutation_failures: AtomicU64,
     pub(crate) communities: Vec<crate::Community>,
-    pub(crate) usm_users: HashMap<Bytes, UsmUser>,
+    pub(crate) security_context: crate::UsmSecurityContext,
+    pub(crate) security_context_required: bool,
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
     /// Serializes complete SET transactions without restricting retrieval.

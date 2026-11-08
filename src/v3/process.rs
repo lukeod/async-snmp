@@ -7,6 +7,7 @@
 //! [`process_prepared_v3_inbound`]; role-legitimate differences are carried by
 //! [`V3Role`].
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -14,7 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 
-use super::{DerivedKeys, UsmUser};
+use super::DerivedKeys;
+#[cfg(test)]
+use super::UsmUser;
 use crate::error::{Error, Result};
 use crate::message::{
     MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, combine_staged_v3_anomalies,
@@ -163,7 +166,7 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) decode_config: crate::DecodeConfig,
     /// Local policy bound for outbound responses and Reports.
     pub(crate) outbound_limit: usize,
-    pub(crate) usm_users: &'a HashMap<Bytes, UsmUser>,
+    pub(crate) usm_users: Arc<super::security::UsmUsers>,
     pub(crate) stats: &'a UsmStats,
     pub(crate) mpd: Option<MpdCounters<'a>>,
     pub(crate) source: SocketAddr,
@@ -340,7 +343,10 @@ pub(crate) fn process_prepared_v3_inbound(
 
     // RFC 3414 Section 3.2 Step 4: the user must exist in the local user
     // database regardless of security level.
-    let Some(user_config) = ctx.usm_users.get(&usm_params.username) else {
+    let Some(user_config) = ctx
+        .usm_users
+        .lookup(&usm_params.engine_id, &usm_params.username)
+    else {
         tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.username = ?usm_params.username }, "unknown user");
         return fail(UsmFailure::UnknownUserNames, None);
     };
@@ -579,7 +585,8 @@ mod tests {
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             decode_config: crate::DecodeConfig::default(),
             outbound_limit: 8192,
-            usm_users,
+            usm_users: super::super::UsmSecurityContext::from_prepared(usm_users.clone())
+                .snapshot(),
             stats,
             mpd,
             source: "127.0.0.1:9999".parse().unwrap(),
