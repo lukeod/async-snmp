@@ -569,6 +569,7 @@ pub(crate) struct RequestLifecycle {
     pub(crate) deadline: Option<tokio::time::Instant>,
     pub(crate) cancellation: CancellationToken,
     pub(crate) phase: Arc<AtomicU8>,
+    phase_changed: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl RequestLifecycle {
@@ -582,6 +583,12 @@ impl RequestLifecycle {
         self.endpoint_limits = limits;
         self
     }
+
+    pub(crate) fn with_phase_notifier(mut self, notifier: Arc<tokio::sync::Notify>) -> Self {
+        self.phase_changed = Some(notifier);
+        self
+    }
+
     pub(crate) fn new(
         received_at: tokio::time::Instant,
         admitted_at: tokio::time::Instant,
@@ -597,6 +604,7 @@ impl RequestLifecycle {
             deadline,
             cancellation,
             phase,
+            phase_changed: None,
         }
     }
 
@@ -628,6 +636,9 @@ impl RequestLifecycle {
             _ => RequestTaskPhase::Other,
         };
         self.phase.store(phase as u8, Ordering::Release);
+        if let Some(notifier) = &self.phase_changed {
+            notifier.notify_waiters();
+        }
     }
 }
 

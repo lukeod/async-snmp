@@ -586,7 +586,7 @@ pub(super) fn prepare_application(mut config: ApplicationConfig) -> Arc<AgentInn
         discard_notifications: config.discard_notifications,
         command_stop: config.command_stop,
         command_admission_gate: std::sync::Mutex::new(()),
-        task_changed: tokio::sync::Notify::new(),
+        task_changed: Arc::new(tokio::sync::Notify::new()),
         mutation_failures: AtomicU64::new(0),
         communities: config.communities,
         security_context,

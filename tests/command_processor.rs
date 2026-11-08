@@ -593,6 +593,43 @@ async fn concurrent_sets_share_one_coordinator() {
 }
 
 #[tokio::test]
+async fn mutation_drain_wakes_when_registered_request_classifies_as_retrieval() {
+    let state = Arc::new(State::default());
+    state.block_get.store(true, Ordering::SeqCst);
+    let processor = builder(state.clone()).build().unwrap();
+    let _registration = processor
+        .local_engine()
+        .register_receive_capacity(limits().receive().advertised());
+    let control = processor.control();
+    let mut request =
+        Box::pin(processor.process(community(Version::V2c, get(Version::V2c), limits())));
+
+    // Register the owned child without yielding to it, so drain sees Unclassified.
+    assert!(futures_util::poll!(&mut request).is_pending());
+    assert_eq!(control.outstanding_requests(), 1);
+    assert_eq!(state.gets.load(Ordering::SeqCst), 0);
+    control.request_shutdown();
+    let mut mutation_drain = Box::pin(control.drain_mutations(WAIT));
+    assert!(futures_util::poll!(&mut mutation_drain).is_pending());
+
+    // Classification must wake the already waiting drain while GET remains blocked.
+    entered(&state.started).await;
+    assert!(matches!(
+        futures_util::poll!(&mut mutation_drain),
+        std::task::Poll::Ready(Ok(()))
+    ));
+    assert_eq!(control.outstanding_requests(), 1);
+    assert_eq!(control.outstanding_mutations(), 0);
+    let mut full_drain = Box::pin(control.drain_requests(WAIT));
+    assert!(futures_util::poll!(&mut full_drain).is_pending());
+
+    drop(request);
+    state.release.add_permits(1);
+    full_drain.await.unwrap();
+    assert_eq!(control.outstanding_requests(), 0);
+}
+
+#[tokio::test]
 async fn queued_admission_rechecks_endpoint_capacity_atomically() {
     let state = Arc::new(State::default());
     state.block_get.store(true, Ordering::SeqCst);

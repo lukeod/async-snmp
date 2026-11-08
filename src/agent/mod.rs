@@ -2032,7 +2032,7 @@ pub(crate) struct AgentInner {
     discard_notifications: bool,
     command_stop: CancellationToken,
     command_admission_gate: std::sync::Mutex<()>,
-    task_changed: tokio::sync::Notify,
+    task_changed: Arc<tokio::sync::Notify>,
     mutation_failures: AtomicU64,
     pub(crate) communities: Vec<crate::Community>,
     pub(crate) security_context: crate::UsmSecurityContext,
@@ -2511,6 +2511,7 @@ impl AgentProcessor {
         lifecycle: RequestLifecycle,
         prepared: Option<Box<crate::v3::prepared::PreparedV3>>,
     ) -> Result<Option<Bytes>> {
+        let lifecycle = lifecycle.with_phase_notifier(self.inner.task_changed.clone());
         let result = self
             .handle_request_inner(data, source, lifecycle, prepared)
             .await;
