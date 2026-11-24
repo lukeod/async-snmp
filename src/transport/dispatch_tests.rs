@@ -72,12 +72,13 @@ async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses
     use tokio::task::JoinSet;
     use tokio_util::sync::CancellationToken;
 
-    let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let local_addr = socket.local_addr().unwrap();
     let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let (observer, mut events) = TransportObserver::channel(16).unwrap();
     let observation = super::observation::Observation(Some(observer));
     let responder =
-        Arc::new(crate::udp_responder::UdpResponder::new(&socket).with_observation(observation));
+        Arc::new(crate::udp_responder::UdpResponder::new(socket).with_observation(observation));
     let endpoint = EndpointId::new();
     for version in [crate::CommunityVersion::V1, crate::CommunityVersion::V2c] {
         let (sender, mut receiver) = mpsc::channel(1);
@@ -117,7 +118,7 @@ async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses
             };
             let info = ReceivedMessageInfo::udp(
                 endpoint,
-                socket.local_addr().unwrap(),
+                local_addr,
                 received.source,
                 None,
                 tokio::time::Instant::now(),
@@ -126,7 +127,6 @@ async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses
             ReceivedMessage::udp(
                 bytes,
                 info,
-                socket.clone(),
                 responder.clone(),
                 received,
                 ProcessingLimits::UDP,

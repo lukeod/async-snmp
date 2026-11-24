@@ -89,6 +89,7 @@ use super::{
 };
 use crate::error::{Error, Result};
 use crate::message_size::{ReceiveLimits, UDP_RECEIVE_BUFFER_SIZE};
+use crate::udp_responder::UdpResponder;
 use crate::util::bind_udp_socket;
 use bytes::Bytes;
 use std::net::SocketAddr;
@@ -123,7 +124,8 @@ impl Default for UdpEndpointConfig {
 
 /// UDP transport that can serve multiple targets.
 ///
-/// Owns a single UDP socket. Its receiver is driven by a separate [`UdpRunner`].
+/// Exposes a single UDP socket driven by a separate [`UdpRunner`]. The runner
+/// closes the socket on termination. Endpoint metadata remains accessible.
 /// Create [`UdpHandle`]s for each target via [`handle()`](Self::handle).
 #[derive(Clone)]
 pub struct UdpEndpoint {
@@ -134,13 +136,11 @@ pub struct UdpEndpoint {
 struct UdpEndpointInner {
     observation: super::observation::Observation,
     endpoint_id: crate::EndpointId,
-    responder: Arc<crate::udp_responder::UdpResponder>,
-    socket: Arc<UdpSocket>,
+    responder: Arc<UdpResponder>,
     local_addr: SocketAddr,
     core: Arc<UdpCore>,
     config: UdpEndpointConfig,
     receive_limits: ReceiveLimits,
-    shutdown: CancellationToken,
     shutdown_complete: CancellationToken,
     operations: tokio::sync::RwLock<()>,
     request_admission: Arc<tokio::sync::Semaphore>,
@@ -149,7 +149,6 @@ struct UdpEndpointInner {
     // guard would never fire.
     _shutdown_guard: DropGuard,
     recv_task: tokio::sync::Mutex<Option<JoinHandle<Result<()>>>>,
-    admission: Arc<Mutex<bool>>,
     status: Arc<Mutex<UdpStatus>>,
     ipv6_only: bool,
     dispatch: Arc<std::sync::OnceLock<Arc<super::dispatch::DispatchRoles>>>,
@@ -161,17 +160,15 @@ struct UdpEndpointInner {
 
 #[cfg(not(test))]
 async fn recv_datagram(
-    socket: &UdpSocket,
-    responder: &crate::udp_responder::UdpResponder,
+    responder: &UdpResponder,
     buf: &mut [u8],
 ) -> std::io::Result<crate::udp_responder::ReceivedDatagram> {
-    responder.recv(socket, buf).await
+    responder.recv(buf).await
 }
 
 #[cfg(test)]
 async fn recv_datagram(
-    socket: &UdpSocket,
-    responder: &crate::udp_responder::UdpResponder,
+    responder: &UdpResponder,
     receive_errors: &std::sync::Mutex<std::collections::VecDeque<std::io::Error>>,
     receive_error_ready: &tokio::sync::Notify,
     buf: &mut [u8],
@@ -181,24 +178,22 @@ async fn recv_datagram(
             return Err(error);
         }
         tokio::select! {
-            result = responder.recv(socket, buf) => return result,
+            result = responder.recv(buf) => return result,
             () = receive_error_ready.notified() => {}
         }
     }
 }
 
 struct UdpRecvTaskCleanup {
+    responder: Arc<UdpResponder>,
     core: Arc<UdpCore>,
     shutdown_complete: CancellationToken,
-    shutdown: CancellationToken,
-    admission: Arc<Mutex<bool>>,
     status: Arc<Mutex<UdpStatus>>,
 }
 
 impl Drop for UdpRecvTaskCleanup {
     fn drop(&mut self) {
-        *self.admission.lock().unwrap() = false;
-        self.shutdown.cancel();
+        self.responder.close();
         self.core.close();
         let mut status = self.status.lock().unwrap();
         if !matches!(*status, UdpStatus::Failed(_)) {
@@ -225,11 +220,7 @@ impl UdpEndpoint {
         );
     }
     #[cfg(test)]
-    pub(crate) fn test_socket(&self) -> Arc<UdpSocket> {
-        self.inner.socket.clone()
-    }
-    #[cfg(test)]
-    pub(crate) fn test_responder(&self) -> Arc<crate::udp_responder::UdpResponder> {
+    pub(crate) fn test_responder(&self) -> Arc<UdpResponder> {
         self.inner.responder.clone()
     }
     pub(crate) fn limits(&self) -> super::ProcessingLimits {
@@ -359,8 +350,6 @@ pub enum UdpStatus {
 #[must_use = "the runner must be driven or dropped"]
 pub struct UdpRunner {
     observation: super::observation::Observation,
-    socket: Arc<UdpSocket>,
-    responder: Arc<crate::udp_responder::UdpResponder>,
     endpoint_id: crate::EndpointId,
     local_addr: SocketAddr,
     receive_limits: ReceiveLimits,
@@ -397,8 +386,6 @@ impl UdpRunner {
     fn new(inner: &UdpEndpointInner) -> Self {
         Self {
             observation: inner.observation.clone(),
-            socket: inner.socket.clone(),
-            responder: inner.responder.clone(),
             endpoint_id: inner.endpoint_id,
             local_addr: inner.local_addr,
             receive_limits: inner.receive_limits,
@@ -407,10 +394,9 @@ impl UdpRunner {
             #[cfg(test)]
             receive_attempts: None,
             cleanup: UdpRecvTaskCleanup {
+                responder: inner.responder.clone(),
                 core: inner.core.clone(),
                 shutdown_complete: inner.shutdown_complete.clone(),
-                shutdown: inner.shutdown.clone(),
-                admission: inner.admission.clone(),
                 status: inner.status.clone(),
             },
             #[cfg(test)]
@@ -431,13 +417,12 @@ impl UdpRunner {
         result
     }
     async fn receive(&self) -> Result<()> {
-        let socket = &self.socket;
-        let responder = &self.responder;
+        let responder = &self.cleanup.responder;
         let endpoint_id = self.endpoint_id;
         let local_addr = self.local_addr;
         let receive_limits = self.receive_limits;
         let core = &self.cleanup.core;
-        let shutdown = &self.cleanup.shutdown;
+        let shutdown = responder.shutdown_token();
         #[cfg(test)]
         let receive_errors = &self.receive_errors;
         #[cfg(test)]
@@ -473,7 +458,6 @@ impl UdpRunner {
                 }
 
                 result = recv_datagram(
-                    socket,
                     responder,
                     #[cfg(test)] receive_errors.as_ref(),
                     #[cfg(test)] receive_error_ready.as_ref(),
@@ -492,7 +476,7 @@ impl UdpRunner {
                             let data = Bytes::copy_from_slice(&buf[..len]);
 
                             if let Some(roles) = self.dispatch.get() {
-                                let message = super::ReceivedMessage::udp(data, info, self.socket.clone(), self.responder.clone(), received, super::ProcessingLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone());
+                                let message = super::ReceivedMessage::udp(data, info, responder.clone(), received, super::ProcessingLimits { receive: receive_limits, send: self.send_capacity });
                                 roles.dispatch(message, core.clone(), &mut dispatch_tasks);
                                 continue;
                             }
@@ -802,16 +786,14 @@ impl UdpEndpointBuilder {
 
         tracing::debug!(target: "async_snmp::transport", { snmp.local_addr = %local_addr }, "UDP transport bound");
 
-        let shutdown = CancellationToken::new();
+        let responder =
+            Arc::new(UdpResponder::new(socket).with_observation(self.observation.clone()));
+        let shutdown_guard = responder.shutdown_token().clone().drop_guard();
         let shutdown_complete = CancellationToken::new();
         let inner = Arc::new(UdpEndpointInner {
             observation: self.observation.clone(),
             endpoint_id: crate::EndpointId::new(),
-            responder: Arc::new(
-                crate::udp_responder::UdpResponder::new(&socket)
-                    .with_observation(self.observation.clone()),
-            ),
-            socket: Arc::new(socket),
+            responder,
             local_addr,
             core: Arc::new(UdpCore::new().with_observation(self.observation)),
             request_admission: Arc::new(tokio::sync::Semaphore::new(
@@ -819,12 +801,10 @@ impl UdpEndpointBuilder {
             )),
             config: self.config,
             receive_limits,
-            _shutdown_guard: shutdown.clone().drop_guard(),
-            shutdown,
+            _shutdown_guard: shutdown_guard,
             shutdown_complete,
             operations: tokio::sync::RwLock::new(()),
             recv_task: tokio::sync::Mutex::new(None),
-            admission: Arc::new(Mutex::new(true)),
             status: Arc::new(Mutex::new(UdpStatus::Prepared)),
             ipv6_only,
             dispatch: Arc::new(std::sync::OnceLock::new()),
@@ -876,7 +856,7 @@ impl UdpControl {
     /// Return whether endpoint shutdown has been requested.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.inner.shutdown.is_cancelled()
+        self.inner.responder.shutdown_token().is_cancelled()
     }
 
     /// Observe driver state, including fatal endpoint errors.
@@ -884,10 +864,9 @@ impl UdpControl {
         self.inner.status.lock().unwrap().clone()
     }
 
-    /// Stop new operations and request receiver termination without waiting.
+    /// Close the socket and request receiver termination without waiting.
     pub fn request_shutdown(&self) {
-        *self.inner.admission.lock().unwrap() = false;
-        self.inner.shutdown.cancel();
+        self.inner.responder.close();
         self.inner.core.close();
     }
 
@@ -1056,7 +1035,7 @@ impl RequestTransport for UdpHandle {
         };
         registration.udp_admission = Some(tokio::select! {
             biased;
-            () = self.inner.shutdown.cancelled() => return Err(Error::Closed { target: self.target }.boxed()),
+            () = self.inner.responder.shutdown_token().cancelled() => return Err(Error::Closed { target: self.target }.boxed()),
             () = tokio::time::sleep_until(registration.deadline()) => return Err(Error::Timeout { target: self.target, elapsed: admitted_at.elapsed(), retries: 0 }.boxed()),
             permit = acquire => permit,
         });
@@ -1102,7 +1081,7 @@ impl RequestTransport for UdpHandle {
 
 impl UdpHandle {
     fn ensure_open(&self) -> Result<()> {
-        if self.inner.shutdown.is_cancelled() {
+        if self.inner.responder.shutdown_token().is_cancelled() {
             return Err(Error::Closed {
                 target: self.target,
             }
@@ -1117,57 +1096,37 @@ impl UdpHandle {
         if let Some(gate) = &self.send_gate {
             tokio::select! {
                 biased;
-                () = self.inner.shutdown.cancelled() => return Err(Error::Closed { target: self.target }.boxed()),
+                () = self.inner.responder.shutdown_token().cancelled() => return Err(Error::Closed { target: self.target }.boxed()),
                 permit = gate.acquire() => permit.expect("test send gate remains open").forget(),
             }
         }
-        loop {
-            tokio::select! {
-                biased;
-                () = self.inner.shutdown.cancelled() => return Err(Error::Closed { target: self.target }.boxed()),
-                result = self.inner.socket.writable() => result.map_err(|source| Error::Network { target: self.target, source })?,
-            }
-            let admission = self.inner.admission.lock().unwrap();
-            if !*admission {
-                return Err(Error::Closed {
-                    target: self.target,
-                }
-                .boxed());
-            }
-            match self.inner.socket.try_send_to(data, self.target) {
-                Ok(written) => {
-                    self.inner.observation.written(written);
-                    if written != data.len() {
-                        return Err(Error::Network {
-                            target: self.target,
-                            source: std::io::Error::new(
-                                std::io::ErrorKind::WriteZero,
-                                "UDP send wrote a partial datagram",
-                            ),
-                        }
-                        .boxed());
+        self.inner
+            .responder
+            .send_to(data, self.target, None)
+            .await
+            .map_err(|source| {
+                if self.inner.responder.shutdown_token().is_cancelled() {
+                    Error::Closed {
+                        target: self.target,
                     }
-                    self.inner.observation.sent(super::SentMessageInfo {
-                        endpoint_id: self.inner.endpoint_id,
-                        session_id: None,
-                        transport: super::TransportKind::Udp,
-                        local_addr: self.inner.local_addr,
-                        peer_addr: self.target,
-                        sent_at: tokio::time::Instant::now(),
-                        sent_len: written,
-                    });
-                    break;
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
-                Err(source) => {
-                    return Err(Error::Network {
+                    .boxed()
+                } else {
+                    Error::Network {
                         target: self.target,
                         source,
                     }
-                    .boxed());
+                    .boxed()
                 }
-            }
-        }
+            })?;
+        self.inner.observation.sent(super::SentMessageInfo {
+            endpoint_id: self.inner.endpoint_id,
+            session_id: None,
+            transport: super::TransportKind::Udp,
+            local_addr: self.inner.local_addr,
+            peer_addr: self.target,
+            sent_at: tokio::time::Instant::now(),
+            sent_len: data.len(),
+        });
         Ok(())
     }
     #[cfg(test)]
@@ -1402,7 +1361,13 @@ mod tests {
     #[tokio::test]
     async fn unpolled_runner_and_unpolled_run_future_close_sends() {
         for as_future in [false, true] {
-            let (endpoint, runner) = UdpEndpoint::builder().prepare().await.unwrap().into_parts();
+            let (endpoint, runner) = UdpEndpoint::builder()
+                .bind("127.0.0.1:0")
+                .prepare()
+                .await
+                .unwrap()
+                .into_parts();
+            let local_addr = endpoint.local_addr();
             let handle = endpoint.handle("127.0.0.1:161".parse().unwrap()).unwrap();
             if as_future {
                 drop(runner.run());
@@ -1410,6 +1375,8 @@ mod tests {
                 drop(runner);
             }
             endpoint.control().wait_closed().await;
+            let _rebound = UdpSocket::bind(local_addr).await.unwrap();
+            assert_eq!(endpoint.local_addr(), local_addr);
             assert!(endpoint.control().is_shutdown());
             assert!(matches!(
                 *handle
@@ -1559,8 +1526,10 @@ mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(endpoint.local_addr(), bound);
-        assert_eq!(endpoint.inner.socket.ttl().unwrap(), 37);
-        assert!(endpoint.inner.socket.broadcast().unwrap());
+        endpoint.inner.responder.test_socket(|socket| {
+            assert_eq!(socket.ttl().unwrap(), 37);
+            assert!(socket.broadcast().unwrap());
+        });
         drop(runner);
         for option in 0..3 {
             let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();

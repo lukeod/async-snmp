@@ -337,15 +337,10 @@ pub(crate) struct ReplyRoute {
 #[derive(Clone)]
 enum ReplyKind {
     Udp {
-        socket: std::sync::Arc<tokio::net::UdpSocket>,
         responder: std::sync::Arc<crate::udp_responder::UdpResponder>,
         received: crate::udp_responder::ReceivedDatagram,
         endpoint_id: EndpointId,
         local_addr: SocketAddr,
-        admission: Option<(
-            std::sync::Arc<std::sync::Mutex<bool>>,
-            tokio_util::sync::CancellationToken,
-        )>,
     },
     Tcp(super::TcpTransport),
 }
@@ -376,23 +371,14 @@ impl ReplyRoute {
         }
         match &self.kind {
             ReplyKind::Udp {
-                socket,
                 responder,
                 received,
                 endpoint_id,
                 local_addr,
-                admission,
             } => {
-                let send = responder.send_to_admitted(
-                    socket,
-                    &data,
-                    received.source,
-                    received.destination,
-                    admission.as_ref().map(|(gate, _)| gate.as_ref()),
-                );
+                let send = responder.send_to(&data, received.source, received.destination);
                 let result = tokio::select! { biased;
                     () = tokio::time::sleep_until(deadline) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "reply deadline expired")),
-                    () = async { match admission { Some((_, cancel)) => cancel.cancelled().await, None => std::future::pending().await } } => Err(std::io::Error::new(std::io::ErrorKind::NotConnected, "UDP endpoint closed")),
                     result = send => result,
                 };
                 if result.is_ok() {
@@ -461,17 +447,6 @@ impl ReceivedMessage {
         self.reply.observation().disposition(self.info, disposition);
     }
 
-    pub(crate) fn with_udp_admission(
-        mut self,
-        gate: std::sync::Arc<std::sync::Mutex<bool>>,
-        cancel: tokio_util::sync::CancellationToken,
-    ) -> Self {
-        if let ReplyKind::Udp { admission, .. } = &mut self.reply.kind {
-            *admission = Some((gate, cancel));
-        }
-        self
-    }
-
     pub(crate) fn tcp(
         bytes: bytes::Bytes,
         info: ReceivedMessageInfo,
@@ -496,7 +471,6 @@ impl ReceivedMessage {
     pub(crate) fn udp(
         bytes: bytes::Bytes,
         info: ReceivedMessageInfo,
-        socket: std::sync::Arc<tokio::net::UdpSocket>,
         responder: std::sync::Arc<crate::udp_responder::UdpResponder>,
         received: crate::udp_responder::ReceivedDatagram,
         limits: ProcessingLimits,
@@ -509,12 +483,10 @@ impl ReceivedMessage {
             prepared: None,
             reply: ReplyRoute {
                 kind: ReplyKind::Udp {
-                    socket,
                     responder,
                     received,
                     endpoint_id: info.endpoint_id(),
                     local_addr: info.local_addr(),
-                    admission: None,
                 },
                 limits,
             },
@@ -529,16 +501,16 @@ mod tests {
 
     #[tokio::test]
     async fn udp_reply_route_preserves_the_complete_input_identity() {
-        let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let local = socket.local_addr().unwrap();
-        let responder = Arc::new(crate::udp_responder::UdpResponder::new(&socket));
+        let responder = Arc::new(crate::udp_responder::UdpResponder::new(socket));
         let endpoint = EndpointId::new();
         let mut buffer = [0; 32];
         let mut previous = None;
         for _ in 0..2 {
             peer.send_to(b"same bytes", local).await.unwrap();
-            let received = responder.recv(&socket, &mut buffer).await.unwrap();
+            let received = responder.recv(&mut buffer).await.unwrap();
             let info = ReceivedMessageInfo::udp(
                 endpoint,
                 local,
@@ -550,7 +522,6 @@ mod tests {
             let message = ReceivedMessage::udp(
                 bytes::Bytes::copy_from_slice(&buffer[..received.len]),
                 info,
-                socket.clone(),
                 responder.clone(),
                 received,
                 ProcessingLimits::UDP,

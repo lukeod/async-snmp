@@ -1481,8 +1481,6 @@ impl NotificationReceiverBuilder {
                 self.admission_policy,
             ),
             #[cfg(test)]
-            socket: network.udp.first().map(crate::UdpEndpoint::test_socket),
-            #[cfg(test)]
             udp_responder: network.udp.first().map(crate::UdpEndpoint::test_responder),
             #[cfg(test)]
             endpoint_id: network.bound[0].endpoint_id,
@@ -1892,8 +1890,6 @@ struct ReceiverInner {
     active: std::sync::atomic::AtomicUsize,
     idle: tokio::sync::Notify,
     #[cfg(test)]
-    socket: Option<Arc<UdpSocket>>,
-    #[cfg(test)]
     udp_responder: Option<Arc<UdpResponder>>,
     #[cfg(test)]
     endpoint_id: crate::EndpointId,
@@ -2107,10 +2103,10 @@ impl NotificationRole {
             source,
             destination,
         };
-        let socket = self.inner.socket.clone().expect("UDP test fixture");
+        let responder = self.inner.udp_responder.clone().expect("UDP test fixture");
         let info = crate::ReceivedMessageInfo::udp(
             self.inner.endpoint_id,
-            socket.local_addr().unwrap(),
+            responder.test_socket(|socket| socket.local_addr().unwrap()),
             source,
             destination.map(|destination| destination.ip),
             tokio::time::Instant::now(),
@@ -2119,8 +2115,7 @@ impl NotificationRole {
         crate::transport::ReceivedMessage::udp(
             data,
             info,
-            socket,
-            self.inner.udp_responder.clone().expect("UDP test fixture"),
+            responder,
             received,
             crate::transport::ProcessingLimits::UDP,
         )
@@ -2346,11 +2341,10 @@ mod tests {
             assert_eq!(
                 receiver
                     .inner
-                    .socket
+                    .udp_responder
                     .as_ref()
                     .unwrap()
-                    .local_addr()
-                    .unwrap(),
+                    .test_socket(|socket| socket.local_addr().unwrap()),
                 receiver.local_addr()
             );
         }

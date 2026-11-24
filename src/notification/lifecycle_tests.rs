@@ -182,6 +182,35 @@ async fn graceful_shutdown_drains_admitted_ack_without_waiting_for_consumption()
 }
 
 #[tokio::test]
+async fn running_shutdown_releases_udp_port_with_queued_inform() {
+    let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
+    let local_addr = receiver.local_addr();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *receiver.inner.response_send_gate.lock().unwrap() = Some(gate.clone());
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sender
+        .send_to(&build_v2c_inform(b"public"), local_addr)
+        .await
+        .unwrap();
+    processing_started(&receiver).await;
+
+    receiver.control().request_shutdown();
+    gate.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(1), receiver.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    let _rebound = UdpSocket::bind(local_addr).await.unwrap();
+    await_ack(&sender).await;
+    assert_eq!(receiver.local_addr(), local_addr);
+    assert!(matches!(
+        receiver.recv().await.unwrap().inform_ack,
+        crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+    ));
+    assert!(receiver.recv().await.is_none());
+}
+
+#[tokio::test]
 async fn protocol_work_limit_drops_without_blocking_reader() {
     let mut receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
@@ -353,7 +382,15 @@ async fn supplied_socket_preserves_options_and_rejects_conflicts_and_unbound_soc
         .unwrap()
         .into_parts();
     assert_eq!(receiver.local_addr(), local);
-    assert_eq!(receiver.inner.socket.as_ref().unwrap().ttl().unwrap(), 29);
+    assert_eq!(
+        receiver
+            .inner
+            .udp_responder
+            .as_ref()
+            .unwrap()
+            .test_socket(|socket| socket.ttl().unwrap()),
+        29
+    );
     drop(runner);
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     assert!(

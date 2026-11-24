@@ -35,7 +35,7 @@ async fn message() -> ReceivedMessage {
     .await
 }
 async fn message_with(pdu: crate::Pdu, config: crate::UsmConfig) -> ReceivedMessage {
-    let socket = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let source = "127.0.0.1:9999".parse().unwrap();
     let keys = config.derive_keys(b"prepared-engine").unwrap();
     let wire: Bytes = crate::v3::encode::encode_v3_message(
@@ -54,7 +54,6 @@ async fn message_with(pdu: crate::Pdu, config: crate::UsmConfig) -> ReceivedMess
     )
     .unwrap()
     .into();
-    let responder = Arc::new(crate::udp_responder::UdpResponder::new(&socket));
     let info = crate::ReceivedMessageInfo::udp(
         crate::EndpointId::new(),
         socket.local_addr().unwrap(),
@@ -63,10 +62,10 @@ async fn message_with(pdu: crate::Pdu, config: crate::UsmConfig) -> ReceivedMess
         tokio::time::Instant::now(),
         wire.len(),
     );
+    let responder = Arc::new(crate::udp_responder::UdpResponder::new(socket));
     ReceivedMessage::udp(
         wire,
         info,
-        socket,
         responder,
         crate::udp_responder::ReceivedDatagram {
             len: info.received_len(),

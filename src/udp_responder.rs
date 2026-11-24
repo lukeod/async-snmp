@@ -7,8 +7,11 @@
 //! receive and send use Tokio's ordinary UDP operations, allowing the kernel to
 //! select the response source address.
 
+use std::future::poll_fn;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Mutex;
+use std::task::{Poll, ready};
 
 #[cfg(any(
     test,
@@ -21,6 +24,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
+use tokio_util::sync::CancellationToken;
 
 /// Metadata needed to reply to a received datagram.
 #[derive(Clone, Copy, Debug)]
@@ -189,9 +193,12 @@ fn intrinsically_non_unicast(ip: IpAddr) -> bool {
     }
 }
 
-/// Per-socket capability for destination-aware datagram receives and replies.
+/// Closeable UDP socket with destination-aware datagram receives and replies.
 #[derive(Debug)]
 pub(crate) struct UdpResponder {
+    socket: Mutex<Option<UdpSocket>>,
+    writer: tokio::sync::Mutex<()>,
+    shutdown: CancellationToken,
     observation: crate::transport::observation::Observation,
     packet_info: bool,
     #[cfg(any(
@@ -333,54 +340,30 @@ impl UdpResponder {
         &self.observation
     }
 
-    pub(crate) fn new(socket: &UdpSocket) -> Self {
-        Self::from_setup_result(socket, platform::enable_packet_info(socket))
+    pub(crate) fn new(socket: UdpSocket) -> Self {
+        let result = platform::enable_packet_info(&socket);
+        Self::from_setup_result(socket, result)
     }
 
-    fn from_setup_result(socket: &UdpSocket, result: io::Result<()>) -> Self {
-        match result {
-            Ok(()) => Self {
-                observation: Default::default(),
-                packet_info: true,
-                #[cfg(any(
-                    test,
-                    windows,
-                    target_os = "freebsd",
-                    target_os = "dragonfly",
-                    target_os = "netbsd",
-                    target_os = "openbsd",
-                ))]
-                ipv4_interfaces: Arc::new(InterfaceSnapshotState::default()),
-            },
-            Err(error) => {
-                tracing::warn!(
-                    target: "async_snmp::udp",
-                    %error,
-                    local_addr = ?socket.local_addr().ok(),
-                    "UDP destination metadata unavailable; replies will use kernel source selection"
-                );
-                Self {
-                    observation: Default::default(),
-                    packet_info: false,
-                    #[cfg(any(
-                        test,
-                        windows,
-                        target_os = "freebsd",
-                        target_os = "dragonfly",
-                        target_os = "netbsd",
-                        target_os = "openbsd",
-                    ))]
-                    ipv4_interfaces: Arc::new(InterfaceSnapshotState::default()),
-                }
-            }
+    fn from_setup_result(socket: UdpSocket, result: io::Result<()>) -> Self {
+        if let Err(error) = &result {
+            tracing::warn!(
+                target: "async_snmp::udp",
+                %error,
+                local_addr = ?socket.local_addr().ok(),
+                "UDP destination metadata unavailable; replies will use kernel source selection"
+            );
         }
+        Self::with_socket(Some(socket), result.is_ok())
     }
 
-    #[cfg(test)]
-    fn without_packet_info() -> Self {
+    fn with_socket(socket: Option<UdpSocket>, packet_info: bool) -> Self {
         Self {
+            socket: Mutex::new(socket),
+            writer: tokio::sync::Mutex::new(()),
+            shutdown: CancellationToken::new(),
             observation: Default::default(),
-            packet_info: false,
+            packet_info,
             #[cfg(any(
                 test,
                 windows,
@@ -393,61 +376,77 @@ impl UdpResponder {
         }
     }
 
-    /// Receive one datagram and, when available, its destination address.
-    pub(crate) async fn recv(
-        &self,
-        socket: &UdpSocket,
-        buf: &mut [u8],
-    ) -> io::Result<ReceivedDatagram> {
-        if !self.packet_info {
-            let (len, source) = socket.recv_from(buf).await?;
-            self.observation.read(len);
-            return Ok(ReceivedDatagram {
-                len,
-                source,
-                destination: None,
-            });
-        }
+    pub(crate) fn shutdown_token(&self) -> &CancellationToken {
+        &self.shutdown
+    }
 
-        loop {
-            socket.readable().await?;
-            match socket.try_io(tokio::io::Interest::READABLE, || {
-                platform::recv_with_packet_info(socket, buf, &self.observation)
-            }) {
-                Ok(received) => return Ok(received),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
-            }
-        }
+    pub(crate) fn close(&self) {
+        self.shutdown.cancel();
+        // Take under the same lock as any pending nonblocking syscall. No
+        // endpoint or reply route can keep the socket alive across a poll.
+        drop(self.socket.lock().unwrap().take());
     }
 
     #[cfg(test)]
-    pub(crate) async fn send_to(
-        &self,
-        socket: &UdpSocket,
-        data: &[u8],
-        destination: SocketAddr,
-        source: Option<DestinationMetadata>,
-    ) -> io::Result<()> {
-        self.send_to_admitted(socket, data, destination, source, None)
-            .await
+    pub(crate) fn test_socket<T>(&self, inspect: impl FnOnce(&UdpSocket) -> T) -> T {
+        inspect(self.socket.lock().unwrap().as_ref().unwrap())
     }
 
-    pub(crate) async fn send_to_admitted(
+    /// Receive one datagram and, when available, its destination address.
+    pub(crate) async fn recv(&self, buf: &mut [u8]) -> io::Result<ReceivedDatagram> {
+        poll_fn(|cx| {
+            let socket = self.socket.lock().unwrap();
+            let socket = socket.as_ref().ok_or_else(closed_socket)?;
+            loop {
+                ready!(socket.poll_recv_ready(cx))?;
+                let received = if self.packet_info {
+                    socket.try_io(tokio::io::Interest::READABLE, || {
+                        platform::recv_with_packet_info(socket, buf, &self.observation)
+                    })
+                } else {
+                    socket.try_recv_from(buf).map(|(len, source)| {
+                        self.observation.read(len);
+                        ReceivedDatagram {
+                            len,
+                            source,
+                            destination: None,
+                        }
+                    })
+                };
+                match received {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    result => return Poll::Ready(result),
+                }
+            }
+        })
+        .await
+    }
+
+    pub(crate) async fn send_to(
         &self,
-        socket: &UdpSocket,
         data: &[u8],
         destination: SocketAddr,
         source: Option<DestinationMetadata>,
-        admission: Option<&std::sync::Mutex<bool>>,
+    ) -> io::Result<()> {
+        tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => Err(closed_socket()),
+            result = self.send_datagram(data, destination, source) => result,
+        }
+    }
+
+    async fn send_datagram(
+        &self,
+        data: &[u8],
+        destination: SocketAddr,
+        source: Option<DestinationMetadata>,
     ) -> io::Result<()> {
         let Some(source) = source.filter(|_| self.packet_info) else {
-            return send_plain_admitted(socket, data, destination, admission, &self.observation)
-                .await;
+            return self.send_plain(data, destination).await;
         };
 
         let exact_result = self
-            .send_with_metadata(socket, data, destination, source, false, admission)
+            .send_with_metadata(data, destination, source, false)
             .await;
         let exact_error = match exact_result {
             Ok(()) => return Ok(()),
@@ -479,7 +478,7 @@ impl UdpResponder {
                 "UDP exact-source reply failed; retrying on the received interface"
             );
             match self
-                .send_with_metadata(socket, data, destination, source, true, admission)
+                .send_with_metadata(data, destination, source, true)
                 .await
             {
                 Ok(()) => return Ok(()),
@@ -508,7 +507,7 @@ impl UdpResponder {
             );
         }
 
-        send_plain_admitted(socket, data, destination, admission, &self.observation).await
+        self.send_plain(data, destination).await
     }
 
     async fn classify_destination(&self, source: DestinationMetadata) -> DestinationClassification {
@@ -615,17 +614,13 @@ impl UdpResponder {
 
     async fn send_with_metadata(
         &self,
-        socket: &UdpSocket,
         data: &[u8],
         destination: SocketAddr,
         source: DestinationMetadata,
         unspecified_source: bool,
-        admission: Option<&std::sync::Mutex<bool>>,
     ) -> io::Result<()> {
-        loop {
-            socket.writable().await?;
-            let _admission = check_send_admission(admission)?;
-            match socket.try_io(tokio::io::Interest::WRITABLE, || {
+        self.write(|socket| {
+            socket.try_io(tokio::io::Interest::WRITABLE, || {
                 platform::send_with_source(
                     socket,
                     data,
@@ -634,52 +629,51 @@ impl UdpResponder {
                     unspecified_source,
                     &self.observation,
                 )
-            }) {
-                Ok(()) => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
+            })
+        })
+        .await
+    }
+
+    async fn send_plain(&self, data: &[u8], destination: SocketAddr) -> io::Result<()> {
+        self.write(|socket| {
+            let written = socket.try_send_to(data, destination)?;
+            self.observation.written(written);
+            if written != data.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "UDP send wrote a partial datagram",
+                ));
             }
-        }
+            Ok(())
+        })
+        .await
+    }
+
+    async fn write(&self, mut send: impl FnMut(&UdpSocket) -> io::Result<()>) -> io::Result<()> {
+        // poll_send_ready stores a single waker. Serialize readiness polling
+        // across direct sends and replies, without keeping the socket locked
+        // when a writer yields.
+        let _writer = self.writer.lock().await;
+        poll_fn(|cx| {
+            let socket = self.socket.lock().unwrap();
+            if self.shutdown.is_cancelled() {
+                return Poll::Ready(Err(closed_socket()));
+            }
+            let socket = socket.as_ref().ok_or_else(closed_socket)?;
+            loop {
+                ready!(socket.poll_send_ready(cx))?;
+                match send(socket) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    result => return Poll::Ready(result),
+                }
+            }
+        })
+        .await
     }
 }
 
-fn check_send_admission(
-    admission: Option<&std::sync::Mutex<bool>>,
-) -> io::Result<Option<std::sync::MutexGuard<'_, bool>>> {
-    let guard = admission.map(|gate| gate.lock().unwrap());
-    if guard.as_ref().is_some_and(|open| !**open) {
-        return Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            "UDP endpoint is closed",
-        ));
-    }
-    Ok(guard)
-}
-async fn send_plain_admitted(
-    socket: &UdpSocket,
-    data: &[u8],
-    destination: SocketAddr,
-    admission: Option<&std::sync::Mutex<bool>>,
-    observation: &crate::transport::observation::Observation,
-) -> io::Result<()> {
-    loop {
-        socket.writable().await?;
-        let _admission = check_send_admission(admission)?;
-        match socket.try_send_to(data, destination) {
-            Ok(written) => {
-                observation.written(written);
-                if written != data.len() {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "UDP send wrote a partial datagram",
-                    ));
-                }
-                return Ok(());
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error),
-        }
-    }
+fn closed_socket() -> io::Error {
+    io::Error::new(io::ErrorKind::NotConnected, "UDP endpoint is closed")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2121,7 +2115,7 @@ mod tests {
 
         let responder = tracing::subscriber::with_default(subscriber, || {
             UdpResponder::from_setup_result(
-                &socket,
+                socket,
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "injected packet-info setup failure",
@@ -2139,39 +2133,55 @@ mod tests {
     #[tokio::test]
     async fn setup_success_selects_destination_metadata() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let responder = UdpResponder::from_setup_result(&socket, Ok(()));
+        let responder = UdpResponder::from_setup_result(socket, Ok(()));
         assert!(responder.packet_info);
     }
 
     #[tokio::test]
     async fn ordinary_udp_fallback_receives_and_sends() {
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let (observer, _events) = crate::TransportObserver::channel(8).unwrap();
-        let responder = UdpResponder::without_packet_info().with_observation(
+        let responder = UdpResponder::with_socket(Some(server), false).with_observation(
             crate::transport::observation::Observation(Some(observer.clone())),
         );
-        client
-            .send_to(b"request", server.local_addr().unwrap())
-            .await
-            .unwrap();
+        client.send_to(b"request", local).await.unwrap();
 
         let mut request = [0_u8; 64];
-        let received = responder.recv(&server, &mut request).await.unwrap();
+        let received = responder.recv(&mut request).await.unwrap();
         assert_eq!(&request[..received.len], b"request");
         assert_eq!(received.destination, None);
 
         responder
-            .send_to(&server, b"response", received.source, None)
+            .send_to(b"response", received.source, None)
             .await
             .unwrap();
         let mut response = [0_u8; 64];
         let (len, source) = client.recv_from(&mut response).await.unwrap();
         assert_eq!(&response[..len], b"response");
-        assert_eq!(source, server.local_addr().unwrap());
+        assert_eq!(source, local);
         assert_eq!(observer.stats().socket_read_bytes, 7);
         assert_eq!(observer.stats().socket_written_bytes, 8);
         assert_eq!(observer.stats().sent_messages, 0);
+    }
+
+    #[tokio::test]
+    async fn close_releases_port_with_waiting_writer() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = socket.local_addr().unwrap();
+        let responder = UdpResponder::new(socket);
+        let writer = responder.writer.lock().await;
+        let mut pending = std::pin::pin!(responder.send_to(b"queued", local, None));
+        assert!(futures::poll!(&mut pending).is_pending());
+
+        responder.close();
+        let _rebound = UdpSocket::bind(local).await.unwrap();
+        assert_eq!(
+            pending.await.unwrap_err().kind(),
+            io::ErrorKind::NotConnected
+        );
+        drop(writer);
     }
 
     #[cfg(target_os = "linux")]
@@ -2179,16 +2189,14 @@ mod tests {
     async fn truncated_datagram_counts_reported_bytes_before_metadata_rejection() {
         let (observer, _events) = crate::TransportObserver::channel(8).unwrap();
         let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let local = server.local_addr().unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let responder = UdpResponder::new(&server).with_observation(
+        let responder = UdpResponder::new(server).with_observation(
             crate::transport::observation::Observation(Some(observer.clone())),
         );
         assert!(responder.packet_info);
-        client
-            .send_to(b"too long", server.local_addr().unwrap())
-            .await
-            .unwrap();
-        let error = responder.recv(&server, &mut [0; 2]).await.unwrap_err();
+        client.send_to(b"too long", local).await.unwrap();
+        let error = responder.recv(&mut [0; 2]).await.unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         // recvmsg without MSG_TRUNC input flags reports copied bytes on Linux.
         assert_eq!(observer.stats().socket_read_bytes, 2);
@@ -2199,12 +2207,11 @@ mod tests {
     async fn large_response_is_sent_as_an_ordinary_udp_datagram() {
         let server = UdpSocket::bind("0.0.0.0:0").await.unwrap();
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let responder = UdpResponder::new(&server);
+        let responder = UdpResponder::new(server);
         let payload = vec![0x5a; 8 * 1024];
 
         responder
             .send_to(
-                &server,
                 &payload,
                 client.local_addr().unwrap(),
                 Some(DestinationMetadata::new("127.0.0.1".parse().unwrap(), 0)),
@@ -2396,7 +2403,7 @@ mod tests {
     async fn cancelled_snapshot_waiter_does_not_orphan_refresh() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let responder = Arc::new(UdpResponder::without_packet_info());
+        let responder = Arc::new(UdpResponder::with_socket(None, false));
         let retained = Ipv4InterfaceAddress {
             interface_index: 17,
             address: "192.0.2.10".parse().unwrap(),
@@ -2462,7 +2469,7 @@ mod tests {
     fn runtime_shutdown_does_not_orphan_snapshot_refresh() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let responder = Arc::new(UdpResponder::without_packet_info());
+        let responder = Arc::new(UdpResponder::with_socket(None, false));
         let address = Ipv4InterfaceAddress {
             interface_index: 17,
             address: "192.0.2.10".parse().unwrap(),
@@ -2527,7 +2534,7 @@ mod tests {
     async fn panicked_snapshot_refresh_clears_in_flight_state() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let responder = UdpResponder::without_packet_info();
+        let responder = UdpResponder::with_socket(None, false);
         let calls = Arc::new(AtomicUsize::new(0));
         let first_calls = Arc::clone(&calls);
         let snapshot = tokio::time::timeout(
@@ -2576,18 +2583,18 @@ mod tests {
     #[tokio::test]
     async fn broadcast_reply_uses_received_interface_without_duplicates() {
         let server = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let port = server.local_addr().unwrap().port();
         let (observer, _events) = crate::TransportObserver::channel(8).unwrap();
-        let responder = UdpResponder::new(&server).with_observation(
+        let responder = UdpResponder::new(server).with_observation(
             crate::transport::observation::Observation(Some(observer.clone())),
         );
         let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         client.set_broadcast(true).unwrap();
-        let destination =
-            SocketAddr::from(([127, 255, 255, 255], server.local_addr().unwrap().port()));
+        let destination = SocketAddr::from(([127, 255, 255, 255], port));
 
         client.send_to(b"request", destination).await.unwrap();
         let mut request = [0_u8; 64];
-        let received = responder.recv(&server, &mut request).await.unwrap();
+        let received = responder.recv(&mut request).await.unwrap();
         assert_eq!(&request[..received.len], b"request");
         let metadata = received.destination.expect("missing IP_PKTINFO metadata");
         assert_eq!(metadata.ip, destination.ip());
@@ -2598,7 +2605,7 @@ mod tests {
         );
 
         responder
-            .send_to(&server, b"response", received.source, received.destination)
+            .send_to(b"response", received.source, received.destination)
             .await
             .unwrap();
         let mut response = [0_u8; 64];
@@ -2629,16 +2636,16 @@ mod tests {
     #[tokio::test]
     async fn ipv6_receive_retains_interface_scope() {
         let server = UdpSocket::bind("[::]:0").await.unwrap();
-        let responder = UdpResponder::new(&server);
-        let client = UdpSocket::bind("[::1]:0").await.unwrap();
         let destination = SocketAddr::new(
             std::net::Ipv6Addr::LOCALHOST.into(),
             server.local_addr().unwrap().port(),
         );
+        let responder = UdpResponder::new(server);
+        let client = UdpSocket::bind("[::1]:0").await.unwrap();
 
         client.send_to(b"request", destination).await.unwrap();
         let mut request = [0_u8; 64];
-        let received = responder.recv(&server, &mut request).await.unwrap();
+        let received = responder.recv(&mut request).await.unwrap();
         let metadata = received.destination.expect("missing IPV6_PKTINFO metadata");
         assert_eq!(metadata.ip, destination.ip());
         assert_ne!(metadata.interface_index, 0);
@@ -2654,8 +2661,7 @@ mod tests {
         use nix::sys::socket::{getsockopt, sockopt::UdpGroSegment};
 
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let _responder = UdpResponder::new(&socket);
-
-        assert!(!getsockopt(&socket, UdpGroSegment).unwrap());
+        let responder = UdpResponder::new(socket);
+        assert!(!responder.test_socket(|socket| getsockopt(socket, UdpGroSegment).unwrap()));
     }
 }
