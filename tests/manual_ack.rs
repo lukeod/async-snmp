@@ -521,7 +521,15 @@ async fn attached_manual_role_shutdown_invalidates_tokens_without_stopping_comma
             .unwrap(),
     );
     let control = notifications.control();
-    tokio::time::timeout(Duration::from_secs(1), control.shutdown())
+    control.request_shutdown();
+    assert!(
+        tokio::time::timeout(WAIT, notifications.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(control.status(), async_snmp::NotificationStatus::Stopped);
+    tokio::time::timeout(WAIT, control.wait_closed())
         .await
         .unwrap();
     assert!(matches!(

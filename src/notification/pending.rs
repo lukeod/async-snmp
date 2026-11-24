@@ -387,14 +387,13 @@ pub(super) fn failed(
 }
 
 impl NotificationRole {
-    /// One supervised expiry/completion worker. Attached roles park after role
-    /// shutdown so their completion cannot terminate the agent network runner.
-    pub(crate) async fn run_pending(self, root_shutdown: CancellationToken) -> crate::Result<()> {
+    /// One supervised expiry/completion worker for the notification role.
+    pub(crate) async fn run_pending(self, shutdown: CancellationToken) -> crate::Result<()> {
         let registry = self.inner.pending.clone();
         let _cleanup = WorkerCleanup(registry.clone());
         let mut work = tokio::task::JoinSet::new();
         loop {
-            if root_shutdown.is_cancelled() {
+            if shutdown.is_cancelled() {
                 break;
             }
             // Reap completed children even under continuous admission/expiry
@@ -405,7 +404,7 @@ impl NotificationRole {
                 }
             }
             registry.expire();
-            for item in registry.requested(&root_shutdown) {
+            for item in registry.requested(&shutdown) {
                 let role = self.clone();
                 work.spawn(async move {
                     let Work { payload, result, cancel, guard } = item;
@@ -427,7 +426,7 @@ impl NotificationRole {
             let deadline = registry.next_deadline();
             tokio::select! {
                 biased;
-                () = root_shutdown.cancelled() => break,
+                () = shutdown.cancelled() => break,
                 () = registry.changed.notified() => {},
                 () = async { match deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {},
                 joined = work.join_next(), if !work.is_empty() => {

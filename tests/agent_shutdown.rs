@@ -294,6 +294,57 @@ async fn cancellation_does_not_abort_set_commit() {
 }
 
 #[tokio::test]
+async fn attached_role_finishes_while_agent_drains_blocked_set() {
+    let started = Arc::new(Semaphore::new(0));
+    let release = Arc::new(Semaphore::new(0));
+    let committed = Arc::new(AtomicBool::new(false));
+    let mut agent = Agent::builder()
+        .listener(async_snmp::ListenerSource::tcp("127.0.0.1:0"))
+        .community("public")
+        .allow_all_access()
+        .handler(
+            oid!(1, 3, 6, 1, 4, 1, 99999),
+            Arc::new(BlockingSetHandler {
+                commit_started: started.clone(),
+                release_commit: release.clone(),
+                committed: committed.clone(),
+            }),
+        )
+        .notifications(async_snmp::NotificationReceiver::builder())
+        .spawn()
+        .await
+        .unwrap();
+    let mut notifications = agent.take_notifications().unwrap();
+    let role_control = notifications.control();
+    let client = Client::builder(agent.bound_addresses()[0].local_addr, Auth::v2c("public"))
+        .retry(Retry::none())
+        .request_timeout(TEST_TIMEOUT)
+        .connect_tcp()
+        .await
+        .unwrap();
+    let request = tokio::spawn(async move { client.set(&test_oid(), Value::Integer(7)).await });
+    wait_for(&started).await;
+
+    agent.control().request_shutdown();
+    tokio::time::timeout(TEST_TIMEOUT, role_control.wait_closed())
+        .await
+        .expect("role shutdown should finish while the SET is still blocked");
+    assert_eq!(
+        role_control.status(),
+        async_snmp::NotificationStatus::Stopped
+    );
+    assert!(notifications.recv().await.is_none());
+    assert!(!agent.task().is_finished());
+    assert!(!committed.load(Ordering::SeqCst));
+
+    release.add_permits(1);
+    let response = request.await.unwrap().unwrap();
+    assert_eq!(response.varbinds[0].value, Value::Integer(7));
+    assert!(committed.load(Ordering::SeqCst));
+    agent.join().await.unwrap();
+}
+
+#[tokio::test]
 async fn externally_aborting_run_does_not_abort_set_commit() {
     let commit_started = Arc::new(Semaphore::new(0));
     let release_commit = Arc::new(Semaphore::new(0));

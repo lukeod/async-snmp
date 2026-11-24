@@ -38,6 +38,105 @@ async fn processing_started(receiver: &NotificationReceiver) {
     .unwrap();
 }
 
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn attached_shutdown_drains_automatic_ack_and_preserves_terminal_status() {
+    use std::sync::atomic::AtomicBool;
+
+    let fail_accept = Arc::new(AtomicBool::new(false));
+    let failure = fail_accept.clone();
+    let tcp = crate::TcpListenerSource::bind("127.0.0.1:0").test_accept_hook(move || {
+        if failure.load(Ordering::Acquire) {
+            return Err(std::io::ErrorKind::InvalidInput.into());
+        }
+        Ok(())
+    });
+    let mut agent = crate::Agent::builder()
+        .listener(crate::ListenerSource::udp("127.0.0.1:0"))
+        .listener(crate::ListenerSource::Tcp(tcp))
+        .notifications(NotificationReceiver::builder())
+        .spawn()
+        .await
+        .unwrap();
+    let mut receiver = agent.take_notifications().unwrap();
+    let control = receiver.control();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *receiver.inner.response_send_gate.lock().unwrap() = Some(gate.clone());
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sender
+        .send_to(&build_v2c_inform(b"public"), receiver.local_addr())
+        .await
+        .unwrap();
+    processing_started(&receiver).await;
+
+    control.request_shutdown();
+    assert_eq!(control.status(), NotificationStatus::Running);
+    gate.add_permits(1);
+    await_ack(&sender).await;
+    let event = receiver.recv().await.unwrap();
+    assert!(matches!(
+        event.inform_ack,
+        NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+    ));
+    let wait = Duration::from_secs(1);
+    assert!(
+        tokio::time::timeout(wait, receiver.recv())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(control.status(), NotificationStatus::Stopped);
+
+    fail_accept.store(true, Ordering::Release);
+    let _ = tokio::net::TcpStream::connect(agent.bound_addresses()[1].local_addr).await;
+    let error = tokio::time::timeout(wait, agent.join())
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(matches!(*error, Error::Listener { .. }));
+    assert_eq!(control.status(), NotificationStatus::Stopped);
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn attached_shutdown_before_start_completes_when_runner_is_driven_or_dropped() {
+    for drive in [true, false] {
+        let (agent, runner, receiver) = crate::Agent::builder()
+            .bind("127.0.0.1:0")
+            .notifications(NotificationReceiver::builder())
+            .prepare()
+            .await
+            .unwrap()
+            .into_parts();
+        let mut receiver = receiver.unwrap();
+        let control = receiver.control();
+        control.request_shutdown();
+        assert_eq!(control.status(), NotificationStatus::Prepared);
+
+        let wait = Duration::from_secs(1);
+        if drive {
+            let task = tokio::spawn(runner.run());
+            assert!(
+                tokio::time::timeout(wait, receiver.recv())
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(control.status(), NotificationStatus::Stopped);
+            assert_eq!(agent.control().status(), crate::AgentStatus::Running);
+            agent.control().request_shutdown();
+            task.await.unwrap().unwrap();
+        } else {
+            drop(runner);
+            assert!(receiver.recv().await.is_none());
+            assert_eq!(control.status(), NotificationStatus::Interrupted);
+        }
+        tokio::time::timeout(wait, control.wait_closed())
+            .await
+            .unwrap();
+    }
+}
+
 async fn next_disposition(events: &mut ObservationReceiver) -> MessageDisposition {
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {

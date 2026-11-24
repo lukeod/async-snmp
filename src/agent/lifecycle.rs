@@ -279,13 +279,10 @@ impl AgentRunner {
             role.started();
         }
         let mut children: JoinSet<Result<()>> = JoinSet::new();
-        if let Some((role, _)) = &self.notification_role
-            && role.has_pending_worker()
+        if let Some((processor, role)) = &self.notification_role
+            && processor.has_pending_worker()
         {
-            children.spawn(
-                role.clone()
-                    .run_pending(self.processor.inner.cancel.clone()),
-            );
+            children.spawn(processor.clone().run_pending(role.shutdown_token().clone()));
         }
         let (failures, mut failure_rx) = mpsc::channel(self.listeners.len());
         let mut requests = RequestTasks::new(
@@ -314,6 +311,17 @@ impl AgentRunner {
                 biased;
                 () = self.processor.inner.cancel.cancelled() => break Ok(()),
                 Some(error) = failure_rx.recv() => break Err(error),
+                () = async {
+                    let Some((processor, role)) = &self.notification_role else {
+                        return std::future::pending().await;
+                    };
+                    role.shutdown_token().cancelled().await;
+                    processor.drain().await;
+                } => {
+                    if let Some((_, role)) = self.notification_role.take() {
+                        role.finished(&Ok(()));
+                    }
+                }
                 joined = children.join_next(), if !children.is_empty() => match joined {
                     Some(Ok(Err(error))) => break Err(error),
                     Some(Err(error)) => break Err(Error::Config(format!("agent listener task failed: {error}").into()).boxed()),
@@ -324,32 +332,40 @@ impl AgentRunner {
             }
         };
         if let Some((_, role)) = &self.notification_role {
-            role.stop_admission();
+            role.request_shutdown();
         }
         self.incoming.close();
         self.processor.inner.cancel.cancel();
         requests.cancel();
         self.cleanup.network.command_admission_stopped.cancel();
-        // Keep endpoints writable while admitted handlers finalize responses.
-        if let AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(grace) =
-            self.processor.inner.shutdown_policy
-        {
-            let drain = async {
-                while let Some(joined) = requests.join_next().await {
-                    log_request_result(Some(joined));
+        // Keep endpoints writable until both roles finish. Publish notification
+        // completion independently of command handlers still draining.
+        let drain_commands = async {
+            if let AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(grace) =
+                self.processor.inner.shutdown_policy
+            {
+                let drain = async {
+                    while let Some(joined) = requests.join_next().await {
+                        log_request_result(Some(joined));
+                    }
+                };
+                if tokio::time::timeout(grace, drain).await.is_err() {
+                    requests.abort_retrievals();
                 }
-            };
-            if tokio::time::timeout(grace, drain).await.is_err() {
-                requests.abort_retrievals();
             }
-        }
-        while let Some(joined) = requests.join_next().await {
-            log_request_result(Some(joined));
-        }
-        if let Some((processor, role)) = &mut self.notification_role {
-            processor.drain().await;
-            role.finished(&result);
-        }
+            while let Some(joined) = requests.join_next().await {
+                log_request_result(Some(joined));
+            }
+        };
+        let drain_notifications = async {
+            if let Some((processor, _)) = &self.notification_role {
+                processor.drain().await;
+            }
+            if let Some((_, role)) = self.notification_role.take() {
+                role.finished(&result);
+            }
+        };
+        tokio::join!(drain_commands, drain_notifications);
         self.cleanup.network.close_endpoints();
         while children.join_next().await.is_some() {}
         self.cleanup.terminal_status = Some(match &result {

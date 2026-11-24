@@ -136,7 +136,6 @@ pub(super) struct ServiceState {
     pub(super) shutdown: CancellationToken,
     complete: CancellationToken,
     status: Mutex<NotificationStatus>,
-    attached: std::sync::atomic::AtomicBool,
 }
 impl ServiceState {
     pub(super) fn new() -> Self {
@@ -144,8 +143,13 @@ impl ServiceState {
             shutdown: CancellationToken::new(),
             complete: CancellationToken::new(),
             status: Mutex::new(NotificationStatus::Prepared),
-            attached: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    fn request_shutdown(&self, delivery: &Delivery, pending: &pending::PendingRegistry) {
+        delivery.close_admission();
+        pending.shutdown();
+        self.shutdown.cancel();
     }
 }
 
@@ -169,40 +173,39 @@ pub(crate) struct RunnerCleanup {
     pub(super) capacity_registration: Option<crate::ReceiveCapacityRegistration>,
 }
 impl RunnerCleanup {
-    pub(crate) fn stop_admission(&self) {
-        self.delivery.close_admission();
-        self.pending.shutdown();
+    pub(crate) fn request_shutdown(&self) {
+        self.state.request_shutdown(&self.delivery, &self.pending);
+    }
+    #[cfg(feature = "agent")]
+    pub(crate) fn shutdown_token(&self) -> &CancellationToken {
+        &self.state.shutdown
     }
     pub(crate) fn started(&self) {
         if !self.state.shutdown.is_cancelled() {
             *self.state.status.lock().unwrap() = NotificationStatus::Running;
         }
     }
-    pub(crate) fn finished(&mut self, result: &Result<()>) {
-        self.pending.shutdown();
-        self.delivery.finish();
-        drop(self.capacity_registration.take());
-        *self.state.status.lock().unwrap() = match result {
+    pub(crate) fn finished(mut self, result: &Result<()>) {
+        self.finish(match result {
             Ok(()) => NotificationStatus::Stopped,
             Err(error) => NotificationStatus::Failed(error.to_string().into()),
-        };
+        });
+    }
+    fn finish(&mut self, status: NotificationStatus) {
+        if self.state.complete.is_cancelled() {
+            return;
+        }
+        self.request_shutdown();
+        drop(self.capacity_registration.take());
+        *self.state.status.lock().unwrap() = status;
+        // Publish status before dropping the last sender can wake the consumer.
+        self.delivery.finish();
         self.state.complete.cancel();
     }
 }
 impl Drop for RunnerCleanup {
     fn drop(&mut self) {
-        self.pending.shutdown();
-        self.delivery.finish();
-        self.state.shutdown.cancel();
-        drop(self.capacity_registration.take());
-        let mut status = self.state.status.lock().unwrap();
-        if !matches!(
-            *status,
-            NotificationStatus::Failed(_) | NotificationStatus::Stopped
-        ) {
-            *status = NotificationStatus::Interrupted;
-        }
-        self.state.complete.cancel();
+        self.finish(NotificationStatus::Interrupted);
     }
 }
 
@@ -224,31 +227,11 @@ impl NotificationControl {
     /// drains admitted automatic response attempts. Queued events remain
     /// available to the consumer.
     pub fn request_shutdown(&self) {
-        self.inner.delivery.close_admission();
-        self.inner.pending.shutdown();
-        self.state.shutdown.cancel();
-        if self.state.attached.load(Ordering::Acquire) {
-            self.inner.delivery.finish();
-        }
+        self.state
+            .request_shutdown(&self.inner.delivery, &self.inner.pending);
     }
     /// Wait for termination. An unstarted runner must be driven or dropped.
     pub async fn wait_closed(&self) {
-        if self.state.attached.load(Ordering::Acquire) {
-            self.state.shutdown.cancelled().await;
-            NotificationRole {
-                inner: self.inner.clone(),
-            }
-            .drain()
-            .await;
-            let mut status = self.state.status.lock().unwrap();
-            if matches!(
-                *status,
-                NotificationStatus::Prepared | NotificationStatus::Running
-            ) {
-                *status = NotificationStatus::Stopped;
-            }
-            self.state.complete.cancel();
-        }
         self.state.complete.cancelled().await;
     }
     /// [`Request shutdown`](Self::request_shutdown) and
@@ -317,7 +300,6 @@ impl NotificationReceiver {
         Arc::get_mut(&mut self.lease)
             .expect("new role lease is unique")
             ._service_lease = Some(lease);
-        self.state.attached.store(true, Ordering::Release);
     }
     /// Receive one accepted event with a cancellation-safe wait.
     ///
@@ -502,7 +484,7 @@ impl NotificationRunner {
     pub async fn run(self) -> Result<()> {
         // On cancellation, drop the network before publishing runner completion.
         let Self {
-            mut cleanup,
+            cleanup,
             network,
             listeners,
             processor,
@@ -535,8 +517,7 @@ impl NotificationRunner {
                 }
             }
         };
-        cleanup.stop_admission();
-        cleanup.state.shutdown.cancel();
+        cleanup.request_shutdown();
         processor.drain().await;
         network.0.close_endpoints();
         while children.join_next().await.is_some() {}
