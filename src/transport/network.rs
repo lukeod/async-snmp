@@ -4,11 +4,13 @@ use super::{BoundListener, TcpTransport, UdpEndpoint, listener::PreparedListener
 use crate::{Error, Result};
 use std::{
     collections::HashMap,
+    io,
     sync::{Arc, Mutex},
 };
 use tokio::{
     sync::{Semaphore, mpsc},
     task::JoinSet,
+    time::{Instant, sleep_until},
 };
 use tokio_util::sync::CancellationToken;
 
@@ -128,6 +130,8 @@ async fn run_tcp_listener(
     let PreparedListener::Tcp {
         bound,
         listener,
+        #[cfg(test)]
+        accept_hook,
         options,
         ingress,
         roles,
@@ -139,15 +143,26 @@ async fn run_tcp_listener(
     let mut sessions = JoinSet::new();
     let mut backoff = UdpRecvErrorBackoff::default();
     let mut accepting = true;
+    let mut retry_at = None;
     loop {
         tokio::select! {
             biased;
             () = network.stop.cancelled() => return Ok(()),
             () = cancel.cancelled(), if accepting => { accepting = false; },
             _ = sessions.join_next(), if !sessions.is_empty() => {},
-            accepted = listener.accept(), if accepting => match accepted {
+            accepted = async {
+                if let Some(deadline) = retry_at {
+                    sleep_until(deadline).await;
+                }
+                #[cfg(test)]
+                if let Some(hook) = &accept_hook {
+                    hook()?;
+                }
+                listener.accept().await
+            }, if accepting => match accepted {
                 Ok((stream, _)) => {
                     backoff.reset();
+                    retry_at = None;
                     let Ok(permit) = network.connections.clone().try_acquire_owned() else { drop(stream); continue; };
                     let prepared = match TcpTransport::builder().from_stream(stream).observation(observation.clone()).options(options.clone()).ingress(ingress.clone(), bound.endpoint_id).prepare().await {
                         Ok(prepared) => prepared,
@@ -165,8 +180,10 @@ async fn run_tcp_listener(
                         if let Err(error) = runner.run().await { tracing::debug!(%error, "agent TCP session terminated"); }
                     });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted || error.kind() == std::io::ErrorKind::WouldBlock || error.kind() == std::io::ErrorKind::ConnectionAborted => {
-                    tokio::select! { () = cancel.cancelled() => { accepting = false; }, () = tokio::time::sleep(backoff.advance()) => {} }
+                Err(error) if retryable_accept_error(&error) => {
+                    let delay = backoff.advance();
+                    tracing::debug!(%error, local_addr = %bound.local_addr, ?delay, "retrying TCP accept");
+                    retry_at = Some(Instant::now() + delay);
                 }
                 Err(source) => {
                     let _ = failures.try_send(listener_error(bound, Error::Network { target: bound.local_addr, source }.boxed()));
@@ -175,6 +192,36 @@ async fn run_tcp_listener(
             }
         }
     }
+}
+
+fn retryable_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::OutOfMemory
+    ) || error.raw_os_error().is_some_and(accept_resource_errno)
+}
+
+#[cfg(unix)]
+fn accept_resource_errno(code: i32) -> bool {
+    matches!(
+        code,
+        libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
+    )
+}
+
+#[cfg(windows)]
+fn accept_resource_errno(code: i32) -> bool {
+    use windows_sys::Win32::Networking::WinSock;
+
+    matches!(code, WinSock::WSAEMFILE | WinSock::WSAENOBUFS)
+}
+
+#[cfg(not(any(unix, windows)))]
+const fn accept_resource_errno(_code: i32) -> bool {
+    false
 }
 
 pub(crate) fn listener_error(bound: BoundListener, source: Box<Error>) -> Box<Error> {
@@ -191,5 +238,122 @@ pub(crate) struct NetworkCleanup(pub(crate) Arc<NetworkState>);
 impl Drop for NetworkCleanup {
     fn drop(&mut self) {
         self.0.close_endpoints();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ListenerSource, NotificationReceiver, TcpListenerSource, TransportKind};
+    use std::time::Duration;
+
+    const WAIT: Duration = Duration::from_secs(2);
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn accept_retries_resource_errors() {
+        #[cfg(unix)]
+        let codes = [libc::EMFILE, libc::ENFILE, libc::ENOBUFS, libc::ENOMEM];
+        #[cfg(windows)]
+        let codes = {
+            use windows_sys::Win32::Networking::WinSock;
+            [WinSock::WSAEMFILE, WinSock::WSAENOBUFS]
+        };
+        for code in codes {
+            assert!(retryable_accept_error(&io::Error::from_raw_os_error(code)));
+        }
+    }
+
+    #[cfg(feature = "agent")]
+    #[tokio::test]
+    async fn tcp_accept_recovers_while_udp_keeps_serving() {
+        use crate::{Agent, Auth, Client, Retry, Value, oid};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        let resource_limited = Arc::new(AtomicBool::new(true));
+        let failed = Arc::new(Notify::new());
+        let accept = {
+            let resource_limited = resource_limited.clone();
+            let failed = failed.clone();
+            move || {
+                if resource_limited.load(Ordering::Acquire) {
+                    failed.notify_one();
+                    #[cfg(unix)]
+                    return Err(io::Error::from_raw_os_error(libc::EMFILE));
+                    #[cfg(windows)]
+                    return Err(io::Error::from_raw_os_error(
+                        windows_sys::Win32::Networking::WinSock::WSAEMFILE,
+                    ));
+                    #[cfg(not(any(unix, windows)))]
+                    return Err(io::ErrorKind::OutOfMemory.into());
+                }
+                Ok(())
+            }
+        };
+        let agent = Agent::builder()
+            .community("public")
+            .allow_all_access()
+            .listener(ListenerSource::udp("127.0.0.1:0"))
+            .listener(ListenerSource::Tcp(
+                TcpListenerSource::bind("127.0.0.1:0").test_accept_hook(accept),
+            ))
+            .spawn()
+            .await
+            .unwrap();
+        tokio::time::timeout(WAIT, failed.notified()).await.unwrap();
+        let oid = oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0);
+        let client = |transport| {
+            let bound = agent
+                .bound_addresses()
+                .iter()
+                .find(|bound| bound.transport == transport)
+                .unwrap();
+            Client::builder(bound.local_addr.to_string(), Auth::v2c("public"))
+                .retry(Retry::none())
+                .request_timeout(WAIT)
+        };
+        let udp = client(TransportKind::Udp).connect().await.unwrap();
+        let response = udp.get(&oid).await.unwrap();
+        assert!(matches!(response.varbinds[0].value, Value::OctetString(_)));
+
+        resource_limited.store(false, Ordering::Release);
+        let tcp = client(TransportKind::Tcp).connect_tcp().await.unwrap();
+        assert_eq!(tcp.get(&oid).await.unwrap().varbinds, response.varbinds);
+        agent.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fatal_accept_failure_retains_listener_identity() {
+        let source = TcpListenerSource::bind("127.0.0.1:0")
+            .test_accept_hook(|| Err(io::ErrorKind::InvalidInput.into()));
+        let mut receiver = NotificationReceiver::builder()
+            .listener(ListenerSource::Tcp(source))
+            .spawn()
+            .await
+            .unwrap();
+        let expected = receiver.bound_addresses()[0];
+        let error = tokio::time::timeout(WAIT, receiver.join())
+            .await
+            .unwrap()
+            .unwrap_err();
+        match *error {
+            Error::Listener {
+                endpoint_id,
+                transport,
+                local_addr,
+                source,
+            } => {
+                assert_eq!(endpoint_id, expected.endpoint_id);
+                assert_eq!(transport, TransportKind::Tcp);
+                assert_eq!(local_addr, expected.local_addr);
+                assert!(matches!(
+                    *source,
+                    Error::Network { source, .. }
+                        if source.kind() == io::ErrorKind::InvalidInput
+                ));
+            }
+            other => panic!("unexpected listener failure: {other}"),
+        }
     }
 }

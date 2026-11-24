@@ -126,6 +126,8 @@ impl ListenerSource {
                 Ok(PreparedListener::Tcp {
                     bound,
                     listener,
+                    #[cfg(test)]
+                    accept_hook: source.accept_hook,
                     options: source.options,
                     observation: source.observation,
                     ingress,
@@ -136,11 +138,16 @@ impl ListenerSource {
     }
 }
 
+#[cfg(test)]
+pub(crate) type TcpAcceptHook = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+
 /// TCP acceptor source and limits applied independently to each accepted session.
 pub struct TcpListenerSource {
     observation: super::observation::Observation,
     address: Option<String>,
     listener: Option<TcpListener>,
+    #[cfg(test)]
+    accept_hook: Option<TcpAcceptHook>,
     options: TcpOptions,
 }
 impl TcpListenerSource {
@@ -156,6 +163,8 @@ impl TcpListenerSource {
             observation: Default::default(),
             address: Some(address.as_ref().into()),
             listener: None,
+            #[cfg(test)]
+            accept_hook: None,
             options: TcpOptions::default(),
         }
     }
@@ -164,12 +173,23 @@ impl TcpListenerSource {
             observation: Default::default(),
             address: None,
             listener: Some(listener),
+            #[cfg(test)]
+            accept_hook: None,
             options: TcpOptions::default(),
         }
     }
     #[must_use]
     pub fn session_options(mut self, options: TcpOptions) -> Self {
         self.options = options;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_accept_hook(
+        mut self,
+        hook: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        self.accept_hook = Some(Box::new(hook));
         self
     }
 }
@@ -189,6 +209,8 @@ pub(crate) enum PreparedListener {
         observation: super::observation::Observation,
         bound: BoundListener,
         listener: TcpListener,
+        #[cfg(test)]
+        accept_hook: Option<TcpAcceptHook>,
         options: TcpOptions,
         ingress: super::ingress::ApplicationIngress,
         roles: Option<std::sync::Arc<super::dispatch::DispatchRoles>>,
