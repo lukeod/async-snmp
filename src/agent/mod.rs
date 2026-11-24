@@ -212,7 +212,6 @@ use crate::pdu::NotificationPdu;
 use crate::pdu::{Pdu, PduBody, PduType, ResponsePdu};
 use crate::transport::framing::BufferBudget;
 use crate::transport::listener::PreparedListener;
-use crate::transport::normalize_udp_target;
 #[cfg(test)]
 use crate::transport::udp_error::UdpRecvErrorBackoff;
 #[cfg(test)]
@@ -1486,15 +1485,15 @@ impl AgentBuilder {
                         .boxed());
                     };
                     shared_sink_listeners.insert(listener);
-                    let dest = resolve_notification_destination(
+                    let peer = resolve_udp_sink_handle(
                         sink.target.expect("validated UDP target"),
-                        endpoint.local_addr(),
+                        endpoint,
                         &construction,
                         index,
                         &mut resolve_host,
                     )
                     .await?;
-                    crate::BuiltinTransport::from(endpoint.handle(dest)?)
+                    crate::BuiltinTransport::from(peer)
                 }
                 NotificationTarget::Udp {
                     endpoint: builder, ..
@@ -1508,15 +1507,14 @@ impl AgentBuilder {
                         )
                         .await?
                         .into_parts();
-                    let dest = resolve_notification_destination(
+                    let peer = resolve_udp_sink_handle(
                         sink.target.expect("validated UDP target"),
-                        endpoint.local_addr(),
+                        &endpoint,
                         &construction,
                         index,
                         &mut resolve_host,
                     )
                     .await?;
-                    let peer = endpoint.handle(dest)?;
                     listeners.push(PreparedListener::Udp {
                         bound: crate::BoundListener {
                             endpoint_id: endpoint.endpoint_id(),
@@ -1988,19 +1986,19 @@ impl AgentConstructionDeadline {
     }
 }
 
-async fn resolve_notification_destination<R, F>(
+async fn resolve_udp_sink_handle<R, F>(
     target: TrapSinkTarget,
-    local: SocketAddr,
+    endpoint: &crate::UdpEndpoint,
     construction: &AgentConstructionDeadline,
     index: usize,
     resolve: &mut R,
-) -> Result<SocketAddr>
+) -> Result<crate::UdpHandle>
 where
     R: FnMut(String, u16) -> F,
     F: Future<Output = Result<Vec<SocketAddr>>>,
 {
     match target {
-        TrapSinkTarget::Address(address) => normalize_udp_target(local, address),
+        TrapSinkTarget::Address(address) => endpoint.handle(address),
         TrapSinkTarget::HostPort {
             original,
             host,
@@ -2014,7 +2012,19 @@ where
                     resolve(host, port),
                 )
                 .await?;
-            addresses.into_iter().find_map(|address| normalize_udp_target(local, address).ok()).ok_or_else(|| Error::Config(format!("no address resolved for notification sink '{original}' is compatible with selected endpoint {local}").into()).boxed())
+            addresses
+                .into_iter()
+                .find_map(|address| endpoint.handle(address).ok())
+                .ok_or_else(|| {
+                    Error::Config(
+                        format!(
+                            "no address resolved for notification sink '{original}' is compatible with selected endpoint {}",
+                            endpoint.local_addr()
+                        )
+                        .into(),
+                    )
+                    .boxed()
+                })
         }
     }
 }
@@ -7603,7 +7613,7 @@ mod tests {
         let Some(TrapSinkTarget::Address(address)) = target else {
             panic!("numeric destination must remain an address");
         };
-        normalize_udp_target(bind.parse().unwrap(), *address)
+        crate::transport::normalize_udp_target(bind.parse().unwrap(), *address)
     }
 
     #[test]
@@ -7725,7 +7735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolved_trap_sink_uses_first_normalizable_candidate_in_order() {
+    async fn resolved_trap_sink_uses_first_compatible_candidate_in_order() {
         let incompatible: SocketAddr = "[2001:db8::1]:1161".parse().unwrap();
         let first_compatible: SocketAddr = "[::ffff:192.0.2.2]:1162".parse().unwrap();
         let later_compatible: SocketAddr = "192.0.2.3:1163".parse().unwrap();
@@ -7749,6 +7759,65 @@ mod tests {
             "[::ffff:192.0.2.3]:1163".parse().unwrap(),
             "IPv6 binds must retain resolver order even when a later native IPv6 candidate exists"
         );
+    }
+
+    #[tokio::test]
+    async fn ipv6_only_udp_sinks_skip_ipv4_dns_candidates() {
+        let ipv6_only_socket = || {
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            socket.set_only_v6(true).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            socket
+                .bind(&"[::1]:0".parse::<SocketAddr>().unwrap().into())
+                .unwrap();
+            UdpSocket::from_std(socket.into()).unwrap()
+        };
+        let shared = ipv6_only_socket();
+        let dedicated = ipv6_only_socket();
+        let local_addresses = [
+            shared.local_addr().unwrap(),
+            dedicated.local_addr().unwrap(),
+        ];
+        let ipv6_target = "[::1]:162".parse::<SocketAddr>().unwrap();
+        let agent = Agent::builder()
+            .listener(crate::ListenerSource::udp_socket(shared))
+            .notification_sink(
+                NotificationSinkId::new("shared").unwrap(),
+                crate::NotificationTarget::shared_udp(0, "sink.example:162"),
+                crate::Auth::v2c("public"),
+            )
+            .notification_sink(
+                NotificationSinkId::new("dedicated").unwrap(),
+                crate::NotificationTarget::udp(
+                    crate::UdpEndpoint::builder().from_socket(dedicated),
+                    "sink.example:162",
+                ),
+                crate::Auth::v2c("public"),
+            )
+            .build_with_dependencies(
+                |_, _| async { panic!("the agent must use its supplied socket") },
+                |host, port| async move {
+                    assert_eq!(host, "sink.example");
+                    assert_eq!(port, 162);
+                    Ok(vec!["127.0.0.1:162".parse().unwrap(), ipv6_target])
+                },
+                || Ok(Bytes::from_static(b"generated-engine")),
+                || panic!("privacy salt must not be created"),
+            )
+            .await
+            .unwrap();
+
+        let sinks: Vec<_> = agent.notification_sinks().collect();
+        assert_eq!(sinks.len(), local_addresses.len());
+        for (sink, addr) in sinks.into_iter().zip(local_addresses) {
+            assert_eq!(sink.local_addr(), addr);
+            assert_eq!(sink.dest(), ipv6_target);
+        }
     }
 
     #[tokio::test]
