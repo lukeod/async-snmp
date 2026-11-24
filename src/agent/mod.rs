@@ -636,7 +636,8 @@ struct ValidatedAgentBuilder {
 }
 
 impl AgentBuilder {
-    /// Enable client exchanges on prepared UDP endpoints and TCP sessions (default false).
+    /// Enable client exchanges on all configured listeners and sessions (default false).
+    /// A shared UDP notification sink enables exchanges on its selected listener.
     /// The existing endpoint runner remains the sole socket reader.
     #[must_use]
     pub fn client_exchanges(mut self, enabled: bool) -> Self {
@@ -1466,12 +1467,11 @@ impl AgentBuilder {
             }
         }
         let shared_listener_count = listeners.len();
-        let mut shared_sink_exchanges = false;
+        let mut shared_sink_listeners = HashSet::new();
         let mut trap_sinks = Vec::with_capacity(config.trap_sinks.len());
         for (index, sink) in config.trap_sinks.into_iter().enumerate() {
             let peer = match sink.transport {
                 NotificationTarget::SharedUdp { listener, .. } => {
-                    shared_sink_exchanges = true;
                     let Some(crate::transport::listener::PreparedListener::Udp {
                         endpoint, ..
                     }) = listeners
@@ -1483,6 +1483,7 @@ impl AgentBuilder {
                         )
                         .boxed());
                     };
+                    shared_sink_listeners.insert(listener);
                     let dest = resolve_notification_destination(
                         sink.target.expect("validated UDP target"),
                         endpoint.local_addr(),
@@ -1659,13 +1660,23 @@ impl AgentBuilder {
                     .as_ref()
                     .map(|(processor, _)| processor.clone()),
                 inner.security_context.clone(),
-                config.client_exchanges || shared_sink_exchanges,
+                config.client_exchanges,
                 notification_role
                     .as_ref()
                     .map_or(64, |(processor, _)| processor.processing_limit()),
             ));
-            for listener in listeners.iter_mut().take(shared_listener_count) {
-                listener.configure_dispatch(roles.clone());
+            let shared_sink_roles = if config.client_exchanges || shared_sink_listeners.is_empty() {
+                roles.clone()
+            } else {
+                Arc::new(roles.with_client_exchanges())
+            };
+            for (index, listener) in listeners.iter_mut().take(shared_listener_count).enumerate() {
+                let listener_roles = if shared_sink_listeners.contains(&index) {
+                    &shared_sink_roles
+                } else {
+                    &roles
+                };
+                listener.configure_dispatch(listener_roles.clone());
             }
         }
         let mut runner = AgentRunner::new(inner, network, listeners, receiver);

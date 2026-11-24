@@ -24,16 +24,17 @@ use std::{
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+#[derive(Clone)]
 pub(crate) struct DispatchRoles {
     pub(crate) commands: Option<ApplicationIngress>,
     pub(crate) notifications: Option<crate::notification::NotificationRole>,
     pub(crate) security_context: UsmSecurityContext,
-    pub(crate) client_exchanges: bool,
+    client_exchanges: bool,
     application: Arc<Semaphore>,
     exchanges: Arc<Semaphore>,
     application_bytes: Arc<Semaphore>,
     exchange_bytes: Arc<Semaphore>,
-    peer_exchange_bytes: Mutex<HashMap<SocketAddr, Weak<Semaphore>>>,
+    peer_exchange_bytes: Arc<Mutex<HashMap<SocketAddr, Weak<Semaphore>>>>,
 }
 impl DispatchRoles {
     pub(crate) fn new(
@@ -56,7 +57,15 @@ impl DispatchRoles {
                     .min(4 * 1024 * 1024),
             )),
             exchange_bytes: Arc::new(Semaphore::new(4 * 1024 * 1024)),
-            peer_exchange_bytes: Mutex::new(HashMap::new()),
+            peer_exchange_bytes: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+    /// Enable exchanges on selected listeners while retaining the shared budgets.
+    #[cfg(feature = "agent")]
+    pub(crate) fn with_client_exchanges(&self) -> Self {
+        Self {
+            client_exchanges: true,
+            ..self.clone()
         }
     }
     pub(crate) fn validate_registration(&self, registration: &RequestRegistration) -> Result<()> {

@@ -515,6 +515,68 @@ async fn inbound_only_queue_pause_excludes_progress_deadline_and_times_out_separ
 }
 
 #[tokio::test]
+async fn shared_udp_sink_enables_exchanges_only_on_its_listener() {
+    let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
+    let destination = receiver.bound_addresses()[0].local_addr;
+    let mut service = agent(b"udp-sink-exchanges")
+        .client_exchanges(false)
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .notification_sink(
+            crate::NotificationSinkId::new("selected").unwrap(),
+            crate::NotificationTarget::shared_udp(2, destination.to_string()),
+            Auth::v2c("public"),
+        )
+        .inform_retry(Retry::none())
+        .inform_timeout(Duration::from_secs(2))
+        .notifications(NotificationReceiver::builder().queue_capacity(1))
+        .spawn()
+        .await
+        .unwrap();
+    let mut events = service.take_notifications().unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[1].local_addr)
+        .await
+        .unwrap();
+
+    let inform = community(crate::Pdu::inform_request(1, 1, &trap(), vec![]));
+    stream.write_all(&inform).await.unwrap();
+    read(&mut stream).await;
+    stream.write_all(&inform).await.unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(70), stream.read(&mut [0]))
+            .await
+            .is_err(),
+        "the second TCP Inform should wait for queue capacity"
+    );
+
+    let outcome = service.send_inform(&trap(), 1, vec![]).await;
+    assert!(outcome.all_succeeded(), "{outcome:?}");
+
+    events.recv().await.unwrap();
+    read(&mut stream).await;
+    events.recv().await.unwrap();
+
+    let unrelated = service
+        .udp_endpoint(service.bound_addresses()[0].endpoint_id)
+        .unwrap()
+        .handle(destination)
+        .unwrap();
+    let error = unrelated
+        .request_with(
+            community(crate::Pdu::get_request(2, &[oid()])),
+            registration(2),
+            |_| Ok(Candidate::Accept(())),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error.exchange_source(), crate::Error::Config(_)));
+
+    service.shutdown().await.unwrap();
+    receiver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn selected_session_controls_retain_root_lifetime_without_driver_cycle() {
     let service = agent(b"tcp-lease")
         .listener(ListenerSource::tcp("127.0.0.1:0"))
