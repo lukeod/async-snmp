@@ -42,7 +42,7 @@ impl Delivery {
 }
 
 #[derive(Default)]
-pub(crate) struct NotificationAdmission {
+pub(super) struct NotificationAdmission {
     failure: Option<NotificationDisposition>,
     permit: Option<OwnedPermit<ReceivedNotification>>,
     pub(super) pending_permit: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -77,15 +77,11 @@ impl NotificationAdmission {
             }
         }
     }
-    pub(super) fn reserve_inform(
-        &mut self,
-        inner: &ReceiverInner,
-        kind: NotificationPduClass,
-    ) -> bool {
+    pub(super) fn reserve_delivery(&mut self, inner: &ReceiverInner, inform: bool) -> bool {
         if !self.reserve(&inner.delivery) {
             return false;
         }
-        if kind != NotificationPduClass::Inform
+        if !inform
             || inner.acknowledgement_mode == InformAcknowledgementMode::Automatic
             || self.pending_permit.is_some()
         {
@@ -522,11 +518,63 @@ pub(crate) enum NotificationDisposition {
     Overloaded,
 }
 
-impl NotificationRole {
-    pub(crate) fn engine_id(&self) -> &[u8] {
-        &self.inner.engine_id
+struct ActiveNotification(NotificationRole);
+impl Drop for ActiveNotification {
+    fn drop(&mut self) {
+        self.0.inner.active.fetch_sub(1, Ordering::AcqRel);
+        self.0.inner.idle.notify_waiters();
     }
+}
 
+pub(crate) struct NotificationWork {
+    active: ActiveNotification,
+    info: crate::ReceivedMessageInfo,
+    observation: crate::transport::observation::Observation,
+    result: Result<(NotificationProcessResult, crate::transport::ReplyRoute)>,
+    pub(super) admission: NotificationAdmission,
+}
+impl NotificationWork {
+    pub(crate) async fn run(mut self) -> NotificationDisposition {
+        let source = self.info.peer_addr();
+        let result = match self.result {
+            Ok((result, route)) => {
+                self.active
+                    .0
+                    .respond(result, route, source, &mut self.admission)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        let disposition = match result {
+            Ok(Some(notification)) => {
+                self.admission.publish(notification);
+                NotificationDisposition::Delivered
+            }
+            Ok(None) => self
+                .admission
+                .failure
+                .unwrap_or(NotificationDisposition::Rejected),
+            Err(error) => {
+                tracing::debug!(target: "async_snmp::notification", %source, %error, "notification rejected before admission");
+                NotificationDisposition::Rejected
+            }
+        };
+        self.observation.disposition(
+            self.info,
+            match disposition {
+                NotificationDisposition::Delivered => {
+                    crate::MessageDisposition::NotificationDelivered
+                }
+                NotificationDisposition::Disabled => crate::MessageDisposition::Disabled,
+                NotificationDisposition::Overloaded => crate::MessageDisposition::Overloaded,
+                NotificationDisposition::Rejected => crate::MessageDisposition::Rejected,
+            },
+        );
+        disposition
+    }
+}
+
+impl NotificationRole {
     pub(crate) fn has_pending_worker(&self) -> bool {
         self.inner.acknowledgement_mode == InformAcknowledgementMode::ApplicationControlled
     }
@@ -561,10 +609,7 @@ impl NotificationRole {
     pub(crate) async fn admission_closed(&self) {
         self.inner.delivery.closed.cancelled().await;
     }
-    pub(crate) async fn reserve_tcp(
-        &self,
-        fail_fast: bool,
-    ) -> Result<Option<NotificationAdmission>> {
+    async fn reserve_tcp(&self, fail_fast: bool) -> Result<Option<NotificationAdmission>> {
         let delivery = &self.inner.delivery;
         let sender = {
             let state = delivery.state.lock().unwrap();
@@ -605,59 +650,61 @@ impl NotificationRole {
         &self,
         message: crate::transport::ReceivedMessage,
     ) -> NotificationDisposition {
-        if !self.is_enabled() {
-            message.observe(crate::MessageDisposition::Disabled);
-            return NotificationDisposition::Disabled;
+        match self.prepare(message) {
+            Some(work) => work.run().await,
+            None => NotificationDisposition::Disabled,
         }
-        self.process_admitted(message, NotificationAdmission::default())
-            .await
     }
-    pub(crate) fn process_admitted(
+
+    pub(crate) async fn admit_tcp(
         &self,
         message: crate::transport::ReceivedMessage,
-        mut admission: NotificationAdmission,
-    ) -> impl std::future::Future<Output = NotificationDisposition> + Send + 'static {
-        struct Active(Arc<ReceiverInner>);
-        impl Drop for Active {
-            fn drop(&mut self) {
-                self.0.active.fetch_sub(1, Ordering::AcqRel);
-                self.0.idle.notify_waiters();
-            }
-        }
-        self.inner.active.fetch_add(1, Ordering::AcqRel);
-        let active = Active(self.inner.clone());
-        let processor = self.clone();
-        async move {
-            let _active = active;
-            let source = message.info.peer_addr();
-            let info = message.info;
-            let observation = message.reply.observation().clone();
-            let disposition = match processor.parse_and_respond(message, &mut admission).await {
-                Ok(Some(notification)) => {
-                    admission.publish(notification);
-                    NotificationDisposition::Delivered
-                }
-                Ok(None) => admission
-                    .failure
-                    .unwrap_or(NotificationDisposition::Rejected),
-                Err(error) => {
-                    tracing::debug!(target: "async_snmp::notification", %source, %error, "notification rejected before admission");
-                    NotificationDisposition::Rejected
-                }
+        fail_fast: bool,
+    ) -> Result<Option<NotificationWork>> {
+        let Some(mut work) = self.prepare(message) else {
+            return Ok(None);
+        };
+        // Reports and Inform tooBig replies terminate before event delivery.
+        if matches!(work.result, Ok((NotificationProcessResult::Accepted(_), _))) {
+            let Some(admission) = self.reserve_tcp(fail_fast).await? else {
+                work.observation
+                    .disposition(work.info, crate::MessageDisposition::Disabled);
+                return Ok(None);
             };
-            observation.disposition(
-                info,
-                match disposition {
-                    NotificationDisposition::Delivered => {
-                        crate::MessageDisposition::NotificationDelivered
-                    }
-                    NotificationDisposition::Disabled => crate::MessageDisposition::Disabled,
-                    NotificationDisposition::Overloaded => crate::MessageDisposition::Overloaded,
-                    NotificationDisposition::Rejected => crate::MessageDisposition::Rejected,
-                },
-            );
-            disposition
+            work.admission = admission;
         }
+        Ok(Some(work))
+    }
+
+    pub(super) fn prepare(
+        &self,
+        message: crate::transport::ReceivedMessage,
+    ) -> Option<NotificationWork> {
+        // Register active work before shutdown can close admission and drain it.
+        let active = {
+            let state = self.inner.delivery.state.lock().unwrap();
+            if !state.open {
+                message.observe(crate::MessageDisposition::Disabled);
+                return None;
+            }
+            self.inner.active.fetch_add(1, Ordering::AcqRel);
+            ActiveNotification(self.clone())
+        };
+        let info = message.info;
+        let observation = message.reply.observation().clone();
+        let result = message.into_processing().and_then(|(input, route)| {
+            self.inner
+                .protocol
+                .process(input)
+                .map(|result| (result, route))
+        });
+        Some(NotificationWork {
+            active,
+            info,
+            observation,
+            result,
+            admission: NotificationAdmission::default(),
+        })
     }
 }
 

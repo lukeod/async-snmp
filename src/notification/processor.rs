@@ -515,15 +515,7 @@ impl NotificationProcessor {
     /// Send Reports and `tooBig` replies from the result on the incoming route.
     /// An accepted Inform carries an [`InformResponse`] for deferred encoding.
     pub fn process(&self, input: ProcessingInput) -> Result<NotificationProcessResult> {
-        self.process_admitted(input, &mut |_| true)
-    }
-
-    pub(super) fn process_admitted(
-        &self,
-        input: ProcessingInput,
-        reserve: &mut impl FnMut(super::NotificationPduClass) -> bool,
-    ) -> Result<NotificationProcessResult> {
-        let result = self.process_inner(input, reserve);
+        let result = self.process_inner(input);
         self.inner.local_engine.count_asn_parse_error(&result);
         result
     }
@@ -534,14 +526,13 @@ impl NotificationProcessor {
         info: crate::ReceivedMessageInfo,
         identity: NotificationWireIdentity,
         response: Option<InformResponse>,
-        reserve: &mut impl FnMut(super::NotificationPduClass) -> bool,
     ) -> Result<NotificationProcessResult> {
-        let pdu_class = if response.is_some() {
-            NotificationPduClass::Inform
-        } else {
-            NotificationPduClass::Trap
-        };
         if let Some(policy) = &self.inner.admission_policy {
+            let pdu_class = if response.is_some() {
+                NotificationPduClass::Inform
+            } else {
+                NotificationPduClass::Trap
+            };
             let admission =
                 NotificationAdmissionInfo::new(info, &notification, &identity, pdu_class);
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -566,9 +557,6 @@ impl NotificationProcessor {
         {
             return Ok(NotificationProcessResult::InformTooBig { response });
         }
-        if !reserve(pdu_class) {
-            return Ok(NotificationProcessResult::Rejected);
-        }
         Ok(NotificationProcessResult::Accepted(Box::new(
             ProcessedNotification {
                 notification,
@@ -579,11 +567,7 @@ impl NotificationProcessor {
         )))
     }
 
-    fn process_inner(
-        &self,
-        input: ProcessingInput,
-        reserve: &mut impl FnMut(super::NotificationPduClass) -> bool,
-    ) -> Result<NotificationProcessResult> {
+    fn process_inner(&self, input: ProcessingInput) -> Result<NotificationProcessResult> {
         let version =
             crate::message::peek_version(input.bytes().clone(), input.info().peer_addr())?;
         if version == Version::V3 {
@@ -646,7 +630,7 @@ impl NotificationProcessor {
                     };
                     let response =
                         inform.then(|| self.response(info, limits, InformRequest::V3(inbound)));
-                    self.admit_notification(notification, info, identity, response, reserve)
+                    self.admit_notification(notification, info, identity, response)
                 }
             };
         }
@@ -680,7 +664,6 @@ impl NotificationProcessor {
                     v3: None,
                 },
                 None,
-                reserve,
             ),
             CommunityPdu::Standard(pdu) if version == Version::V2c => {
                 if !matches!(pdu.pdu_type(), PduType::TrapV2 | PduType::InformRequest) {
@@ -721,7 +704,6 @@ impl NotificationProcessor {
                         v3: None,
                     },
                     response,
-                    reserve,
                 )
             }
             _ => Ok(NotificationProcessResult::Rejected),

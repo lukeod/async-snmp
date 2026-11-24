@@ -14,8 +14,9 @@ use async_snmp::{AuthoritativeEngine, RequestTransport, TransportKind};
 ))]
 use async_snmp::{Client, Retry};
 use async_snmp::{
-    InformAckOutcome, InformAcknowledgementMode, ListenerSource, NotificationAcknowledgement,
-    NotificationPdu, NotificationReceiver, PendingInformAck, Value, VarBind, Version, oid,
+    InformAckOutcome, InformAcknowledgementMode, ListenerSource, MessageDisposition,
+    NotificationAcknowledgement, NotificationPdu, NotificationReceiver, ObservationEvent,
+    PendingInformAck, TcpListenerSource, TransportObserver, Value, VarBind, Version, oid,
 };
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -49,6 +50,15 @@ fn wire_with_varbinds(id: i32, varbinds: Vec<VarBind>) -> Bytes {
     .unwrap()
     .encode()
     .unwrap()
+}
+fn oversized_wire(id: i32) -> Bytes {
+    wire_with_varbinds(
+        id,
+        vec![VarBind::new(
+            oid!(1, 3, 6, 1, 4, 1, 9, 1),
+            Value::OctetString(Bytes::from_static(&[0; 128])),
+        )],
+    )
 }
 fn pending(event: async_snmp::ReceivedNotification) -> PendingInformAck {
     let NotificationAcknowledgement::Pending(pending) = event.inform_ack else {
@@ -87,6 +97,14 @@ async fn tcp_reply(stream: &mut TcpStream) -> CommunityMessage {
     })
     .await
     .unwrap()
+}
+async fn assert_tcp_too_big(peer: &mut TcpStream, request_id: i32) {
+    let reply = tcp_reply(peer).await;
+    let pdu = reply.pdu().standard().unwrap();
+    assert_eq!(pdu.request_id(), request_id);
+    assert_eq!(pdu.error_status_enum(), async_snmp::ErrorStatus::TooBig);
+    assert_eq!(pdu.error_index(), 0);
+    assert!(pdu.varbinds().is_empty());
 }
 
 #[tokio::test]
@@ -170,15 +188,70 @@ async fn tcp_pending_saturation_preserves_session_and_drop_releases_outstanding_
 }
 
 #[tokio::test]
+async fn oversized_tcp_inform_gets_toobig_while_the_event_queue_is_full() {
+    let trap = CommunityMessage::v2c(
+        "public",
+        NotificationPdu::trap_v2(
+            Version::V2c,
+            1,
+            0,
+            &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1),
+            vec![],
+        )
+        .unwrap()
+        .into_raw(),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    let oversized = oversized_wire(2);
+    for client_exchanges in [false, true] {
+        for mode in [
+            InformAcknowledgementMode::Automatic,
+            InformAcknowledgementMode::ApplicationControlled,
+        ] {
+            let (observer, mut observations) = TransportObserver::channel(8).unwrap();
+            let mut receiver = NotificationReceiver::builder()
+                .listener(ListenerSource::Tcp(
+                    TcpListenerSource::bind("127.0.0.1:0").observer(observer),
+                ))
+                .client_exchanges(client_exchanges)
+                .acknowledgement_mode(mode)
+                .queue_capacity(1)
+                .max_message_size(wire(1).len())
+                .spawn()
+                .await
+                .unwrap();
+            let mut peer = TcpStream::connect(receiver.bound_addresses()[0].local_addr)
+                .await
+                .unwrap();
+            peer.write_all(&trap).await.unwrap();
+            tokio::time::timeout(WAIT, async {
+                while !matches!(
+                    observations.recv().await.unwrap(),
+                    ObservationEvent::Disposition {
+                        disposition: MessageDisposition::NotificationDelivered,
+                        ..
+                    }
+                ) {}
+            })
+            .await
+            .unwrap();
+
+            peer.write_all(&oversized).await.unwrap();
+            assert_tcp_too_big(&mut peer, 2).await;
+            assert_eq!(receiver.control().overload_drops(), 0);
+            assert_eq!(event(&mut receiver).await.wire_identity.request_id, Some(1));
+            receiver.shutdown().await.unwrap();
+            assert!(receiver.recv().await.is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn oversized_tcp_inform_gets_toobig_while_the_only_manual_slot_is_occupied() {
     let ordinary = wire(1);
-    let oversized = wire_with_varbinds(
-        2,
-        vec![VarBind::new(
-            oid!(1, 3, 6, 1, 4, 1, 9, 1),
-            Value::OctetString(Bytes::from_static(&[0; 128])),
-        )],
-    );
+    let oversized = oversized_wire(2);
     let mut receiver = manual()
         .listener(ListenerSource::tcp("127.0.0.1:0"))
         .queue_capacity(1)
@@ -193,12 +266,7 @@ async fn oversized_tcp_inform_gets_toobig_while_the_only_manual_slot_is_occupied
     let first = pending(event(&mut receiver).await);
 
     peer.write_all(&oversized).await.unwrap();
-    let reply = tcp_reply(&mut peer).await;
-    let pdu = reply.pdu().standard().unwrap();
-    assert_eq!(pdu.request_id(), 2);
-    assert_eq!(pdu.error_status_enum(), async_snmp::ErrorStatus::TooBig);
-    assert_eq!(pdu.error_index(), 0);
-    assert!(pdu.varbinds().is_empty());
+    assert_tcp_too_big(&mut peer, 2).await;
     assert_eq!(receiver.control().overload_drops(), 0);
 
     assert!(matches!(first.acknowledge().await, InformAckOutcome::Sent));

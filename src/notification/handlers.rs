@@ -2,23 +2,22 @@
 
 use super::{
     EncodedInformResponse, InformAckOutcome, InformAcknowledgementMode, InformResponse,
-    NotificationAcknowledgement, NotificationAdmission, NotificationProcessResult,
-    NotificationRole, ProcessedNotification, ReceivedNotification,
+    NotificationAcknowledgement, NotificationProcessResult, NotificationRole,
+    ProcessedNotification, ReceivedNotification, lifecycle::NotificationAdmission,
 };
 use crate::error::{Error, Result};
+use crate::transport::ReplyRoute;
 use crate::v3::UsmFailure;
+use std::net::SocketAddr;
 
 impl NotificationRole {
-    pub(super) async fn parse_and_respond(
+    pub(super) async fn respond(
         &self,
-        message: crate::transport::ReceivedMessage,
+        result: NotificationProcessResult,
+        route: ReplyRoute,
+        source: SocketAddr,
         admission: &mut NotificationAdmission,
     ) -> Result<Option<ReceivedNotification>> {
-        let (input, route) = message.into_processing()?;
-        let source = input.info().peer_addr();
-        let result = self.inner.protocol.process_admitted(input, &mut |kind| {
-            admission.reserve_inform(&self.inner, kind)
-        })?;
         match result {
             NotificationProcessResult::Rejected => Ok(None),
             NotificationProcessResult::InformTooBig { response } => {
@@ -49,6 +48,9 @@ impl NotificationRole {
                 Err(Error::Auth { target: source }.boxed())
             }
             NotificationProcessResult::Accepted(event) => {
+                if !admission.reserve_delivery(&self.inner, event.inform_response.is_some()) {
+                    return Ok(None);
+                }
                 let ProcessedNotification {
                     notification,
                     receive_info,
@@ -96,6 +98,18 @@ impl NotificationRole {
                 )))
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn parse_and_respond(
+        &self,
+        message: crate::transport::ReceivedMessage,
+    ) -> Result<Option<ReceivedNotification>> {
+        let (input, route) = message.into_processing()?;
+        let source = input.info().peer_addr();
+        let result = self.inner.protocol.process(input)?;
+        self.respond(result, route, source, &mut NotificationAdmission::default())
+            .await
     }
 
     pub(super) async fn complete_response(
@@ -161,11 +175,8 @@ impl NotificationRole {
         data: bytes::Bytes,
         source: std::net::SocketAddr,
     ) -> Result<Option<ReceivedNotification>> {
-        self.parse_and_respond(
-            self.test_message(data, source, None),
-            &mut NotificationAdmission::default(),
-        )
-        .await
+        self.parse_and_respond(self.test_message(data, source, None))
+            .await
     }
 
     #[cfg(test)]
@@ -184,11 +195,8 @@ impl NotificationRole {
         source: std::net::SocketAddr,
         destination: Option<crate::udp_responder::DestinationMetadata>,
     ) -> Result<Option<ReceivedNotification>> {
-        self.parse_and_respond(
-            self.test_message(data, source, destination),
-            &mut NotificationAdmission::default(),
-        )
-        .await
+        self.parse_and_respond(self.test_message(data, source, destination))
+            .await
     }
 
     #[cfg(test)]
@@ -207,10 +215,7 @@ impl NotificationRole {
         source: std::net::SocketAddr,
         destination: Option<crate::udp_responder::DestinationMetadata>,
     ) -> Result<Option<ReceivedNotification>> {
-        self.parse_and_respond(
-            self.test_message(data, source, destination),
-            &mut NotificationAdmission::default(),
-        )
-        .await
+        self.parse_and_respond(self.test_message(data, source, destination))
+            .await
     }
 }

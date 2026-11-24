@@ -330,12 +330,6 @@ impl DispatchRoles {
             }
             return Ok(());
         }
-        let needs_delivery = matches!(
-            class,
-            Ok(Some(
-                PduType::TrapV1 | PduType::TrapV2 | PduType::InformRequest
-            ))
-        );
         let commands = self.commands.as_ref().filter(|role| role.is_enabled());
         let notification = match class {
             Ok(Some(PduType::TrapV1 | PduType::TrapV2 | PduType::InformRequest)) => {
@@ -362,27 +356,12 @@ impl DispatchRoles {
                     } else {
                         None
                     };
-                    let foreign_inform = class.as_ref().is_ok_and(|class| {
-                        *class == Some(PduType::InformRequest)
-                            && message.prepared.as_ref().is_some_and(|prepared| {
-                                prepared.proves_foreign_inform(processor.engine_id())
-                            })
-                    });
-                    let admission = if needs_delivery && !foreign_inform {
-                        let Some(admission) = processor.reserve_tcp(self.client_exchanges).await?
-                        else {
-                            message.observe(super::MessageDisposition::Disabled);
-                            return Ok::<(), Box<Error>>(());
-                        };
-                        admission
-                    } else {
-                        crate::notification::NotificationAdmission::default()
-                    };
-                    let work = processor.process_admitted(message, admission);
-                    tasks.spawn(async move {
-                        let (_slot, _session_slot, _buffers) = (slot, session_slot, buffers);
-                        work.await;
-                    });
+                    if let Some(work) = processor.admit_tcp(message, self.client_exchanges).await? {
+                        tasks.spawn(async move {
+                            let (_slot, _session_slot, _buffers) = (slot, session_slot, buffers);
+                            work.run().await;
+                        });
+                    }
                     Ok::<(), Box<Error>>(())
                 };
                 tokio::select! { biased;

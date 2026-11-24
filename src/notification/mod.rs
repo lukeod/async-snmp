@@ -337,8 +337,8 @@ pub use processor::{
 #[cfg(test)]
 mod lifecycle_tests;
 mod varbind;
+pub(crate) use lifecycle::RunnerCleanup;
 use lifecycle::{Delivery, NotificationLease};
-pub(crate) use lifecycle::{NotificationAdmission, RunnerCleanup};
 pub use lifecycle::{
     NotificationControl, NotificationHealth, NotificationRunner, NotificationStatus,
     PreparedNotificationReceiver, RunningNotificationReceiver,

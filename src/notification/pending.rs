@@ -445,9 +445,7 @@ impl NotificationRole {
 mod tests {
     use super::*;
     use crate::message::CommunityMessage;
-    use crate::notification::{
-        NotificationAdmission, NotificationReceiver, NotificationReceiverBuilder,
-    };
+    use crate::notification::{NotificationReceiver, NotificationReceiverBuilder};
     use crate::{NotificationPdu, Value, VarBind, Version, oid};
     use bytes::Bytes;
     use std::sync::atomic::AtomicBool;
@@ -677,13 +675,13 @@ mod tests {
     async fn shutdown_racing_with_pending_reservation_is_disabled_without_overload() {
         let (receiver, _runner) = manual().prepare().await.unwrap().into_parts();
         let role = receiver.processor();
-        let mut admission = NotificationAdmission::default();
-        assert!(admission.reserve(&role.inner.delivery));
-        role.inner.pending.shutdown();
         let data = inform(Arc::new(AtomicBool::new(false)));
         let message = role.test_message(data, "127.0.0.1:9999".parse().unwrap(), None);
+        let mut work = role.prepare(message).unwrap();
+        assert!(work.admission.reserve(&role.inner.delivery));
+        role.inner.pending.shutdown();
         assert_eq!(
-            role.process_admitted(message, admission).await,
+            work.run().await,
             super::super::lifecycle::NotificationDisposition::Disabled
         );
         assert_eq!(receiver.control().overload_drops(), 0);

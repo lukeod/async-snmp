@@ -130,35 +130,6 @@ impl PreparedV3 {
             .and_then(|crypto| crypto.plaintext.as_ref())
             .map_or(0, Bytes::len)
     }
-
-    /// Confirm that an Inform found by dispatch cannot be delivered locally.
-    pub(crate) fn proves_foreign_inform(&self, local_engine_id: &[u8]) -> bool {
-        let Some(usm) = self.usm.as_ref().map(|decoded| &decoded.value) else {
-            return false;
-        };
-        if usm.engine_id.as_ref() == local_engine_id {
-            return false;
-        }
-        if self
-            .raw
-            .as_ref()
-            .is_some_and(|raw| matches!(raw.value.msg_data, RawMsgData::Plaintext { .. }))
-        {
-            return true;
-        }
-        // Dispatch can also classify under a client exchange's keys. Only
-        // evidence from the selected application user can decide admission.
-        self.crypto.as_ref().is_some_and(|crypto| {
-            crypto
-                .prefix
-                .is_some_and(|prefix| prefix.kind == PduType::InformRequest)
-                && self
-                    .selected_users
-                    .as_ref()
-                    .and_then(|users| users.lookup(&usm.engine_id, &usm.username))
-                    .is_some_and(|user| crypto.matches_user(user, &usm.engine_id))
-        })
-    }
 }
 impl PreparedCrypto {
     /// Verify and decrypt for routing without committing USM state or counters.
