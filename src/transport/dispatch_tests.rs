@@ -683,12 +683,14 @@ async fn failed_client_security_never_reenters_application_or_publishes_reports(
 
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
-async fn ambiguous_usm_credentials_are_rejected_before_outbound_send() {
-    let mut service = secured_agent(b"ambiguous-credentials")
+async fn ambiguous_usm_credentials_are_rejected_after_discovery_before_authenticated_send() {
+    use crate::message::V3Message;
+    use crate::v3::{UsmSecurityParams, encode::encode_v3_report};
+
+    let service = secured_agent(b"ambiguous-credentials")
         .spawn()
         .await
         .unwrap();
-    let _notifications = service.take_notifications();
     let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let bad = crate::UsmConfig::new("priv")
         .auth_priv(
@@ -699,10 +701,42 @@ async fn ambiguous_usm_credentials_are_rejected_before_outbound_send() {
         )
         .unwrap();
     let client = client(&endpoint(&service), peer.local_addr().unwrap(), bad.into());
-    assert!(matches!(
-        *client.get(&get_oid()).await.unwrap_err(),
-        crate::Error::Config(_)
-    ));
+    let exchange = tokio::spawn(async move { client.get(&get_oid()).await.unwrap_err() });
+    let (bytes, source) = receive(&peer).await;
+    let discovery = V3Message::decode(bytes.clone(), crate::DecodeConfig::DEFAULT)
+        .unwrap()
+        .value;
+    let capacity = discovery.global_data().msg_max_size();
+    assert_eq!(
+        bytes,
+        V3Message::discovery_request(discovery.msg_id(), capacity)
+            .unwrap()
+            .encode()
+            .unwrap()
+    );
+    let report = encode_v3_report(
+        discovery.msg_id(),
+        None,
+        capacity,
+        UsmSecurityParams::new("ambiguous-remote-engine", 1, 0, "").unwrap(),
+        crate::v3::report_oids::unknown_engine_ids(),
+        1,
+        None,
+        source,
+    )
+    .unwrap();
+    peer.send_to(&report, source).await.unwrap();
+    let error = exchange.await.unwrap();
+    assert_eq!(error.kind(), crate::ErrorKind::Config);
+    let [record] = error
+        .response_metadata()
+        .unwrap()
+        .received_messages
+        .as_slice()
+    else {
+        panic!("expected only the discovery Report");
+    };
+    assert_eq!(record.pdu_type, crate::PduType::Report);
     assert!(
         tokio::time::timeout(Duration::from_millis(30), peer.recv(&mut [0; 2048]))
             .await

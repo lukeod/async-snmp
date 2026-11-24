@@ -66,12 +66,13 @@ impl DispatchRoles {
             )
             .boxed());
         }
-        let users = self.security_context.snapshot();
+        // Discovery has no authoritative engine ID for selecting a USM user.
         if let Some(context) = &registration.classification_security
-            && let Some(user) = users.lookup(
-                context.engine_id.as_deref().unwrap_or(&[]),
-                context.usm.username(),
-            )
+            && let Some(engine_id) = &context.engine_id
+            && let Some(user) = self
+                .security_context
+                .snapshot()
+                .lookup(engine_id, context.usm.username())
             && !user.supports_outbound_credentials(&context.usm)?
         {
             return Err(Error::Config("shared endpoint USM identity has conflicting client credentials; use a distinct identity or endpoint".into()).boxed());

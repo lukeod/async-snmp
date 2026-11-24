@@ -718,6 +718,59 @@ async fn v3_bidirectional_commands_traps_and_informs_use_one_accepted_connected_
 
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
+async fn shared_discovery_allows_exact_usm_bindings_with_conflicting_defaults() {
+    const REMOTE_ENGINE: &[u8] = b"shared-discovery-remote";
+    let remote = secured_agent(REMOTE_ENGINE)
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let user = |password: &[u8]| {
+        crate::UsmUser::new("auth")
+            .auth(crate::AuthProtocol::Sha256, password)
+            .unwrap()
+    };
+    let context = crate::UsmSecurityContext::new([
+        crate::UsmUserEntry::new(user(b"different-auth-password")),
+        crate::UsmUserEntry::for_engine(REMOTE_ENGINE, user(b"shared-auth-password")).unwrap(),
+    ])
+    .unwrap();
+    let local = agent(b"shared-discovery-local")
+        .security_context(context)
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .session(TcpTransport::builder().target(remote.bound_addresses()[1].local_addr))
+        .spawn()
+        .await
+        .unwrap();
+    let udp = local
+        .udp_endpoint(local.bound_addresses()[0].endpoint_id)
+        .unwrap()
+        .handle(remote.bound_addresses()[0].local_addr)
+        .unwrap();
+    let udp = ClientBuilder::new(security("auth"))
+        .retry(Retry::none())
+        .request_timeout(Duration::from_secs(2))
+        .build_with_transport(udp)
+        .unwrap();
+    let tcp = client(local.tcp_sessions()[0].clone(), security("auth").into());
+    let oid = oid();
+    let (udp, tcp) = tokio::join!(udp.get(&oid), tcp.get(&oid));
+    for response in [udp.unwrap(), tcp.unwrap()] {
+        assert_eq!(
+            response.varbinds[0].value,
+            Value::OctetString(Bytes::from_static(REMOTE_ENGINE))
+        );
+        let history = &response.metadata.received_messages;
+        assert_eq!(history.first().unwrap().pdu_type, crate::PduType::Report);
+        assert_eq!(history.last().unwrap().pdu_type, crate::PduType::Response);
+    }
+    local.shutdown().await.unwrap();
+    remote.shutdown().await.unwrap();
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
 async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_reports() {
     let mut collector = NotificationReceiver::builder()
         .client_exchanges(true)
