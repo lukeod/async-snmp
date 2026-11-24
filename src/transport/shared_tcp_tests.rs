@@ -930,15 +930,18 @@ async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_
         .send_inform(&trap(), 1, vec![])
         .await
         .unwrap();
-    // Discovery is report-only and needs no delivery capacity. Explicit discovery
-    // is exercised by a fresh v3 client GET, which receives the Report before its
-    // unsupported command times out, leaving the shared session alive.
-    let poller = ClientBuilder::new(security("priv"))
-        .request_timeout(Duration::from_millis(80))
-        .retry(Retry::none())
-        .build_with_transport(session.clone())
-        .unwrap();
-    assert!(poller.get(&oid()).await.is_err());
+    // The acknowledged Inform occupies the only delivery slot. Discovery
+    // must still complete on this session.
+    let poller = client(session.clone(), security("priv").into());
+    let discovery = poller
+        .rediscover_engine_with_metadata()
+        .await
+        .expect("discovery must succeed with the notification queue full");
+    assert_eq!(discovery.received_messages.len(), 1);
+    assert_eq!(
+        discovery.received_messages[0].pdu_type,
+        crate::PduType::Report
+    );
     assert!(!session.control().is_shutdown());
 
     // An encrypted stale Inform also needs no delivery slot. Read the Report
@@ -970,7 +973,11 @@ async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_
         crate::v3::ReportStatus::UnknownEngineId { .. }
     ));
 
-    collector.recv().await.unwrap();
+    let queued = collector.recv().await.unwrap();
+    assert!(matches!(
+        queued.notification,
+        crate::Notification::InformV2c { .. }
+    ));
     collector.shutdown().await.unwrap();
 }
 
