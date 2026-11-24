@@ -70,8 +70,9 @@ impl PendingInformAck {
     /// Submit one bounded response attempt and await its local outcome.
     ///
     /// On first poll the attempt is committed to the supervised service worker.
-    /// Dropping this wait future after submission does not cancel that attempt;
-    /// the worker finishes under its absolute deadline or service shutdown.
+    /// The attempt continues if its waiter is dropped after submission.
+    /// The worker applies the original deadline and cancels pending completion
+    /// attempts at shutdown.
     /// Stream writes retain their existing finish-frame-or-close semantics.
     /// Encoding uses the original validated credentials and current engine time.
     pub async fn acknowledge(mut self) -> InformAckOutcome {

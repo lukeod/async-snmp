@@ -725,6 +725,7 @@ impl Error {
 
     /// Return metadata retained from accepted responses in this operation.
     ///
+    /// Call this on the original error to include metadata from exchange wrappers.
     /// Protocol errors and response-shape failures expose their native
     /// metadata through the same accessor. Errors that occurred before any
     /// response was accepted return `None`.
@@ -746,9 +747,9 @@ impl Error {
     /// Return the underlying failure carried by an exchange metadata or shared
     /// operation wrapper.
     ///
-    /// For unwrapped errors, this returns `self`. Prefer this accessor or
-    /// [`Self::kind`] when matching failures that may be shared by concurrent
-    /// participants.
+    /// For unwrapped errors, this returns `self`. Use this accessor or
+    /// [`Self::kind`] to match the failure. Read response metadata from the
+    /// original error with [`Self::response_metadata`].
     #[must_use]
     pub fn exchange_source(&self) -> &Error {
         match self {

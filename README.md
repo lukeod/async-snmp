@@ -227,9 +227,10 @@ hold weak references; expiry frees service-owned request/key memory and permits
 even if the application retains a token. First polling `acknowledge()` commits a
 supervised attempt that continues under its deadline if its waiter is abandoned.
 It uses the original UDP destination/source route or exact TCP session, without
-replacement. `receiver.close()` stops admission while allowing admitted tokens
-until their deadlines as the runner continues; consumer drop, control/root
-shutdown or runner abort invalidates pending work. Pending-slot saturation rejects
+replacement. `receiver.close()` stops admission. Admitted tokens remain usable
+until their deadlines while the runner stays active. Graceful shutdown drains
+admitted automatic response attempts. Shutdown, consumer drop and runner abort
+invalidate pending manual acknowledgements. Pending-slot saturation rejects
 new Informs without closing TCP or blocking traps and shared roles. Delivery-queue
 overload keeps its configured transport policy.
 

@@ -84,7 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cancellation-safe single-consumer queue returning `Option`; receivers are no
   longer cloneable. Controls expose shutdown, terminal status and coalesced
   authoritative persistence health. Deliverable Informs reserve queue capacity
-  before ordinary acknowledgement. Closure drains admitted events.
+  before ordinary acknowledgement. Shutdown invalidates pending manual
+  acknowledgements and drains admitted automatic response attempts. Consumer
+  `close()` stops new admission. Admitted manual tokens remain usable until
+  their deadlines while the runner stays active.
   `RunningNotificationReceiver` provides `recv()` and `close()` directly and
   dereferences to the consumer immutably. Its `task()` returns an optional
   handle, which is absent once `join()` or `shutdown()` finishes.
@@ -124,8 +127,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `receive_info.peer_addr()` for the sender and `receive_info.received_len()` for
   the complete encoded SNMP input length, including accepted UDP suffixes.
 - `RequestContext::receive_info()` exposes the receiving endpoint and original
-  input length. Client response metadata retains received-message provenance
-  internally, including on errors through `Error::exchange_source()`.
+  input length. Read retained received-message history through
+  `Error::response_metadata()` on the original error. Use
+  `Error::exchange_source()` to match the underlying failure.
   `Error::ResponseShape::response` is boxed to keep the error representation bounded.
 
 

@@ -45,9 +45,10 @@
 //! destination/source route or exact TCP session; closed routes are not replaced.
 //! Protocol Reports are independent of application completion.
 //!
-//! `close()` stops admission and permits admitted manual tokens until their
-//! deadlines while the runner remains driven. Consumer drop or control/root
-//! shutdown invalidates pending work without waiting for application-held tokens.
+//! [`NotificationReceiver::close`] stops admission. Admitted manual tokens
+//! remain usable until their deadlines while the runner stays active.
+//! Graceful shutdown drains admitted automatic response attempts. Shutdown,
+//! consumer drop and runner abort invalidate pending manual acknowledgements.
 //! Cancelling `recv()` leaves the event queue intact. Dropping the consumer or
 //! aborting the runner can lose volatile events, including acknowledged events.
 //! Acknowledgement is not a durability guarantee. Queue EOF does not report the

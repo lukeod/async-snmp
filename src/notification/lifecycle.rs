@@ -215,8 +215,11 @@ pub struct NotificationControl {
     _lease: Arc<NotificationLease>,
 }
 impl NotificationControl {
-    /// Request standalone-service or attached-role shutdown. Admitted work is drained while
-    /// the runner is driven; queued events need not be consumed for it to finish.
+    /// Request standalone-service or attached-role shutdown.
+    ///
+    /// This invalidates pending manual acknowledgements. A driven runner
+    /// drains admitted automatic response attempts. Queued events remain
+    /// available to the consumer.
     pub fn request_shutdown(&self) {
         self.inner.delivery.close_admission();
         self.inner.pending.shutdown();
@@ -245,7 +248,8 @@ impl NotificationControl {
         }
         self.state.complete.cancelled().await;
     }
-    /// Request shutdown and wait under the same runner-start precondition.
+    /// [`Request shutdown`](Self::request_shutdown) and
+    /// [`wait for termination`](Self::wait_closed).
     pub async fn shutdown(&self) {
         self.request_shutdown();
         self.wait_closed().await;
@@ -305,17 +309,20 @@ impl NotificationReceiver {
             ._service_lease = Some(lease);
         self.state.attached.store(true, Ordering::Release);
     }
-    /// Receive one accepted event. Cancellation does not consume an event or
-    /// close admission. The runner receives independently; automatic mode
-    /// acknowledges before delivery, manual mode requires explicit completion. `None` means the queue and all admitted producers finished;
-    /// inspect control status or the runner result to distinguish failure.
+    /// Receive one accepted event with a cancellation-safe wait.
+    ///
+    /// Automatic mode attempts acknowledgement before delivery. Manual mode
+    /// requires explicit completion. `None` means the queue and all admitted
+    /// producers have finished. Check the runner result or control status for
+    /// its terminal outcome.
     pub async fn recv(&mut self) -> Option<ReceivedNotification> {
         self.events.recv().await
     }
-    /// Stop new notification admission and drain queued/admitted events. An
-    /// already admitted automatic Inform finishes its response attempt. Manual
-    /// capabilities remain usable until their deadline while the runner runs.
-    /// This disables only the notification role.
+    /// Stop admission for this notification role.
+    ///
+    /// Use [`Self::recv`] to drain queued and admitted events. Admitted automatic
+    /// Inform response attempts continue. Admitted manual tokens remain usable
+    /// until their deadlines while the runner stays active.
     pub fn close(&mut self) {
         self.inner.delivery.close_admission();
         self.events.close();
@@ -394,7 +401,8 @@ impl RunningNotificationReceiver {
         self.receiver.recv().await
     }
 
-    /// Stop new event admission. Use [`Self::recv`] to drain queued and admitted events.
+    /// Stop admission and keep admitted events available through [`Self::recv`].
+    /// See [`NotificationReceiver::close`] for acknowledgement behavior.
     pub fn close(&mut self) {
         self.receiver.close();
     }
@@ -433,14 +441,17 @@ impl RunningNotificationReceiver {
             .boxed()
         })?
     }
-    /// Request shutdown, drain admitted processing and join; events remain available.
+    /// Request shutdown and join the runner. Queued events remain available.
+    ///
+    /// Shutdown invalidates pending manual acknowledgements and drains
+    /// admitted automatic response attempts.
     pub async fn shutdown(&mut self) -> Result<()> {
         self.control().request_shutdown();
         self.join().await
     }
 }
 
-/// Owned listener and session execution. Graceful shutdown drains admitted replies.
+/// Owned listener and session execution for a notification receiver.
 #[must_use = "drive or drop the notification runner"]
 pub struct NotificationRunner {
     network: crate::transport::network::NetworkCleanup,
@@ -471,8 +482,9 @@ impl NotificationRunner {
             cleanup,
         }
     }
-    /// Run all prepared sources. Graceful shutdown finishes admitted acknowledgements
-    /// before terminating session writers; queue consumption is not required.
+    /// Run all prepared sources. Graceful shutdown invalidates pending manual
+    /// acknowledgements and drains admitted automatic response attempts before
+    /// closing session writers. Queued events remain available after shutdown.
     pub async fn run(self) -> Result<()> {
         let Self {
             network,
