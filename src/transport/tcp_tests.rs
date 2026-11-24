@@ -1007,6 +1007,7 @@ async fn cleanup_on_unpolled_runner_future_and_task_abort() {
         timeout(Duration::from_secs(1), transport.control().wait_closed())
             .await
             .unwrap();
+        assert_eq!(transport.control().status(), TcpStatus::Interrupted);
         assert_eq!(
             transport
                 .send(bytes::Bytes::from_static(b"closed"))
@@ -1086,6 +1087,60 @@ async fn shutdown_before_start_waits_until_runner_is_dropped() {
     );
     drop(runner);
     control.wait_closed().await;
+    assert_eq!(control.status(), TcpStatus::Interrupted);
+}
+
+#[test]
+fn runtime_teardown_preserves_interrupted_tcp_join_result() {
+    let origin = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (control, _peer) = origin.block_on(async {
+        let (prepared, peer) = pair(TcpTransport::builder()).await;
+        let control = prepared.spawn().into_managed().control();
+        timeout(Duration::from_secs(1), async {
+            while control.status() != TcpStatus::Running {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        (control, peer)
+    });
+    drop(origin);
+
+    let observer = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    observer.block_on(async {
+        for control in [control.clone(), control] {
+            assert_eq!(control.status(), TcpStatus::Interrupted);
+            let error = timeout(Duration::from_secs(1), control.join())
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(matches!(
+                *error,
+                Error::Network { source, .. }
+                    if source.kind() == std::io::ErrorKind::Interrupted
+            ));
+        }
+    });
+}
+
+#[tokio::test]
+async fn clean_peer_eof_preserves_successful_tcp_join_result() {
+    let (prepared, mut peer) = pair(TcpTransport::builder()).await;
+    let control = prepared.spawn().into_managed().control();
+    peer.shutdown().await.unwrap();
+    timeout(Duration::from_secs(1), control.join())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(control.status(), TcpStatus::Stopped);
+    control.join().await.unwrap();
 }
 
 #[tokio::test]
@@ -1104,8 +1159,9 @@ async fn invalid_complete_message_is_skipped_and_framing_failure_is_terminal() {
     peer.write_all(&build_response_with_id(1)).await.unwrap();
     pending.await.unwrap().unwrap();
     peer.write_all(&[0x30, 0x80]).await.unwrap();
-    running.control().wait_closed().await;
-    assert!(matches!(running.control().status(), TcpStatus::Failed(_)));
+    let control = running.control();
+    control.wait_closed().await;
+    assert!(matches!(control.status(), TcpStatus::Failed(_)));
     assert_eq!(
         running
             .send(bytes::Bytes::from_static(b"closed"))
@@ -1114,7 +1170,14 @@ async fn invalid_complete_message_is_skipped_and_framing_failure_is_terminal() {
             .kind(),
         crate::ErrorKind::Decode
     );
-    assert!(running.join().await.is_err());
+    assert_eq!(
+        running.join().await.unwrap_err().kind(),
+        crate::ErrorKind::Decode
+    );
+    assert_eq!(
+        control.join().await.unwrap_err().kind(),
+        crate::ErrorKind::Decode
+    );
 }
 
 #[tokio::test]

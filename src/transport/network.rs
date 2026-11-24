@@ -147,7 +147,7 @@ async fn run_tcp_listener(
     loop {
         tokio::select! {
             biased;
-            () = network.stop.cancelled() => return Ok(()),
+            () = network.stop.cancelled() => break,
             () = cancel.cancelled(), if accepting => { accepting = false; },
             _ = sessions.join_next(), if !sessions.is_empty() => {},
             accepted = async {
@@ -171,7 +171,13 @@ async fn run_tcp_listener(
                     let (transport, runner) = prepared.into_parts();
                     if let Some(roles) = &roles { transport.configure_dispatch(roles.clone()); }
                     let id = transport.session_id();
-                    network.sessions.lock().unwrap().insert(id, transport);
+                    {
+                        let mut active = network.sessions.lock().unwrap();
+                        if network.stop.is_cancelled() {
+                            continue;
+                        }
+                        active.insert(id, transport);
+                    }
                     let network = network.clone();
                     let guard = SessionGuard { network, id, configured: false };
                     sessions.spawn(async move {
@@ -192,6 +198,8 @@ async fn run_tcp_listener(
             }
         }
     }
+    while sessions.join_next().await.is_some() {}
+    Ok(())
 }
 
 fn retryable_accept_error(error: &io::Error) -> bool {

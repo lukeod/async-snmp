@@ -124,6 +124,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   waits and exposes terminal status. Driver termination closes all sends and
   requests, including when the runner is dropped before its first poll.
 
+- **Breaking:** `UdpStatus` and `TcpStatus` report `Interrupted` when their
+  runner drops before completion. Joining an interrupted runner returns an
+  I/O interruption on every call. A join that observes a panic reports failure.
+
 - **Breaking:** The client exchange trait is named `RequestTransport`. Its send
   and request methods take owned `Bytes`, allowing queued TCP writes to retain
   encoded storage without copying it; clone `Bytes` when retaining a request.

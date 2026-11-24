@@ -31,7 +31,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::{Semaphore, mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 use tokio_util::sync::{CancellationToken, DropGuard};
 
@@ -419,20 +419,20 @@ impl SessionState {
         self.core.close();
     }
     fn closed_error(&self) -> Box<Error> {
-        self.terminal_error.lock().unwrap().as_ref().map_or_else(
-            || {
-                Error::Closed {
-                    target: self.target,
-                }
-                .boxed()
-            },
-            |source| {
-                Error::SharedOperation {
-                    source: source.clone(),
-                }
-                .boxed()
-            },
-        )
+        self.terminal_failure().unwrap_or_else(|| {
+            Error::Closed {
+                target: self.target,
+            }
+            .boxed()
+        })
+    }
+    fn terminal_failure(&self) -> Option<Box<Error>> {
+        self.terminal_error.lock().unwrap().as_ref().map(|source| {
+            Error::SharedOperation {
+                source: source.clone(),
+            }
+            .boxed()
+        })
     }
     fn fail(&self, error: Box<Error>) -> Box<Error> {
         let error: Arc<Error> = error.into();
@@ -441,14 +441,37 @@ impl SessionState {
         *self.status.lock().unwrap() = TcpStatus::Failed(Arc::from(error.to_string()));
         Error::SharedOperation { source: error }.boxed()
     }
+
+    fn interrupted_join(&self) -> Box<Error> {
+        Error::Network {
+            target: self.target,
+            source: std::io::Error::new(std::io::ErrorKind::Interrupted, "TCP runner interrupted"),
+        }
+        .boxed()
+    }
+
+    fn join_result(&self, result: std::result::Result<Result<()>, JoinError>) -> Result<()> {
+        match result {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Err(self.interrupted_join()),
+            Err(error) => {
+                *self.status.lock().unwrap() = TcpStatus::Failed(error.to_string().into());
+                Err(Error::Network {
+                    target: self.target,
+                    source: std::io::Error::other(error),
+                }
+                .boxed())
+            }
+        }
+    }
 }
 struct SessionCleanup(Arc<SessionState>);
 impl Drop for SessionCleanup {
     fn drop(&mut self) {
         self.0.close();
         let mut status = self.0.status.lock().unwrap();
-        if !matches!(*status, TcpStatus::Failed(_)) {
-            *status = TcpStatus::Stopped;
+        if matches!(*status, TcpStatus::Prepared | TcpStatus::Running) {
+            *status = TcpStatus::Interrupted;
         }
         self.0.complete.cancel();
     }
@@ -461,9 +484,11 @@ pub enum TcpStatus {
     Prepared,
     /// Reader and writer are being driven.
     Running,
-    /// Terminal, including runner drop or clean peer EOF.
+    /// The runner completed normally, including clean peer EOF.
     Stopped,
-    /// Terminal framing or socket failure.
+    /// The runner was dropped before completing, including task cancellation.
+    Interrupted,
+    /// Terminal framing or socket failure, or a panic reported by joining.
     Failed(Arc<str>),
 }
 
@@ -528,8 +553,12 @@ impl TcpRunner {
             result = read_loop(read, state, transport) => result,
             result = write_loop(write, writes, state) => result,
         };
-        result.map_err(|source| {
-            state.fail(
+        match result {
+            Ok(()) => {
+                *state.status.lock().unwrap() = TcpStatus::Stopped;
+                Ok(())
+            }
+            Err(source) => Err(state.fail(
                 Error::Session {
                     endpoint_id: state.endpoint_id,
                     session_id: state.session_id,
@@ -538,8 +567,8 @@ impl TcpRunner {
                     source,
                 }
                 .boxed(),
-            )
-        })
+            )),
+        }
     }
 }
 
@@ -575,7 +604,7 @@ impl RunningTcpSession {
     pub async fn join(mut self) -> Result<()> {
         let result = self.task.as_mut().expect("running task retained").await;
         self.task.take();
-        join_result(result, self.peer_addr())
+        self.transport.inner.state.join_result(result)
     }
     /// Request shutdown and join the driver.
     pub async fn shutdown(self) -> Result<()> {
@@ -622,20 +651,27 @@ impl TcpControl {
     }
     /// Join a driver retained by a connect convenience; explicit owners expose
     /// their own `join`. Errors remain visible in status after a previous join.
+    /// An interrupted runner reports an I/O interruption on every join.
     pub async fn join(&self) -> Result<()> {
+        let state = &self.transport.inner.state;
         let mut task = self.transport.inner.task.lock().await;
         if let Some(join) = task.as_mut() {
             let result = join.await;
             task.take();
-            join_result(result, self.transport.peer_addr())
+            state.join_result(result)
         } else {
             drop(task);
             self.wait_closed().await;
-            let state = &self.transport.inner.state;
-            if state.terminal_error.lock().unwrap().is_some() {
-                Err(state.closed_error())
-            } else {
-                Ok(())
+            match self.status() {
+                TcpStatus::Interrupted => Err(state.interrupted_join()),
+                TcpStatus::Failed(message) => Err(state.terminal_failure().unwrap_or_else(|| {
+                    Error::Network {
+                        target: state.target,
+                        source: std::io::Error::other(message.to_string()),
+                    }
+                    .boxed()
+                })),
+                _ => Ok(()),
             }
         }
     }
@@ -1125,19 +1161,6 @@ fn construction_timeout(target: SocketAddr, started: Instant) -> Box<Error> {
     }
     .boxed()
 }
-fn join_result(
-    result: std::result::Result<Result<()>, tokio::task::JoinError>,
-    target: SocketAddr,
-) -> Result<()> {
-    result.map_err(|source| {
-        Error::Network {
-            target,
-            source: std::io::Error::other(source),
-        }
-        .boxed()
-    })?
-}
-
 #[cfg(test)]
 #[path = "tcp_tests.rs"]
 mod tests;

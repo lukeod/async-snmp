@@ -96,7 +96,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::net::UdpSocket;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::{CancellationToken, DropGuard};
 
 /// Configuration for UDP transport.
@@ -158,6 +158,31 @@ struct UdpEndpointInner {
     receive_error_ready: Arc<tokio::sync::Notify>,
 }
 
+impl UdpEndpointInner {
+    fn interrupted_join(&self) -> Box<Error> {
+        Error::Network {
+            target: self.local_addr,
+            source: std::io::Error::new(std::io::ErrorKind::Interrupted, "UDP runner interrupted"),
+        }
+        .boxed()
+    }
+
+    fn join_result(&self, result: std::result::Result<Result<()>, JoinError>) -> Result<()> {
+        match result {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Err(self.interrupted_join()),
+            Err(error) => {
+                *self.status.lock().unwrap() = UdpStatus::Failed(error.to_string().into());
+                Err(Error::Network {
+                    target: self.local_addr,
+                    source: std::io::Error::other(error),
+                }
+                .boxed())
+            }
+        }
+    }
+}
+
 #[cfg(not(test))]
 async fn recv_datagram(
     responder: &UdpResponder,
@@ -196,8 +221,8 @@ impl Drop for UdpRecvTaskCleanup {
         self.responder.close();
         self.core.close();
         let mut status = self.status.lock().unwrap();
-        if !matches!(*status, UdpStatus::Failed(_)) {
-            *status = UdpStatus::Stopped;
+        if matches!(*status, UdpStatus::Prepared | UdpStatus::Running) {
+            *status = UdpStatus::Interrupted;
         }
         self.shutdown_complete.cancel();
     }
@@ -339,9 +364,11 @@ pub enum UdpStatus {
     Prepared,
     /// The receiver is running.
     Running,
-    /// The receiver is terminal, including forced runner drop.
+    /// The runner completed normally.
     Stopped,
-    /// A fatal receive error terminated the receiver.
+    /// The runner was dropped before completing, including task cancellation.
+    Interrupted,
+    /// A fatal driver error terminated the receiver, or joining reported a panic.
     Failed(Arc<str>),
 }
 
@@ -411,9 +438,10 @@ impl UdpRunner {
     pub async fn run(self) -> Result<()> {
         *self.cleanup.status.lock().unwrap() = UdpStatus::Running;
         let result = self.receive().await;
-        if let Err(error) = &result {
-            *self.cleanup.status.lock().unwrap() = UdpStatus::Failed(error.to_string().into());
-        }
+        *self.cleanup.status.lock().unwrap() = match &result {
+            Ok(()) => UdpStatus::Stopped,
+            Err(error) => UdpStatus::Failed(error.to_string().into()),
+        };
         result
     }
     async fn receive(&self) -> Result<()> {
@@ -554,13 +582,7 @@ impl RunningUdpEndpoint {
     pub async fn join(mut self) -> Result<()> {
         let result = self.task.as_mut().expect("running task retained").await;
         self.task.take();
-        result.map_err(|error| {
-            Error::Network {
-                target: self.endpoint.local_addr(),
-                source: std::io::Error::other(error),
-            }
-            .boxed()
-        })?
+        self.endpoint.inner.join_result(result)
     }
     /// Request shutdown and observe the terminal driver result.
     pub async fn shutdown(self) -> Result<()> {
@@ -879,22 +901,18 @@ impl UdpControl {
 
     /// Join the retained driver of a dedicated client convenience. Explicitly
     /// spawned services retain their result in `RunningUdpEndpoint::join`.
+    /// An interrupted runner reports an I/O interruption on every join.
     pub async fn join(&self) -> Result<()> {
         let mut task = self.inner.recv_task.lock().await;
         if let Some(join) = task.as_mut() {
             let result = join.await;
             task.take();
-            result.map_err(|error| {
-                Error::Network {
-                    target: self.inner.local_addr,
-                    source: std::io::Error::other(error),
-                }
-                .boxed()
-            })?
+            self.inner.join_result(result)
         } else {
             drop(task);
-            self.wait_closed().await;
+            self.inner.shutdown_complete.cancelled().await;
             match self.status() {
+                UdpStatus::Interrupted => Err(self.inner.interrupted_join()),
                 UdpStatus::Failed(message) => Err(Error::Network {
                     target: self.inner.local_addr,
                     source: std::io::Error::other(message.to_string()),
@@ -1279,11 +1297,28 @@ mod tests {
                 task.abort();
                 task
             };
-            assert!(task.await.is_err());
+            *endpoint.inner.recv_task.try_lock().unwrap() = Some(task);
             tokio::time::timeout(Duration::from_secs(1), control.wait_closed())
                 .await
                 .unwrap();
             assert!(control.is_shutdown());
+            assert_eq!(control.status(), UdpStatus::Interrupted);
+            for _ in 0..2 {
+                let error = control.join().await.unwrap_err();
+                let expected = if panic_task {
+                    std::io::ErrorKind::Other
+                } else {
+                    std::io::ErrorKind::Interrupted
+                };
+                assert!(
+                    matches!(*error, Error::Network { source, .. } if source.kind() == expected)
+                );
+            }
+            if panic_task {
+                assert!(matches!(control.status(), UdpStatus::Failed(_)));
+            } else {
+                assert_eq!(control.status(), UdpStatus::Interrupted);
+            }
         }
     }
 
@@ -1411,11 +1446,12 @@ mod tests {
         );
         drop(runner);
         control.wait_closed().await;
-        assert_eq!(control.status(), UdpStatus::Stopped);
+        assert_eq!(control.status(), UdpStatus::Interrupted);
         let (endpoint, runner) = UdpEndpoint::builder().prepare().await.unwrap().into_parts();
         endpoint.control().request_shutdown();
         runner.run().await.unwrap();
         endpoint.control().wait_closed().await;
+        assert_eq!(endpoint.control().status(), UdpStatus::Stopped);
     }
 
     #[tokio::test]
@@ -2006,7 +2042,7 @@ mod tests {
     }
 
     #[test]
-    fn shutdown_completes_after_originating_runtime_is_dropped() {
+    fn runtime_teardown_preserves_interrupted_udp_join_result() {
         let runtime_a = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2016,7 +2052,15 @@ mod tests {
                 .await
                 .unwrap()
                 .into_managed();
-            transport.control()
+            let control = transport.control();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while control.status() != UdpStatus::Running {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            control
         });
 
         drop(runtime_a);
@@ -2029,6 +2073,20 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(1), control.shutdown())
                 .await
                 .expect("shutdown hung after originating runtime teardown");
+            let _operation = control.inner.operations.read().await;
+            for _ in 0..2 {
+                let control = control.clone();
+                assert_eq!(control.status(), UdpStatus::Interrupted);
+                let error = tokio::time::timeout(Duration::from_secs(1), control.join())
+                    .await
+                    .unwrap()
+                    .unwrap_err();
+                assert!(matches!(
+                    *error,
+                    Error::Network { source, .. }
+                        if source.kind() == std::io::ErrorKind::Interrupted
+                ));
+            }
         });
         assert!(control.is_shutdown());
     }

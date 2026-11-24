@@ -352,7 +352,6 @@ impl AgentRunner {
             role.finished(&result);
         }
         self.cleanup.network.close_endpoints();
-        children.abort_all();
         while children.join_next().await.is_some() {}
         self.cleanup.terminal_status = Some(match &result {
             Ok(()) => AgentStatus::Stopped,

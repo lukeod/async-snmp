@@ -185,6 +185,9 @@ async fn graceful_shutdown_drains_admitted_ack_without_waiting_for_consumption()
 async fn running_shutdown_releases_udp_port_with_queued_inform() {
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
     let local_addr = receiver.local_addr();
+    let endpoint = receiver
+        .udp_endpoint(receiver.bound_addresses()[0].endpoint_id)
+        .unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     *receiver.inner.response_send_gate.lock().unwrap() = Some(gate.clone());
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -200,6 +203,8 @@ async fn running_shutdown_releases_udp_port_with_queued_inform() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(endpoint.control().status(), crate::UdpStatus::Stopped);
+    endpoint.control().join().await.unwrap();
     let _rebound = UdpSocket::bind(local_addr).await.unwrap();
     await_ack(&sender).await;
     assert_eq!(receiver.local_addr(), local_addr);
@@ -709,6 +714,7 @@ async fn tcp_shutdown_drains_reserved_acknowledgement_and_abort_terminates_route
             assert!(receiver.recv().await.is_none());
             assert_eq!(receiver.control().status(), NotificationStatus::Interrupted);
         } else {
+            let session = receiver.tcp_sessions()[0].control();
             receiver.control().request_shutdown();
             receiver.close();
             tokio::task::yield_now().await;
@@ -717,6 +723,8 @@ async fn tcp_shutdown_drains_reserved_acknowledgement_and_abort_terminates_route
             gate.add_permits(1);
             inform.await.unwrap().unwrap();
             driver.await.unwrap().unwrap();
+            assert_eq!(session.status(), crate::TcpStatus::Stopped);
+            session.join().await.unwrap();
             assert_eq!(engine.receive_capacity(), None);
             assert!(matches!(
                 receiver.recv().await.unwrap().inform_ack,
