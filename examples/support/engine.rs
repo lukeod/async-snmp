@@ -8,12 +8,14 @@ use std::path::Path;
 use async_snmp::{AuthoritativeEngine, LocalEngine, PersistedAuthoritativeEngine};
 
 pub fn load(path: &Path) -> Result<LocalEngine, Box<dyn std::error::Error>> {
+    let mut lock_path = path.as_os_str().to_os_string();
+    lock_path.push(".lock");
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(path.with_extension("lock"))?;
+        .open(lock_path)?;
     fs2::FileExt::try_lock_exclusive(&lock)?;
     let previous = match std::fs::read(path) {
         Ok(bytes) if bytes.len() >= 4 => {

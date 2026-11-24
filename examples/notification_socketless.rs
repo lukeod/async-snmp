@@ -14,7 +14,7 @@ mod engine;
 mod notification_log;
 
 use std::net::{IpAddr, Ipv4Addr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_snmp::{
     AuthProtocol, DecodeConfig, EncodedInformResponse, EndpointId, NotificationAdmissionDecision,
@@ -26,11 +26,10 @@ use tokio::net::UdpSocket;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<_> = std::env::args().collect();
-    let engine = engine::load(Path::new(
-        args.get(1).map_or("receiver.state", String::as_str),
-    ))?;
-    let log = PathBuf::from(args.get(2).map_or("received.log", String::as_str));
+    let mut args = std::env::args_os().skip(1);
+    let state = PathBuf::from(args.next().unwrap_or_else(|| "receiver.state".into()));
+    let log = PathBuf::from(args.next().unwrap_or_else(|| "received.log".into()));
+    let engine = engine::load(&state)?;
     let make_context = |password: &[u8]| -> Result<UsmSecurityContext, Box<dyn std::error::Error>> {
         let user = UsmUser::new("collector").auth(AuthProtocol::Sha256, password)?;
         Ok(UsmSecurityContext::new([
