@@ -20,6 +20,7 @@ pub(crate) struct AgentNetwork {
     pub(crate) io: Arc<crate::transport::network::NetworkState>,
     drops: Arc<AtomicU64>,
     status: std::sync::Mutex<AgentStatus>,
+    command_admission_stopped: CancellationToken,
     complete: CancellationToken,
 }
 impl AgentNetwork {
@@ -35,6 +36,7 @@ impl AgentNetwork {
             )?),
             drops,
             status: std::sync::Mutex::new(AgentStatus::Prepared),
+            command_admission_stopped: CancellationToken::new(),
             complete: CancellationToken::new(),
         })
     }
@@ -98,24 +100,28 @@ impl AgentControl {
     pub fn outstanding_mutations(&self) -> usize {
         command::outstanding_mutations(&self.agent.inner)
     }
-    /// Wait for mutation and unclassified tasks after network admission stops.
-    /// Timeout leaves cleanup running. A classified mutation task that panics
-    /// or is interrupted before completion causes the drain to return an error.
+    /// After requesting agent shutdown, wait for command admission to stop and
+    /// for outstanding mutation and unclassified tasks. Already classified
+    /// retrievals can continue while this method runs. An unstarted runner must
+    /// be driven or dropped. Timeout leaves cleanup running. A classified
+    /// mutation task that panics or is interrupted causes the drain to return
+    /// an error.
     pub async fn drain_mutations(&self, timeout: Duration) -> Result<()> {
         if !self.is_shutdown() {
             return Err(
-                Error::Config("stop network admission before draining mutations".into()).boxed(),
+                Error::Config("request agent shutdown before draining mutations".into()).boxed(),
             );
         }
         let deadline = crate::transport::checked_deadline(timeout, "mutation drain timeout")?;
-        tokio::time::timeout_at(deadline.into(), self.wait_closed())
-            .await
-            .map_err(|_| {
-                Error::Config(
-                    "network admission has not stopped before mutation drain deadline".into(),
-                )
+        tokio::time::timeout_at(
+            deadline.into(),
+            self.agent.network.command_admission_stopped.cancelled(),
+        )
+        .await
+        .map_err(|_| {
+            Error::Config("command admission has not stopped before mutation drain deadline".into())
                 .boxed()
-            })?;
+        })?;
         command::drain_retained(&self.agent.inner, deadline, false).await
     }
 }
@@ -206,6 +212,7 @@ struct AgentRunCleanup {
 impl Drop for AgentRunCleanup {
     fn drop(&mut self) {
         self.inner.cancel.cancel();
+        self.network.command_admission_stopped.cancel();
         self.network.close_endpoints();
         drop(self.capacity_registration.take());
         let completed = self.terminal_status.is_some();
@@ -228,6 +235,7 @@ impl Drop for AgentRunCleanup {
 pub struct AgentRunner {
     processor: AgentProcessor,
     listeners: Vec<PreparedListener>,
+    // The receiver drops before cleanup publishes the admission barrier.
     incoming: mpsc::Receiver<InboundWork>,
     cleanup: AgentRunCleanup,
     pub(super) notification_role: Option<(
@@ -322,6 +330,7 @@ impl AgentRunner {
         self.incoming.close();
         self.processor.inner.cancel.cancel();
         requests.cancel();
+        self.cleanup.network.command_admission_stopped.cancel();
         // Keep endpoints writable while admitted handlers finalize responses.
         if let AgentShutdownPolicy::AbortCancellationSafeRetrievalsAfter(grace) =
             self.processor.inner.shutdown_policy

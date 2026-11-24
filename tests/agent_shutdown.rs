@@ -133,7 +133,7 @@ impl MibHandler for BlockingGetHandler {
 }
 
 #[tokio::test]
-async fn cancellation_drains_a_dispatched_get_through_its_response() {
+async fn mutation_drain_finishes_while_shutdown_waits_for_dispatched_get() {
     let started = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     let handler = Arc::new(BlockingGetHandler {
@@ -141,14 +141,16 @@ async fn cancellation_drains_a_dispatched_get_through_its_response() {
         release: release.clone(),
         calls: Arc::new(AtomicUsize::new(0)),
     });
-    let (addr, cancel, run_task, _control) = start_agent(handler, Some(1)).await;
+    let (addr, cancel, run_task, control) = start_agent(handler, Some(1)).await;
     let client = client(addr).await;
 
     let request_task = tokio::spawn(async move { client.get(&test_oid()).await });
     wait_for(&started).await;
 
     cancel.cancel();
-    tokio::task::yield_now().await;
+    assert_eq!(control.outstanding_mutations(), 0);
+    control.drain_mutations(TEST_TIMEOUT).await.unwrap();
+    assert!(!request_task.is_finished(), "GET should still be blocked");
     assert!(
         !run_task.is_finished(),
         "run returned while a dispatched handler was still blocked"
@@ -162,6 +164,23 @@ async fn cancellation_drains_a_dispatched_get_through_its_response() {
         .expect("GET should succeed after handler release");
     assert_eq!(response.varbinds[0].value, Value::Integer(42));
     await_shutdown(run_task).await;
+}
+
+#[tokio::test]
+async fn mutation_drain_waits_for_unstarted_runner_to_be_dropped() {
+    let (agent, runner, _) = Agent::builder()
+        .bind("127.0.0.1:0")
+        .prepare()
+        .await
+        .unwrap()
+        .into_parts();
+    let control = agent.control();
+    control.request_shutdown();
+    let mut drain = std::pin::pin!(control.drain_mutations(TEST_TIMEOUT));
+    assert!(futures::poll!(&mut drain).is_pending());
+
+    drop(runner);
+    drain.await.unwrap();
 }
 
 struct BlockingSetHandler {
