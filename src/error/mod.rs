@@ -798,10 +798,18 @@ impl Error {
                 response.metadata = combined;
                 self
             }
-            _ => Box::new(Self::Exchange {
-                source: self,
-                metadata: Box::new(prior.clone()),
-            }),
+            _ => {
+                let mut combined = prior.clone();
+                if let Some(metadata) = self.response_metadata() {
+                    combined
+                        .received_messages
+                        .extend_from_slice(&metadata.received_messages);
+                }
+                Box::new(Self::Exchange {
+                    source: self,
+                    metadata: Box::new(combined),
+                })
+            }
         }
     }
 

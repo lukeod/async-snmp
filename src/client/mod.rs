@@ -1532,8 +1532,8 @@ impl<T: RequestTransport> Client<T> {
     /// [`WalkOptions::method`] can select either operation explicitly.
     ///
     /// Returns an async stream that yields each variable binding in the subtree.
-    /// This convenience stream intentionally discards decode metadata; use
-    /// [`Self::walk_with_metadata`] to retain it.
+    /// Terminal errors can retain metadata for the failing exchange. Use
+    /// [`Self::walk_with_metadata`] for the complete response history.
     /// The walk terminates when an OID outside the subtree is encountered or
     /// when `EndOfMibView` is returned. All consumption methods observe this same
     /// GETNEXT/GETBULK sequence. A scalar instance OID is not retrieved as a

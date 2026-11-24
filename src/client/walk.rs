@@ -21,7 +21,7 @@ use crate::version::Version;
 use super::Client;
 use super::response_shape::{BulkResponse, ResponseMetadata};
 
-/// One walked binding plus anomalies accepted since the preceding item.
+/// One walked binding and the response metadata associated with it.
 ///
 /// GETNEXT associates one response with one item. GETBULK associates response
 /// metadata with the first yielded binding from that response, so flattening a
@@ -32,7 +32,7 @@ pub struct WalkItem {
     pub metadata: ResponseMetadata,
 }
 
-/// A collected walk and the anomaly aggregate for every accepted response,
+/// A collected walk and the history of every accepted response,
 /// including responses that terminate without yielding a binding.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WalkCollection {
@@ -47,7 +47,7 @@ pub struct WalkError {
     /// The protocol, response-shape, walk-policy, or transport failure.
     #[source]
     pub source: Box<Error>,
-    /// Every accepted response anomaly observed before termination.
+    /// Metadata from all accepted responses observed before termination.
     pub metadata: ResponseMetadata,
 }
 
@@ -224,6 +224,12 @@ impl OidTracker {
     }
 }
 
+fn retain_response_metadata(history: Option<&mut ResponseMetadata>, metadata: &ResponseMetadata) {
+    if let Some(history) = history {
+        history.append(metadata.clone());
+    }
+}
+
 /// Private GETNEXT walk state machine.
 struct GetNextDriver<T: RequestTransport> {
     client: Client<T>,
@@ -236,7 +242,6 @@ struct GetNextDriver<T: RequestTransport> {
     /// Count of results returned so far.
     count: usize,
     done: bool,
-    metadata: ResponseMetadata,
     pending: Option<
         Pin<
             Box<
@@ -263,14 +268,17 @@ impl<T: RequestTransport> GetNextDriver<T> {
             max_results,
             count: 0,
             done: false,
-            metadata: ResponseMetadata::default(),
             pending: None,
         }
     }
 }
 
 impl<T: RequestTransport + 'static> GetNextDriver<T> {
-    fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+        history: Option<&mut ResponseMetadata>,
+    ) -> Poll<Option<Result<WalkItem>>> {
         if self.done {
             return Poll::Ready(None);
         }
@@ -296,15 +304,17 @@ impl<T: RequestTransport + 'static> GetNextDriver<T> {
 
                 match result {
                     Ok(response) if result_limit.is_some() && response.varbinds.is_empty() => {
-                        self.metadata.append(response.metadata);
+                        if let Some(history) = history {
+                            history.append(response.metadata);
+                        }
                         self.done = true;
                         Poll::Ready(None)
                     }
-                    Ok(mut response)
+                    Ok(response)
                         if response.anomalies.is_empty() && response.varbinds.len() == 1 =>
                     {
-                        let item_metadata = std::mem::take(&mut response.metadata);
-                        self.metadata.append(item_metadata.clone());
+                        let item_metadata = response.metadata;
+                        retain_response_metadata(history, &item_metadata);
                         let vb = response.varbinds.into_iter().next().unwrap();
                         let target = self.client.peer_addr();
                         let base_oid = self.base_oid.clone();
@@ -315,7 +325,9 @@ impl<T: RequestTransport + 'static> GetNextDriver<T> {
                             }
                             VarbindOutcome::Abort(e) => {
                                 self.done = true;
-                                return Poll::Ready(Some(Err(e)));
+                                return Poll::Ready(Some(Err(
+                                    e.with_prior_response_metadata(&item_metadata)
+                                )));
                             }
                             VarbindOutcome::Yield => {}
                         }
@@ -326,7 +338,8 @@ impl<T: RequestTransport + 'static> GetNextDriver<T> {
                                 target,
                                 reason: WalkAbortReason::ResultLimitExceeded { limit },
                             }
-                            .boxed())));
+                            .boxed()
+                            .with_prior_response_metadata(&item_metadata))));
                         }
 
                         // Update current OID for next iteration
@@ -339,7 +352,7 @@ impl<T: RequestTransport + 'static> GetNextDriver<T> {
                         })))
                     }
                     Ok(response) => {
-                        self.metadata.append(response.metadata.clone());
+                        retain_response_metadata(history, &response.metadata);
                         self.done = true;
                         Poll::Ready(Some(Err(Error::ResponseShape {
                             target: self.client.peer_addr(),
@@ -348,8 +361,8 @@ impl<T: RequestTransport + 'static> GetNextDriver<T> {
                         .boxed())))
                     }
                     Err(e) => {
-                        if let Some(metadata) = e.response_metadata().cloned() {
-                            self.metadata.append(metadata);
+                        if let Some(metadata) = e.response_metadata() {
+                            retain_response_metadata(history, metadata);
                         }
                         if self.client.inner.config.version() == Version::V1
                             && matches!(
@@ -373,19 +386,6 @@ impl<T: RequestTransport + 'static> GetNextDriver<T> {
     }
 }
 
-impl<T: RequestTransport + 'static> Stream for GetNextDriver<T> {
-    type Item = Result<VarBind>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.poll_next_with_metadata(cx) {
-            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item.varbind))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
-        }
-    }
-}
-
 /// Private GETBULK walk state machine.
 struct GetBulkDriver<T: RequestTransport> {
     client: Client<T>,
@@ -399,8 +399,9 @@ struct GetBulkDriver<T: RequestTransport> {
     /// Count of results returned so far.
     count: usize,
     done: bool,
-    metadata: ResponseMetadata,
-    deferred_item_metadata: ResponseMetadata,
+    /// Responses from the current batch, including tooBig retries at this cursor.
+    batch_metadata: ResponseMetadata,
+    batch_yielded: bool,
     /// Buffered results from the last GETBULK response
     buffer: VecDeque<VarBind>,
     pending: Option<Pin<Box<dyn std::future::Future<Output = Result<BulkResponse>> + Send>>>,
@@ -425,8 +426,8 @@ impl<T: RequestTransport> GetBulkDriver<T> {
             max_results,
             count: 0,
             done: false,
-            metadata: ResponseMetadata::default(),
-            deferred_item_metadata: ResponseMetadata::default(),
+            batch_metadata: ResponseMetadata::default(),
+            batch_yielded: false,
             buffer: VecDeque::new(),
             pending: None,
         })
@@ -434,7 +435,17 @@ impl<T: RequestTransport> GetBulkDriver<T> {
 }
 
 impl<T: RequestTransport + 'static> GetBulkDriver<T> {
-    fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
+    fn finish(&mut self) -> ResponseMetadata {
+        self.done = true;
+        self.buffer.clear();
+        std::mem::take(&mut self.batch_metadata)
+    }
+
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+        mut history: Option<&mut ResponseMetadata>,
+    ) -> Poll<Option<Result<WalkItem>>> {
         loop {
             if self.done {
                 return Poll::Ready(None);
@@ -449,32 +460,42 @@ impl<T: RequestTransport + 'static> GetBulkDriver<T> {
                 let base_oid = self.base_oid.clone();
                 match validate_walk_varbind(&vb, &base_oid, &mut self.oid_tracker, target) {
                     VarbindOutcome::Done => {
-                        self.done = true;
+                        self.finish();
                         return Poll::Ready(None);
                     }
                     VarbindOutcome::Abort(e) => {
-                        self.done = true;
-                        return Poll::Ready(Some(Err(e)));
+                        return Poll::Ready(Some(Err(
+                            e.with_prior_response_metadata(&self.finish())
+                        )));
                     }
                     VarbindOutcome::Yield => {}
                 }
 
                 if let Some(limit) = result_limit {
-                    self.done = true;
                     return Poll::Ready(Some(Err(Error::WalkAborted {
                         target,
                         reason: WalkAbortReason::ResultLimitExceeded { limit },
                     }
-                    .boxed())));
+                    .boxed()
+                    .with_prior_response_metadata(&self.finish()))));
                 }
 
                 // Update current OID for next request
                 self.current_oid = vb.oid.clone();
                 self.count += 1;
 
+                let metadata = if history.is_some() && !self.batch_yielded {
+                    self.batch_metadata.clone()
+                } else {
+                    ResponseMetadata::default()
+                };
+                self.batch_yielded = true;
+                if self.buffer.is_empty() {
+                    self.batch_metadata.received_messages.clear();
+                }
                 return Poll::Ready(Some(Ok(WalkItem {
                     varbind: vb,
-                    metadata: std::mem::take(&mut self.deferred_item_metadata),
+                    metadata,
                 })));
             }
 
@@ -504,24 +525,23 @@ impl<T: RequestTransport + 'static> GetBulkDriver<T> {
 
                     match result {
                         Ok(response) => {
-                            self.metadata.append(response.metadata.clone());
-                            self.deferred_item_metadata.append(response.metadata);
+                            retain_response_metadata(history.as_deref_mut(), &response.metadata);
                             if response.varbinds.is_empty() {
-                                self.done = true;
+                                self.finish();
                                 return Poll::Ready(None);
                             }
 
+                            self.batch_metadata.append(response.metadata);
+                            self.batch_yielded = false;
                             self.buffer = response.varbinds.into();
                             // Continue loop to process buffer
                         }
-                        Err(mut e) => {
-                            let accepted_metadata =
-                                e.response_metadata().cloned().unwrap_or_default();
-                            self.metadata.append(accepted_metadata.clone());
-                            // On tooBig, degrade instead of aborting (RFC 3416
-                            // 4.2.3): halve max-repetitions down to a floor of 1
-                            // and retry the same position. Only surface the error
-                            // if it still fails at max-repetitions = 1.
+                        Err(e) => {
+                            if let Some(metadata) = e.response_metadata() {
+                                retain_response_metadata(history.as_deref_mut(), metadata);
+                            }
+                            // Retry tooBig at the same cursor with fewer repetitions.
+                            // The result-limit probe already uses one repetition.
                             if result_limit.is_none()
                                 && self.max_repetitions > 1
                                 && matches!(
@@ -532,7 +552,9 @@ impl<T: RequestTransport + 'static> GetBulkDriver<T> {
                                     }
                                 )
                             {
-                                self.deferred_item_metadata.append(accepted_metadata);
+                                if let Some(metadata) = e.response_metadata() {
+                                    self.batch_metadata.append(metadata.clone());
+                                }
                                 let reduced = (self.max_repetitions / 2).max(1);
                                 tracing::debug!(target: "async_snmp::client", { peer = %self.client.peer_addr(), snmp.max_repetitions = self.max_repetitions, snmp.reduced_max_repetitions = reduced }, "tooBig response, reducing max-repetitions and retrying");
                                 self.max_repetitions = reduced;
@@ -540,26 +562,13 @@ impl<T: RequestTransport + 'static> GetBulkDriver<T> {
                                 continue;
                             }
 
-                            e = e.with_prior_response_metadata(&self.deferred_item_metadata);
-                            self.done = true;
-                            return Poll::Ready(Some(Err(e)));
+                            return Poll::Ready(Some(Err(
+                                e.with_prior_response_metadata(&self.finish())
+                            )));
                         }
                     }
                 }
             }
-        }
-    }
-}
-
-impl<T: RequestTransport + 'static> Stream for GetBulkDriver<T> {
-    type Item = Result<VarBind>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match self.poll_next_with_metadata(cx) {
-            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item.varbind))),
-            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -569,20 +578,15 @@ enum WalkDriver<T: RequestTransport> {
     GetBulk(GetBulkDriver<T>),
 }
 
-impl<T: RequestTransport> WalkDriver<T> {
-    fn metadata(&self) -> &ResponseMetadata {
-        match self {
-            Self::GetNext(walk) => &walk.metadata,
-            Self::GetBulk(walk) => &walk.metadata,
-        }
-    }
-}
-
 impl<T: RequestTransport + 'static> WalkDriver<T> {
-    fn poll_next_with_metadata(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<WalkItem>>> {
+    fn poll_next(
+        &mut self,
+        cx: &mut Context<'_>,
+        history: Option<&mut ResponseMetadata>,
+    ) -> Poll<Option<Result<WalkItem>>> {
         match self {
-            Self::GetNext(walk) => walk.poll_next_with_metadata(cx),
-            Self::GetBulk(walk) => walk.poll_next_with_metadata(cx),
+            Self::GetNext(walk) => walk.poll_next(cx, history),
+            Self::GetBulk(walk) => walk.poll_next(cx, history),
         }
     }
 }
@@ -591,7 +595,9 @@ impl<T: RequestTransport + 'static> WalkDriver<T> {
 ///
 /// The private driver uses GETNEXT or GETBULK according to the snapshotted
 /// [`WalkOptions`]. Items intentionally omit response metadata; use
-/// [`WalkMetadataStream`] when accepted decode anomalies must be retained.
+/// [`WalkMetadataStream`] for the complete response history. A terminal error
+/// can retain metadata for its own exchange through [`Error::response_metadata`].
+/// Use [`Error::exchange_source`] when matching a walk-policy error.
 /// The GETNEXT/GETBULK driver is private and cannot be matched by callers:
 ///
 /// ```compile_fail
@@ -666,9 +672,11 @@ impl<T: RequestTransport + 'static> Stream for WalkStream<T> {
     type Item = Result<VarBind>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match &mut self.get_mut().driver {
-            WalkDriver::GetNext(walk) => Pin::new(walk).poll_next(cx),
-            WalkDriver::GetBulk(walk) => Pin::new(walk).poll_next(cx),
+        match self.get_mut().driver.poll_next(cx, None) {
+            Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item.varbind))),
+            Poll::Ready(Some(Err(error))) => Poll::Ready(Some(Err(error))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
@@ -677,22 +685,25 @@ impl<T: RequestTransport + 'static> Stream for WalkStream<T> {
 ///
 /// Response-level metadata is attached to the first binding yielded from that
 /// response. [`Self::metadata`] and [`Self::collect`] also retain metadata from
-/// accepted terminal responses that yield no binding.
+/// accepted terminal responses that yield no binding. The history grows with
+/// the number of accepted responses.
 #[must_use = "streams do nothing unless polled"]
 pub struct WalkMetadataStream<T: RequestTransport> {
     driver: WalkDriver<T>,
+    metadata: ResponseMetadata,
 }
 
 impl<T: RequestTransport> WalkMetadataStream<T> {
     pub(crate) fn new(inner: WalkStream<T>) -> Self {
         Self {
             driver: inner.driver,
+            metadata: ResponseMetadata::default(),
         }
     }
 
     /// Aggregate metadata observed so far, including non-yielding responses.
     pub fn metadata(&self) -> &ResponseMetadata {
-        self.driver.metadata()
+        &self.metadata
     }
 }
 
@@ -708,7 +719,7 @@ impl<T: RequestTransport + 'static> WalkMetadataStream<T> {
         }
         Ok(WalkCollection {
             varbinds,
-            metadata: self.metadata().clone(),
+            metadata: self.metadata,
         })
     }
 }
@@ -718,10 +729,10 @@ impl<T: RequestTransport + 'static> Stream for WalkMetadataStream<T> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        match this.driver.poll_next_with_metadata(cx) {
+        match this.driver.poll_next(cx, Some(&mut this.metadata)) {
             Poll::Ready(Some(Err(source))) => Poll::Ready(Some(Err(WalkError {
                 source,
-                metadata: this.driver.metadata().clone(),
+                metadata: this.metadata.clone(),
             }))),
             Poll::Ready(Some(Ok(item))) => Poll::Ready(Some(Ok(item))),
             Poll::Ready(None) => Poll::Ready(None),
@@ -1426,6 +1437,7 @@ mod tests {
         StatusWithSuffix(ErrorStatus, usize),
         Timeout,
         Closed,
+        Error(Box<Error>),
     }
 
     type DetailedRequestLog = Arc<Mutex<Vec<(PduType, Option<u32>)>>>;
@@ -1509,6 +1521,7 @@ mod tests {
                     }
                     .boxed()),
                     WalkReply::Closed => Err(Error::Closed { target: peer }.boxed()),
+                    WalkReply::Error(error) => Err(error),
                 }
             }
         }
@@ -1607,7 +1620,7 @@ mod tests {
 
     fn assert_result_limit(error: &Error, expected_limit: usize) {
         assert!(matches!(
-            error,
+            error.exchange_source(),
             Error::WalkAborted {
                 reason: WalkAbortReason::ResultLimitExceeded { limit },
                 ..
@@ -1725,6 +1738,192 @@ mod tests {
                 .cloned()
                 .collect::<Vec<_>>(),
             vec![trailing(3)]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_metadata_walks_keep_history_across_responses() {
+        const BINDINGS: u32 = 64;
+        let replies = || {
+            (1..=BINDINGS)
+                .map(|index| {
+                    let bindings = vec![walk_binding(index)];
+                    if index == 1 {
+                        WalkReply::ResponseWithSuffix(bindings, 1)
+                    } else {
+                        WalkReply::Response(bindings)
+                    }
+                })
+                .chain([WalkReply::ResponseWithSuffix(
+                    vec![walk_binding(BINDINGS)],
+                    2,
+                )])
+                .collect()
+        };
+        for method in [WalkMethod::GetNext, WalkMethod::GetBulk] {
+            let options = WalkOptions {
+                method,
+                ..WalkOptions::default()
+            };
+            let (client, _) = scripted_walk_client(Version::V2c, 100, replies());
+            let mut plain = client.walk_with(walk_base(), options).unwrap();
+            for index in 1..=BINDINGS {
+                assert_eq!(plain.next().await.unwrap().unwrap(), walk_binding(index));
+                if let WalkDriver::GetBulk(driver) = &plain.driver {
+                    assert!(driver.batch_metadata.received_messages.is_empty());
+                }
+            }
+            let error = plain.next().await.unwrap().unwrap_err();
+            let metadata = error.response_metadata().unwrap();
+            assert_eq!(metadata.received_messages.len(), 1);
+            assert_eq!(
+                metadata.decode_anomalies().cloned().collect::<Vec<_>>(),
+                vec![trailing(2)]
+            );
+
+            let (client, _) = scripted_walk_client(Version::V2c, 100, replies());
+            let mut walk = client.walk_with_metadata_and(walk_base(), options).unwrap();
+            for index in 1..=BINDINGS {
+                assert_eq!(
+                    walk.next().await.unwrap().unwrap().varbind,
+                    walk_binding(index)
+                );
+                assert_eq!(walk.metadata().received_messages.len(), index as usize);
+            }
+            let error = walk.next().await.unwrap().unwrap_err();
+            assert_eq!(
+                error.metadata.received_messages.len(),
+                BINDINGS as usize + 1
+            );
+            assert_eq!(
+                error
+                    .metadata
+                    .decode_anomalies()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![trailing(1), trailing(2)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_walk_error_keeps_only_the_failing_batch_and_its_toobig_retries() {
+        let replies = || {
+            [
+                WalkReply::ResponseWithSuffix(vec![walk_binding(1)], 1),
+                WalkReply::StatusWithSuffix(ErrorStatus::TooBig, 2),
+            ]
+        };
+        for retry_succeeds in [false, true] {
+            let mut replies = Vec::from(replies());
+            if retry_succeeds {
+                replies.push(WalkReply::ResponseWithSuffix(
+                    vec![walk_binding(2), walk_binding(2)],
+                    3,
+                ));
+            } else {
+                replies.extend([
+                    WalkReply::StatusWithSuffix(ErrorStatus::TooBig, 3),
+                    WalkReply::Timeout,
+                ]);
+            }
+            let (client, _) = scripted_walk_client(Version::V2c, 100, replies);
+            let mut walk = client.bulk_walk(walk_base(), 4).unwrap();
+            assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(1));
+            if retry_succeeds {
+                assert_eq!(walk.next().await.unwrap().unwrap(), walk_binding(2));
+            }
+            let error = walk.next().await.unwrap().unwrap_err();
+            assert_eq!(
+                error.kind(),
+                if retry_succeeds {
+                    crate::ErrorKind::WalkAborted
+                } else {
+                    crate::ErrorKind::Timeout
+                }
+            );
+            let metadata = error.response_metadata().unwrap();
+            assert_eq!(metadata.received_messages.len(), 2);
+            assert_eq!(
+                metadata.decode_anomalies().cloned().collect::<Vec<_>>(),
+                vec![trailing(2), trailing(3)]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_walk_retry_history_precedes_delegated_terminal_metadata() {
+        let target = target_addr();
+        let terminal = Arc::new(Error::Snmp {
+            target,
+            status: ErrorStatus::GenErr,
+            index: 1,
+            oid: None,
+            metadata: Box::new(ResponseMetadata::from_received(
+                crate::ReceivedMessageInfo::udp(
+                    crate::EndpointId::new(),
+                    "127.0.0.1:0".parse().unwrap(),
+                    target,
+                    None,
+                    tokio::time::Instant::now(),
+                    42,
+                ),
+                PduType::Response,
+                vec![trailing(3)],
+            )),
+        });
+        let replies = || {
+            vec![
+                WalkReply::ResponseWithSuffix(vec![walk_binding(1)], 1),
+                WalkReply::StatusWithSuffix(ErrorStatus::TooBig, 2),
+                WalkReply::Error(
+                    Error::SharedOperation {
+                        source: terminal.clone(),
+                    }
+                    .boxed(),
+                ),
+            ]
+        };
+
+        let (client, _) = scripted_walk_client(Version::V2c, 100, replies());
+        let mut plain = client.bulk_walk(walk_base(), 4).unwrap();
+        assert_eq!(plain.next().await.unwrap().unwrap(), walk_binding(1));
+        let error = plain.next().await.unwrap().unwrap_err();
+        let metadata = error.response_metadata().unwrap();
+        assert_eq!(metadata.received_messages.len(), 2);
+        assert_eq!(
+            metadata.decode_anomalies().cloned().collect::<Vec<_>>(),
+            vec![trailing(2), trailing(3)]
+        );
+        let Error::Exchange { source, .. } = error.as_ref() else {
+            panic!("expected exchange metadata around the transport error");
+        };
+        let Error::SharedOperation { source } = source.as_ref() else {
+            panic!("expected the original transport error source");
+        };
+        assert!(Arc::ptr_eq(source, &terminal));
+
+        let (client, _) = scripted_walk_client(Version::V2c, 100, replies());
+        let mut walk = client.bulk_walk_with_metadata(walk_base(), 4).unwrap();
+        assert_eq!(walk.next().await.unwrap().unwrap().varbind, walk_binding(1));
+        let error = walk.next().await.unwrap().unwrap_err();
+        assert_eq!(error.metadata.received_messages.len(), 3);
+        assert_eq!(
+            error
+                .metadata
+                .decode_anomalies()
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![trailing(1), trailing(2), trailing(3)]
+        );
+        assert_eq!(
+            error
+                .source
+                .response_metadata()
+                .unwrap()
+                .received_messages
+                .as_slice(),
+            &error.metadata.received_messages[1..]
         );
     }
 
@@ -2026,7 +2225,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(
-            *error,
+            error.exchange_source(),
             Error::WalkAborted {
                 reason: WalkAbortReason::NonIncreasing,
                 ..
