@@ -15,7 +15,7 @@ use async_snmp::{AuthoritativeEngine, RequestTransport, TransportKind};
 use async_snmp::{Client, Retry};
 use async_snmp::{
     InformAckOutcome, InformAcknowledgementMode, ListenerSource, NotificationAcknowledgement,
-    NotificationPdu, NotificationReceiver, PendingInformAck, Version, oid,
+    NotificationPdu, NotificationReceiver, PendingInformAck, Value, VarBind, Version, oid,
 };
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +30,10 @@ fn manual() -> async_snmp::NotificationReceiverBuilder {
         .pending_inform_timeout(WAIT)
 }
 fn wire(id: i32) -> Bytes {
+    wire_with_varbinds(id, vec![])
+}
+
+fn wire_with_varbinds(id: i32, varbinds: Vec<VarBind>) -> Bytes {
     CommunityMessage::v2c(
         "public",
         NotificationPdu::inform(
@@ -37,7 +41,7 @@ fn wire(id: i32) -> Bytes {
             id,
             0,
             &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1),
-            vec![],
+            varbinds,
         )
         .unwrap()
         .into_raw(),
@@ -166,6 +170,48 @@ async fn tcp_pending_saturation_preserves_session_and_drop_releases_outstanding_
 }
 
 #[tokio::test]
+async fn oversized_tcp_inform_gets_toobig_while_the_only_manual_slot_is_occupied() {
+    let ordinary = wire(1);
+    let oversized = wire_with_varbinds(
+        2,
+        vec![VarBind::new(
+            oid!(1, 3, 6, 1, 4, 1, 9, 1),
+            Value::OctetString(Bytes::from_static(&[0; 128])),
+        )],
+    );
+    let mut receiver = manual()
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .queue_capacity(1)
+        .max_message_size(ordinary.len())
+        .spawn()
+        .await
+        .unwrap();
+    let mut peer = TcpStream::connect(receiver.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    peer.write_all(&ordinary).await.unwrap();
+    let first = pending(event(&mut receiver).await);
+
+    peer.write_all(&oversized).await.unwrap();
+    let reply = tcp_reply(&mut peer).await;
+    let pdu = reply.pdu().standard().unwrap();
+    assert_eq!(pdu.request_id(), 2);
+    assert_eq!(pdu.error_status_enum(), async_snmp::ErrorStatus::TooBig);
+    assert_eq!(pdu.error_index(), 0);
+    assert!(pdu.varbinds().is_empty());
+    assert_eq!(receiver.control().overload_drops(), 0);
+
+    assert!(matches!(first.acknowledge().await, InformAckOutcome::Sent));
+    let reply = tcp_reply(&mut peer).await;
+    assert_eq!(reply.pdu().standard().unwrap().request_id(), 1);
+    peer.write_all(&wire(3)).await.unwrap();
+    let next = event(&mut receiver).await;
+    assert_eq!(next.wire_identity.request_id, Some(3));
+    pending(next).reject();
+    receiver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn closing_original_tcp_session_never_retargets_pending_ack_to_a_replacement() {
     let mut receiver = manual()
         .listener(ListenerSource::tcp("127.0.0.1:0"))
@@ -283,7 +329,7 @@ async fn v3_udp_tcp_manual_ack_retains_captured_credentials_at_every_security_le
             let builder = manual()
                 .authoritative_engine(engine)
                 .security_context(context.clone())
-                .accept_all_notifications();
+                .admit_all_notifications();
             let builder = if tcp {
                 builder.listener(ListenerSource::tcp("127.0.0.1:0"))
             } else {
@@ -435,7 +481,7 @@ async fn manual_des_receives_before_sender_state_is_installed_and_encodes_on_com
             )
         })
         .unwrap()
-        .accept_all_notifications()
+        .admit_all_notifications()
         .spawn()
         .await
         .unwrap();

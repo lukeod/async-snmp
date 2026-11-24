@@ -48,7 +48,7 @@
 //! notification admission. The notification role inherits the prepared engine,
 //! USM users, privacy sender state and message/security counters; configure
 //! engine identity and users only on the agent.
-//! The role keeps its own community, acceptance, decoding and delivery policies.
+//! The role keeps its own community, admission, decoding and delivery policies.
 //!
 //! Closing the notification consumer or its attached control disables that role.
 //! [`Agent::close_commands`] disables commands while notifications and exchanges
@@ -65,8 +65,9 @@
 //! notification `max_processing` overrides this), and at most 4 MiB of input
 //! buffers. These bounds are shared across the agent's UDP endpoints. Existing
 //! command admission/buffering limits and notification delivery capacity remain
-//! additional bounds. Overload drops before application acceptance or Inform ACK;
-//! classification of a colliding request transfers off the response allowance.
+//! additional bounds. Overload can drop a message before delivery or ordinary
+//! Inform acknowledgement. Classification of a colliding request transfers off
+//! the response allowance.
 //!
 //! Add `.session(TcpTransport::builder().target(peer))` to prepare an outbound
 //! connection with these same roles, or use `from_stream` for an owned connection.

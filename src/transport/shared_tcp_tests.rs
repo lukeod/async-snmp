@@ -24,7 +24,7 @@ fn agent(id: &'static [u8]) -> crate::agent::AgentBuilder {
         .allow_all_access()
         .authoritative_engine(engine(id))
         .client_exchanges(true)
-        .notifications(NotificationReceiver::builder().accept_all_notifications())
+        .notifications(NotificationReceiver::builder().admit_all_notifications())
 }
 fn client(session: TcpTransport, auth: Auth) -> Client<TcpTransport> {
     ClientBuilder::new(auth)
@@ -559,12 +559,14 @@ fn security(name: &str) -> crate::UsmConfig {
     }
 }
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-fn secured(pdu: crate::Pdu, id: i32, engine: &[u8], config: &crate::UsmConfig) -> bytes::Bytes {
+fn secured(
+    pdu: crate::Pdu,
+    id: i32,
+    engine: &[u8],
+    config: &crate::UsmConfig,
+    reportable: bool,
+) -> bytes::Bytes {
     let keys = config.derive_keys(engine).unwrap();
-    let reportable = matches!(
-        pdu.pdu_type(),
-        crate::PduType::GetRequest | crate::PduType::InformRequest
-    );
     crate::v3::encode::encode_v3_message(
         &pdu,
         id,
@@ -586,34 +588,58 @@ fn secured(pdu: crate::Pdu, id: i32, engine: &[u8], config: &crate::UsmConfig) -
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
 async fn encrypted_collision_preserves_role_and_failure_ownership() {
+    const COLLISION_ID: i32 = 77;
+    const REMOTE_ENGINE: &[u8] = b"tcp-remote-engine";
+
     let mut service = secured_agent(b"tcp-secured-collision")
         .listener(ListenerSource::tcp("127.0.0.1:0"))
         .spawn()
         .await
         .unwrap();
     let mut events = service.take_notifications().unwrap();
+    let mut config = security("priv");
+    config.validate_and_precompute().unwrap();
+    let encode = |pdu: crate::Pdu, engine| {
+        let reportable = pdu.pdu_type().is_confirmed();
+        secured(pdu, COLLISION_ID, engine, &config, reportable)
+    };
+    let outgoing = encode(
+        crate::Pdu::get_request(COLLISION_ID, &[oid()]),
+        REMOTE_ENGINE,
+    );
+    let command = encode(
+        crate::Pdu::get_request(COLLISION_ID, &[oid()]),
+        service.engine_id(),
+    );
+    let inform = encode(
+        crate::Pdu::inform_request(COLLISION_ID, 1, &trap(), vec![]),
+        service.engine_id(),
+    );
+    let remote_trap = encode(
+        crate::Pdu::trap_v2(COLLISION_ID, 1, &trap(), vec![]),
+        REMOTE_ENGINE,
+    );
+    let valid = encode(
+        crate::Pdu::response(COLLISION_ID, 0, 0, vec![]),
+        REMOTE_ENGINE,
+    );
+    let mut bad = valid.to_vec();
+    *bad.last_mut().unwrap() ^= 1;
+
     let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
         .await
         .unwrap();
     let session = accepted(&service).await;
-    let config = security("priv");
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
-    let registration =
-        RequestRegistration::v3(77, tokio::time::Instant::now() + Duration::from_secs(2))
-            .with_classification_usm(
-                config.clone(),
-                Some(Bytes::from_static(b"tcp-remote-engine")),
-            );
-    let outgoing = secured(
-        crate::Pdu::get_request(77, &[oid()]),
-        77,
-        b"tcp-remote-engine",
-        &config,
-    );
+    let registration = RequestRegistration::v3(
+        COLLISION_ID,
+        tokio::time::Instant::now() + Duration::from_secs(2),
+    )
+    .with_classification_usm(config, Some(Bytes::from_static(REMOTE_ENGINE)));
     let pending = tokio::spawn(async move {
         session
-            .request_with(outgoing.clone(), registration, move |packet| {
+            .request_with(outgoing, registration, move |packet| {
                 let (_, _) = packet.into_parts();
                 if count.fetch_add(1, Ordering::SeqCst) == 0 {
                     Ok(Candidate::Reject)
@@ -624,36 +650,14 @@ async fn encrypted_collision_preserves_role_and_failure_ownership() {
             .await
     });
     read(&mut stream).await;
-    for pdu in [
-        crate::Pdu::get_request(77, &[oid()]),
-        crate::Pdu::inform_request(77, 1, &trap(), vec![]),
-    ] {
-        stream
-            .write_all(&secured(pdu, 77, service.engine_id(), &config))
-            .await
-            .unwrap();
+    for packet in [command, inform] {
+        stream.write_all(&packet).await.unwrap();
         read(&mut stream).await;
     }
     events.recv().await.unwrap();
-    stream
-        .write_all(&secured(
-            crate::Pdu::trap_v2(77, 1, &trap(), vec![]),
-            77,
-            b"tcp-remote-engine",
-            &config,
-        ))
-        .await
-        .unwrap();
+    stream.write_all(&remote_trap).await.unwrap();
     events.recv().await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let valid = secured(
-        crate::Pdu::response(77, 0, 0, vec![]),
-        77,
-        b"tcp-remote-engine",
-        &config,
-    );
-    let mut bad = valid.to_vec();
-    *bad.last_mut().unwrap() ^= 1;
     stream.write_all(&bad).await.unwrap();
     until(|| calls.load(Ordering::SeqCst) == 1).await;
     assert_eq!(events.usm_wrong_digests(), 0);
@@ -714,14 +718,14 @@ async fn v3_bidirectional_commands_traps_and_informs_use_one_accepted_connected_
 
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
-async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_discovery() {
+async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_reports() {
     let mut collector = NotificationReceiver::builder()
         .client_exchanges(true)
         .queue_capacity(1)
         .listener(ListenerSource::udp("127.0.0.1:0"))
         .listener(ListenerSource::tcp("127.0.0.1:0"))
         .authoritative_engine(engine(b"tcp-collector-engine"))
-        .accept_all_notifications()
+        .admit_all_notifications()
         .usm_user("noauth", Ok)
         .unwrap()
         .usm_user("auth", |u| {
@@ -777,6 +781,36 @@ async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_
         .unwrap();
     assert!(poller.get(&oid()).await.is_err());
     assert!(!session.control().is_shutdown());
+
+    // An encrypted stale Inform also needs no delivery slot. Read the Report
+    // from the same stream while the notification queue is still full.
+    let mut stream = TcpStream::connect(collector.bound_addresses()[1].local_addr)
+        .await
+        .unwrap();
+    let inform = crate::NotificationPdu::inform(crate::Version::V3, 4242, 1, &trap(), vec![])
+        .unwrap()
+        .into_raw();
+    let wire = secured(
+        inform,
+        71,
+        b"previous-collector-engine",
+        &security("priv"),
+        false,
+    );
+    stream.write_all(&wire).await.unwrap();
+    let report =
+        crate::message::V3Message::decode(read(&mut stream).await, crate::DecodeConfig::DEFAULT)
+            .unwrap()
+            .value;
+    let scoped = report.scoped_pdu().unwrap();
+    assert_eq!(report.global_data().msg_id(), 71);
+    assert_eq!(scoped.pdu.request_id, 4242);
+    assert_eq!(scoped.context_engine_id.as_ref(), b"tcp-collector-engine");
+    assert!(matches!(
+        crate::v3::classify_report(&scoped.pdu).unwrap(),
+        crate::v3::ReportStatus::UnknownEngineId { .. }
+    ));
+
     collector.recv().await.unwrap();
     collector.shutdown().await.unwrap();
 }

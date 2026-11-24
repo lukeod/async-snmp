@@ -28,6 +28,11 @@ pub(crate) const fn length_encoded_len(len: usize) -> usize {
     }
 }
 
+/// Encoded size of a single-octet-tag value with the given content length.
+pub(crate) const fn tlv_encoded_len(content_len: usize) -> usize {
+    1 + length_encoded_len(content_len) + content_len
+}
+
 /// Returns the number of bytes needed for base-128 variable-length encoding.
 ///
 /// Used for OID subidentifier encoding (X.690 Section 8.19.2).

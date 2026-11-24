@@ -523,6 +523,10 @@ pub(crate) enum NotificationDisposition {
 }
 
 impl NotificationRole {
+    pub(crate) fn engine_id(&self) -> &[u8] {
+        &self.inner.engine_id
+    }
+
     pub(crate) fn has_pending_worker(&self) -> bool {
         self.inner.acknowledgement_mode == InformAcknowledgementMode::ApplicationControlled
     }

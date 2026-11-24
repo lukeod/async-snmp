@@ -154,14 +154,14 @@ async fn accepted_and_connected_sessions_send_both_directions_and_never_reconnec
     let mut server = Agent::builder()
         .listener(ListenerSource::tcp("127.0.0.1:0"))
         .client_exchanges(true)
-        .notifications(NotificationReceiver::builder().accept_all_notifications())
+        .notifications(NotificationReceiver::builder().admit_all_notifications())
         .spawn()
         .await
         .unwrap();
     let mut client = Agent::builder()
         .session(TcpTransport::builder().target(server.bound_addresses()[0].local_addr))
         .client_exchanges(true)
-        .notifications(NotificationReceiver::builder().accept_all_notifications())
+        .notifications(NotificationReceiver::builder().admit_all_notifications())
         .spawn()
         .await
         .unwrap();
@@ -402,7 +402,7 @@ async fn shared_v3_notifications_keep_trap_and_inform_authority_separate() {
     let mut receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
         .authoritative_engine(sink_engine.clone())
-        .accept_all_notifications()
+        .admit_all_notifications()
         .usm_user("user", |u| {
             u.auth_priv(
                 AuthProtocol::Sha256,

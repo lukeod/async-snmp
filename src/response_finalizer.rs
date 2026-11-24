@@ -1,14 +1,19 @@
 //! Exact outbound response-size finalization shared by responders.
 
+#[cfg(any(test, feature = "agent"))]
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::Bytes;
 
-use crate::Version;
-use crate::error::Result;
-use crate::pdu::{Pdu, ResponsePdu};
+#[cfg(any(test, feature = "agent"))]
+use crate::{
+    Version,
+    error::Result,
+    pdu::{Pdu, ResponsePdu},
+};
 
 /// The result of exact response finalization.
+#[cfg(any(test, feature = "agent"))]
 #[derive(Debug)]
 pub(crate) enum FinalizedResponse {
     /// The requested candidate fit the effective limit.
@@ -19,8 +24,8 @@ pub(crate) enum FinalizedResponse {
     Dropped,
 }
 
+#[cfg(any(test, feature = "agent"))]
 impl FinalizedResponse {
-    #[cfg(feature = "agent")]
     pub(crate) fn into_bytes(self) -> Option<Bytes> {
         match self {
             Self::Candidate(bytes) | Self::Alternate(bytes) => Some(bytes),
@@ -54,6 +59,7 @@ pub(crate) fn effective_limit(local_limit: usize, originator_limit: Option<usize
 ///
 /// `snmpSilentDrops` is incremented only when the confirmed request's alternate
 /// also fails the exact encoded-size check.
+#[cfg(any(test, feature = "agent"))]
 pub(crate) fn finalize_response(
     version: Version,
     request: &Pdu,
@@ -213,6 +219,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(result, FinalizedResponse::Alternate(_)));
+        assert_eq!(result.into_bytes().unwrap().len(), 50);
     }
 
     #[test]

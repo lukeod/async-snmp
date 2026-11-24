@@ -130,6 +130,17 @@ impl PduType {
     pub fn tag(self) -> u8 {
         self as u8
     }
+
+    pub(crate) fn is_confirmed(self) -> bool {
+        matches!(
+            self,
+            Self::GetRequest
+                | Self::GetNextRequest
+                | Self::GetBulkRequest
+                | Self::SetRequest
+                | Self::InformRequest
+        )
+    }
 }
 
 impl std::fmt::Display for PduType {
@@ -760,6 +771,20 @@ impl Pdu {
         self.encode_validated(buf)
     }
 
+    /// Size of the standard PDU fields, including received error fields.
+    pub(crate) fn standard_encoded_size(&self) -> usize {
+        use crate::ber::{integer_content_len, tlv_encoded_len};
+
+        let (status, index) = self.error_fields().expect("standard PDU layout");
+        let varbinds = self.varbinds.iter().map(VarBind::encoded_size).sum();
+        tlv_encoded_len(
+            tlv_encoded_len(integer_content_len(self.request_id))
+                + tlv_encoded_len(integer_content_len(status))
+                + tlv_encoded_len(integer_content_len(index))
+                + tlv_encoded_len(varbinds),
+        )
+    }
+
     fn encode_validated(&self, buf: &mut EncodeBuf) -> Result<()> {
         let (pdu_type, first_field, second_field) = match self.body {
             PduBody::Standard {
@@ -1069,14 +1094,7 @@ impl Pdu {
     /// Check if this is a confirmed-class PDU (requires response).
     #[must_use]
     pub fn is_confirmed(&self) -> bool {
-        matches!(
-            self.pdu_type(),
-            PduType::GetRequest
-                | PduType::GetNextRequest
-                | PduType::GetBulkRequest
-                | PduType::SetRequest
-                | PduType::InformRequest
-        )
+        self.pdu_type().is_confirmed()
     }
 }
 

@@ -60,7 +60,7 @@ pub struct UsmConfig {
 /// Authentication and privacy protocols are capabilities, not a minimum
 /// accepted security level. A user with authentication and privacy keys also
 /// supports `authNoPriv` and `noAuthNoPriv`; the Agent or notification receiver
-/// applies its own authorization or acceptance policy to the packet's actual
+/// applies its own authorization or admission policy to the packet's actual
 /// security level.
 ///
 /// Unlike [`UsmConfig`], this type has no scoped-PDU context because inbound

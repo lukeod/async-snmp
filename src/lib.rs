@@ -521,9 +521,8 @@
 //! Metadata-preserving walk streams expose per-item anomalies exactly once and
 //! a cumulative [`WalkCollection::metadata`] that also includes non-yielding
 //! terminal responses. The shorter Inform and walk methods intentionally
-//! discard this metadata. Notification acceptance policies receive
-//! it through [`NotificationEnvelope::decode_anomalies`], and delivered
-//! notifications retain it through [`Notification::decode_anomalies`].
+//! discard this metadata. Delivered notifications retain their anomalies through
+//! [`Notification::decode_anomalies`].
 //!
 //! ### Strict low-level inspection and network-role controls
 //!
@@ -668,9 +667,9 @@ pub use message_size::{
 };
 pub use notification::{
     EncodedInformResponse, InformAckOutcome, InformAcknowledgementMode, InformResponse,
-    Notification, NotificationAcceptance, NotificationAcceptanceError,
-    NotificationAcceptancePolicy, NotificationAcceptanceResult, NotificationAcknowledgement,
-    NotificationControl, NotificationEnvelope, NotificationHealth, NotificationPduClass,
+    Notification, NotificationAcknowledgement, NotificationAdmissionDecision,
+    NotificationAdmissionError, NotificationAdmissionInfo, NotificationAdmissionPolicy,
+    NotificationAdmissionResult, NotificationControl, NotificationHealth, NotificationPduClass,
     NotificationProcessResult, NotificationProcessor, NotificationProcessorBuilder,
     NotificationReceiver, NotificationReceiverBuilder, NotificationRunner, NotificationStatus,
     NotificationVarbindValidation, NotificationWireIdentity, PendingInformAck,

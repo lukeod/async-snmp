@@ -30,9 +30,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   or tasks, sharing protocol processing with managed receivers. Accepted Informs
   carry an owned `InformResponse` encoded only on explicit completion, with
   current authoritative time/sender state and the original selected keys.
-  USM failures retain their Report bytes; `LocalEngine::usm_stats` exposes a
-  counter snapshot. Caller-selected unclaimed engine IDs use common discovery
-  reporting through `report_unknown_engine`.
+  Selected processors handle engine discovery and stale Informs in `process`.
+  USM failures retain any Report bytes, and `LocalEngine::usm_stats` exposes a
+  counter snapshot. Caller-owned endpoints without a selected listener can
+  answer through their designated `LocalEngine::report_unknown_engine`.
+
+- Managed and caller-owned SNMPv3 receivers resolve Inform and trap authority
+  before updating remote timeliness. Stale Informs take the unknown-engine
+  path, and only recognized authenticated traps can advance the remote clock.
+  Report eligibility follows the PDU type when available, with the reportable
+  flag as fallback. Reports preserve the original request ID when available.
+
+- **Breaking:** `admission_policy` and `try_admission_policy` replace the
+  notification acceptance callbacks on both builders. `NotificationAdmissionInfo`
+  exposes receive metadata, wire identity, scoped context, class, and notification
+  OID. Inspect payloads in delivered events and use deferred acknowledgement
+  for application-controlled completion. `admit_all_notifications` explicitly
+  admits every validated notification.
+
+- **Breaking:** For an admitted Inform, the processor checks response size before
+  delivery. In either acknowledgement mode, managed receivers attempt a
+  fitting `tooBig` reply or count a silent drop if both responses exceed the
+  limit. Socketless processors expose this outcome as
+  `NotificationProcessResult::InformTooBig`. If current engine boots/time make
+  an admitted response too large at completion, encoding tries the same
+  alternate. `EncodedInformResponse` and managed `InformAckOutcome` distinguish
+  ordinary replies, `tooBig` replies and counted silent drops.
 
 - `UsmSecurityContext` shares selectable inbound credentials and bounded remote
   timeliness state. Engine-specific user entries precede explicit defaults;
@@ -60,8 +83,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `spawn_on()` and an independently driven runner. `recv(&mut self)` is a
   cancellation-safe single-consumer queue returning `Option`; receivers are no
   longer cloneable. Controls expose shutdown, terminal status and coalesced
-  authoritative persistence health. Queue capacity is reserved before acceptance
-  and Inform acknowledgement; closure drains admitted events.
+  authoritative persistence health. Deliverable Informs reserve queue capacity
+  before ordinary acknowledgement. Closure drains admitted events.
 
 - TCP sessions now own one reader and serialized writer, with bounded concurrent
   exchanges and aggregate message buffering. Cancelling a request leaves framing
@@ -94,7 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Validators receive a `ReceivedPacket` containing the original bytes and `ReceivedMessageInfo`.
   Custom transports construct it with `ReceivedPacket::new(bytes, info)`; validators
   can use `packet.into_parts()` to take both values. Notification results
-  and acceptance envelopes expose `receive_info` instead of `source`. Use
+  and admission policy inputs expose `receive_info` instead of `source`. Use
   `receive_info.peer_addr()` for the sender and `receive_info.received_len()` for
   the complete encoded SNMP input length, including accepted UDP suffixes.
 - `RequestContext::receive_info()` exposes the receiving endpoint and original

@@ -7,9 +7,11 @@ use std::time::Instant;
 
 use bytes::Bytes;
 
-use super::process::UsmStats;
+use super::process::{
+    MpdCounters, UsmStats, V3Inbound, V3LocalContext, V3Role, process_prepared_v3_inbound,
+};
 use super::{AuthoritativeEngine, DesSaltState, SaltCounter, compute_engine_boots_time};
-use crate::{Error, MessageSize, Result};
+use crate::{DecodeConfig, Error, MessageSize, ProcessingInput, Result};
 
 /// Current persistence health of a local authoritative SNMP engine.
 ///
@@ -165,6 +167,62 @@ impl LocalEngine {
     /// The stable local engine identity.
     pub fn engine_id(&self) -> &[u8] {
         &self.inner.engine_id
+    }
+
+    /// Answer SNMPv3 discovery for a packet with no selected application.
+    ///
+    /// Choose this engine as the authoritative identity the endpoint advertises.
+    /// Empty, invalid, and foreign IDs record an unknown-engine failure and use
+    /// the common Report rules and the receive and send limits on `input`. A
+    /// packet naming this engine returns `None`. Send any resulting Report on
+    /// the original UDP route or exact TCP session. A selected notification
+    /// listener handles discovery through [`crate::NotificationProcessor::process`].
+    pub fn report_unknown_engine(
+        &self,
+        input: ProcessingInput,
+        decode_config: DecodeConfig,
+    ) -> Result<Option<Bytes>> {
+        let (packet, limits) = input.into_parts();
+        let (data, info, prepared) = packet.into_prepared();
+        let clock = || self.current_boots_time();
+        let context = V3LocalContext {
+            engine_id: &self.inner.engine_id,
+            engine_boots: 0,
+            engine_time: 0,
+            authoritative_time: Some(&clock),
+            local_receive_capacity: limits.receive().advertised(),
+            accepted_receive_size: limits.receive().accepted(),
+            decode_config,
+            outbound_limit: limits.send(),
+            usm_users: None,
+            stats: &self.inner.usm_stats,
+            mpd: Some(MpdCounters {
+                invalid_msgs: &self.inner.snmp_invalid_msgs,
+                unknown_security_models: &self.inner.snmp_unknown_security_models,
+            }),
+            source: info.peer_addr(),
+        };
+        let result = process_prepared_v3_inbound(data, &context, &V3Role::Unclaimed, prepared).map(
+            |inbound| match inbound {
+                V3Inbound::Failed { report, .. } => report,
+                _ => None,
+            },
+        );
+        self.count_asn_parse_error(&result);
+        result
+    }
+
+    pub(crate) fn count_asn_parse_error<T>(&self, result: &Result<T>) {
+        use crate::DecodeErrorKind;
+
+        if matches!(result, Err(error) if matches!(&**error,
+            Error::Decode(error) if !matches!(error.kind, DecodeErrorKind::UnknownVersion(_)
+                | DecodeErrorKind::InvalidMsgFlags | DecodeErrorKind::UnknownSecurityModel(_))))
+        {
+            self.inner
+                .snmp_in_asn_parse_errs
+                .fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// The persisted authoritative state, absent only for internally generated

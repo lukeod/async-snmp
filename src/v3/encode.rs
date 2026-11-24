@@ -217,10 +217,11 @@ pub(crate) fn sign_v3_message(
 /// tuple and apply normal Step 7(b) timeliness processing. Otherwise it is
 /// noAuthNoPriv.
 ///
-/// The reportableFlag check (whether a report may be sent at all) is the
-/// caller's responsibility.
+/// The caller determines Report eligibility from the PDU type or reportableFlag.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn encode_v3_report(
     msg_id: i32,
+    request_id: Option<i32>,
     local_receive_capacity: MessageSize,
     usm: UsmSecurityParams,
     report_oid: Oid,
@@ -228,13 +229,10 @@ pub(crate) fn encode_v3_report(
     auth_key: Option<&LocalizedKey>,
     target: SocketAddr,
 ) -> Result<Bytes> {
-    // RFC 3412 Section 7.1 Step 3c4: request-id is the value extracted from the
-    // original request PDU, or 0 when it cannot be extracted. Every USM-failure
-    // path reaches here before the scopedPDU is decoded, so it cannot be
-    // extracted. (msgID, which correlates the Report, is carried separately in
-    // the header.)
+    // RFC 3412 Section 7.1 Step 3c4: request-id is copied when recoverable.
+    // The correlated msgID is carried separately in the header.
     let report_pdu = ResponsePdu::report(
-        0,
+        request_id.unwrap_or(0),
         vec![VarBind::new(report_oid, Value::Counter32(counter_value))],
     )?
     .into_raw();
@@ -266,6 +264,66 @@ pub(crate) fn encode_v3_report(
         }
         None => msg.encode(),
     }
+}
+
+/// Size the response envelope from its structured fields without signing,
+/// encrypting or reserving a privacy salt.
+pub(crate) fn v3_response_encoded_size(
+    pdu_size: usize,
+    incoming: &MsgGlobalData,
+    msg_max_size: MessageSize,
+    usm: &UsmSecurityParams,
+    scoped: &ScopedPdu,
+    derived_keys: &DerivedKeys,
+    target: SocketAddr,
+) -> Result<usize> {
+    use crate::ber::{integer_content_len, tlv_encoded_len, unsigned32_content_len};
+
+    let integer_size = |value| tlv_encoded_len(integer_content_len(value));
+    let unsigned_size = |value| tlv_encoded_len(unsigned32_content_len(value));
+    let level = incoming.msg_flags.security_level;
+    let auth_len = if level.requires_auth() {
+        require_auth_key(Some(derived_keys), target)?.1.mac_len()
+    } else {
+        0
+    };
+    let scoped_size = tlv_encoded_len(
+        tlv_encoded_len(scoped.context_engine_id.len())
+            + tlv_encoded_len(scoped.context_name.len())
+            + pdu_size,
+    );
+    let (data_size, priv_len) = if level.requires_priv() {
+        let privacy = derived_keys
+            .priv_key
+            .as_ref()
+            .ok_or_else(|| Error::Auth { target }.boxed())?
+            .protocol();
+        let ciphertext_size = if privacy.is_des_family() {
+            scoped_size.next_multiple_of(8)
+        } else {
+            scoped_size
+        };
+        (tlv_encoded_len(ciphertext_size), 8)
+    } else {
+        (scoped_size, 0)
+    };
+    let usm_sequence_size = tlv_encoded_len(
+        tlv_encoded_len(usm.engine_id.len())
+            + unsigned_size(usm.engine_boots)
+            + unsigned_size(usm.engine_time)
+            + tlv_encoded_len(usm.username.len())
+            + tlv_encoded_len(auth_len)
+            + tlv_encoded_len(priv_len),
+    );
+    let global_size = tlv_encoded_len(
+        integer_size(incoming.msg_id)
+            + integer_size(msg_max_size.as_i32())
+            + tlv_encoded_len(1)
+            + integer_size(incoming.msg_security_model.as_i32()),
+    );
+    Ok(tlv_encoded_len(
+        integer_size(3) + global_size + tlv_encoded_len(usm_sequence_size) + data_size,
+    ))
 }
 
 /// Build and encode a V3 Response message at the incoming security level.

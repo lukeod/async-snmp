@@ -8,8 +8,8 @@ mod common;
 use async_snmp::agent::{Agent, SinkSkipReason, SinkStatus};
 use async_snmp::message::CommunityMessage;
 use async_snmp::notification::{
-    Notification, NotificationAcceptance, NotificationReceiver, NotificationVarbindValidation,
-    ReceivedNotification,
+    Notification, NotificationAdmissionDecision, NotificationReceiver,
+    NotificationVarbindValidation, ReceivedNotification,
 };
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 use async_snmp::v3::{AuthProtocol, PrivProtocol};
@@ -209,9 +209,9 @@ async fn notification_varbind_validation_controls_trap_delivery() {
     let mut strict = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
         .varbind_validation(NotificationVarbindValidation::Strict)
-        .acceptance_policy(move |_: &async_snmp::NotificationEnvelope<'_>| {
+        .admission_policy(move |_: &async_snmp::NotificationAdmissionInfo<'_>| {
             policy_calls_for_receiver.fetch_add(1, Ordering::Relaxed);
-            NotificationAcceptance::Accept
+            NotificationAdmissionDecision::Admit
         })
         .spawn()
         .await
@@ -478,7 +478,7 @@ async fn v3_trap_send_receive() {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
         .unwrap()
-        .accept_all_notifications()
+        .admit_all_notifications()
         .spawn()
         .await
         .unwrap();
@@ -540,7 +540,7 @@ async fn v3_inform_send_receive() {
             )
         })
         .unwrap()
-        .accept_all_notifications()
+        .admit_all_notifications()
         .spawn()
         .await
         .unwrap();
@@ -733,7 +733,7 @@ async fn v3_trap_without_local_authoritative_engine_returns_error() {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
         .unwrap()
-        .accept_all_notifications()
+        .admit_all_notifications()
         .spawn()
         .await
         .unwrap();
@@ -997,7 +997,7 @@ async fn agent_v3_trap_to_sink() {
             u.auth(AuthProtocol::Sha256, b"authpass12345678")
         })
         .unwrap()
-        .accept_all_notifications()
+        .admit_all_notifications()
         .spawn()
         .await
         .unwrap();

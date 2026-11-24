@@ -737,20 +737,9 @@ mod tests {
 
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
-    async fn managed_v3_completion_samples_authoritative_time_when_acknowledged() {
+    async fn managed_v3_completion_sends_too_big_when_engine_time_grows() {
         let engine = crate::AuthoritativeEngine::for_test(b"manual-clock-engine".as_slice(), 1);
-        let mut receiver = manual()
-            .pending_inform_timeout(Duration::from_secs(3))
-            .authoritative_engine(engine.clone())
-            .usm_user("user", |user| {
-                user.auth(crate::AuthProtocol::Sha256, b"authentication-password")
-            })
-            .unwrap()
-            .accept_all_notifications()
-            .spawn()
-            .await
-            .unwrap();
-        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        engine.set_elapsed_for_test(127);
         let security = crate::UsmConfig::new("user")
             .auth(crate::AuthProtocol::Sha256, b"authentication-password")
             .unwrap();
@@ -769,16 +758,32 @@ mod tests {
             17,
             engine.engine_id(),
             1,
-            0,
+            127,
             &security,
             Some(&keys),
             None,
             None,
             None,
             true,
-            crate::MessageSize::new(8192).unwrap(),
+            crate::UDP_RECEIVE_LIMITS.advertised(),
         )
         .unwrap();
+        // At time 127 the ordinary response differs in the PDU tag, flags and
+        // digest, all of which retain their encoded widths.
+        let limit = wire.len();
+        let mut receiver = manual()
+            .pending_inform_timeout(Duration::from_secs(3))
+            .authoritative_engine(engine.clone())
+            .usm_user("user", |user| {
+                user.auth(crate::AuthProtocol::Sha256, b"authentication-password")
+            })
+            .unwrap()
+            .admit_all_notifications()
+            .max_message_size(limit)
+            .spawn()
+            .await
+            .unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         peer.send_to(&wire, receiver.bound_addresses()[0].local_addr)
             .await
             .unwrap();
@@ -789,26 +794,35 @@ mod tests {
         let NotificationAcknowledgement::Pending(token) = event.inform_ack else {
             panic!("expected manual response")
         };
-        engine.set_elapsed_for_test(123);
-        assert!(matches!(token.acknowledge().await, InformAckOutcome::Sent));
+        engine.set_elapsed_for_test(128);
+        assert!(matches!(
+            token.acknowledge().await,
+            InformAckOutcome::SentTooBig
+        ));
         let mut wire = vec![0; 8192];
         let len = tokio::time::timeout(Duration::from_secs(2), peer.recv(&mut wire))
             .await
             .unwrap()
             .unwrap();
+        assert!(len <= limit);
         let response = crate::message::V3Message::decode(
             Bytes::copy_from_slice(&wire[..len]),
             crate::DecodeConfig::DEFAULT,
         )
         .unwrap()
         .value;
+        let reply = &response.scoped_pdu().unwrap().pdu;
+        assert_eq!(reply.request_id(), 17);
+        assert_eq!(reply.error_status_enum(), crate::ErrorStatus::TooBig);
+        assert_eq!(reply.error_index(), 0);
+        assert!(reply.varbinds().is_empty());
         let usm = crate::v3::UsmSecurityParams::decode(
             response.security_params,
             crate::DecodeConfig::DEFAULT,
         )
         .unwrap()
         .value;
-        assert_eq!(usm.engine_time, 123);
+        assert_eq!(usm.engine_time, 128);
         receiver.shutdown().await.unwrap();
     }
 }

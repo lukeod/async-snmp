@@ -129,14 +129,39 @@ invalid replacements leave the current table intact, and remote timeliness is
 retained. Each input keeps one selected credential snapshot, including its
 deferred Inform response. Managed attached roles share their configured context.
 Caller-owned I/O may select a logical processor explicitly, using untrusted routing
-hints before security processing; it must not retry contexts after security failure.
+hints before security processing. Pass each message once to the selected
+`NotificationProcessor::process`, including SNMPv3 discovery probes. If the
+endpoint selects no listener, it can answer discovery using its designated
+`LocalEngine::report_unknown_engine(input, decode_config)`.
+
+Receivers use the SNMPv3 PDU type to distinguish an Inform naming a stale
+receiver engine ID from a trap using the sender's engine ID. When the type is
+unavailable, `reportableFlag` supplies the fallback. Only a recognized,
+authenticated trap advances the remote engine clock. Send any Report from
+`NotificationProcessResult::UsmFailed` or the endpoint discovery helper on the
+original UDP route or exact TCP session. The originator decides whether to
+rediscover after a stale-engine Report. An established async-snmp `Client`
+can explicitly call `rediscover_engine()`.
 
 `NotificationProcessor` returns accepted content and an optional owned
-`InformResponse`. Encode it after application processing; encoding samples current
-engine time and sender state while retaining the original validated credentials.
-Handle USM failure Reports separately, including discovery for unclaimed engine
-IDs through `report_unknown_engine`. The caller sends every result on the original
-UDP route or exact TCP session and controls any deferred response deadline.
+`InformResponse`. Encode it after application processing to use the current engine
+time and sender state with the original validated credentials. The result is an
+`EncodedInformResponse`. If updated SNMPv3 boots or time push the ordinary response
+over the limit, encoding returns a fitting empty-varbind `tooBig` reply or counts a
+silent drop. Use `into_bytes()` to get the reply if one fit.
+Send the reply on the original route and set any deadline for deferred responses.
+
+Use `admission_policy` on either notification builder to restrict validated
+notifications by source, identity, security level, context, class, or OID.
+Admission runs before Inform sizing, delivery, and any Inform Response. Inspect
+the application payload after delivery and use deferred acknowledgement when
+processing must finish before the ordinary Response is sent.
+
+For admitted Informs, the processor checks the ordinary Response size before
+delivery. An oversized response yields
+`NotificationProcessResult::InformTooBig`. Send the empty-varbind `tooBig` reply
+when `response` contains bytes. `response: None` indicates a counted silent drop.
+[RFC 3416 §4.2.7](https://www.rfc-editor.org/rfc/rfc3416.html#section-4.2.7)
 
 ## Transport and service lifecycle
 
@@ -154,6 +179,7 @@ ordinary deadlines before startup and fail after termination.
 | Custom client transport contract | `RequestTransport` |
 | Shared UDP transport | `UdpEndpoint`, target-specific `UdpHandle` |
 | Agent/receiver startup | `prepare` plus runner, or explicit `spawn` |
+| Notification `acceptance_policy` | `admission_policy` with `NotificationAdmissionInfo`. Inspect payloads in delivered events and use manual acknowledgement when needed. |
 | Single service local address | Identified `bound_addresses()` |
 | Notification consumer | Non-Clone receiver; `recv(&mut self)` and separate control |
 | Managed `ReceivedNotification::inform_ack` | `NotificationAcknowledgement::{NotRequired, Completed, Pending}` |
@@ -187,6 +213,13 @@ state can also report failure to install manual completion work. Select
 `ApplicationControlled`, persist/process the event, then consume the pending token
 with `acknowledge().await`. Drop or `reject()` sends nothing. Retransmissions remain
 independent events; acknowledgement provides no exactly-once guarantee.
+
+In either mode, the receiver handles oversized Informs before delivery and
+attempts to send the `tooBig` alternate when it fits. For a delivered Inform,
+`InformAckOutcome::Sent` records successful local transmission of the ordinary
+response. If that response grows beyond the limit at completion, `SentTooBig`
+records transmission of the alternate and `SuppressedBySize` records a counted
+silent drop. `Failed` carries a completion error.
 
 Manual mode defaults to 256 outstanding Informs and a 30-second deadline from
 acceptance, including encoding and sending. These bounds survive dequeue. Tokens

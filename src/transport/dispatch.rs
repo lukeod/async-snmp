@@ -12,6 +12,7 @@ use crate::ber::Decoder;
 use crate::message::{RawMsgData, RawV3Message};
 #[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
 use crate::v3::UsmUser;
+use crate::v3::prepared::{PduPrefix, PreparedCrypto};
 use crate::v3::{UsmSecurityContext, UsmSecurityParams};
 use crate::{Error, PduType, Result, Version};
 use bytes::Bytes;
@@ -360,7 +361,13 @@ impl DispatchRoles {
                     } else {
                         None
                     };
-                    let admission = if needs_delivery {
+                    let foreign_inform = class.as_ref().is_ok_and(|class| {
+                        *class == Some(PduType::InformRequest)
+                            && message.prepared.as_ref().is_some_and(|prepared| {
+                                prepared.proves_foreign_inform(processor.engine_id())
+                            })
+                    });
+                    let admission = if needs_delivery && !foreign_inform {
                         let Some(admission) = processor.reserve_tcp(self.client_exchanges).await?
                         else {
                             message.observe(super::MessageDisposition::Disabled);
@@ -494,7 +501,6 @@ impl DispatchRoles {
     ) -> Result<Option<PduType>> {
         let raw = &prepared.raw.as_ref().unwrap().value;
         let usm = &prepared.usm.as_ref().unwrap().value;
-        let level = raw.security_level();
         *client_context = registration.is_some_and(|registration| {
             registration
                 .classification_security
@@ -522,7 +528,8 @@ impl DispatchRoles {
                 .transpose()?
                 .unwrap_or(false);
         if let RawMsgData::Plaintext { data, offset } = &raw.msg_data {
-            let class = scoped_pdu_class(data.clone(), *offset, source);
+            let class =
+                PduPrefix::read(data.clone(), *offset, source).map(|prefix| Some(prefix.kind));
             if matches!(class, Ok(Some(kind)) if !matches!(kind, PduType::Response | PduType::Report))
             {
                 prepared.client_conflict = false;
@@ -545,53 +552,26 @@ impl DispatchRoles {
             return Ok(None);
         };
         let keys = keys.map_err(|_| Error::Auth { target: source }.boxed())?;
-        let auth = keys
-            .auth_key
-            .as_ref()
-            .ok_or_else(|| Error::Auth { target: source }.boxed())?;
-        let (offset, length) = UsmSecurityParams::find_auth_params_offset(bytes)
-            .ok_or_else(|| Error::Auth { target: source }.boxed())?;
         let envelope = envelope.ok_or_else(|| Error::Auth { target: source }.boxed())?;
-        if !level.requires_auth()
-            || !crate::v3::auth::verify_message(
-                auth,
-                &bytes[..envelope.content_end],
-                offset,
-                length,
-            )
-            .map_err(|_| Error::Auth { target: source }.boxed())?
-        {
-            return Err(Error::Auth { target: source }.boxed());
-        }
-        let key = keys
-            .priv_key
-            .as_ref()
-            .ok_or_else(|| Error::Auth { target: source }.boxed())?;
-        let RawMsgData::Encrypted(data) = &raw.msg_data else {
-            unreachable!()
-        };
-        let decrypted = key
-            .decrypt(data, usm.engine_boots, usm.engine_time, &usm.priv_params)
-            .map_err(|_| Error::Auth { target: source }.boxed());
-        let (class, plaintext) = match decrypted {
-            Ok(decrypted) => {
-                let class = scoped_pdu_class(decrypted.clone(), 0, source);
-                // Retention is optional: one-input budgets remain usable and
-                // cache admission must never await another frame's release.
-                let plaintext = buffers.try_extend(decrypted.len()).then_some(decrypted);
-                (class, plaintext)
-            }
-            Err(error) => (Err(error), None),
-        };
+        let (mut crypto, prefix) = PreparedCrypto::authenticate_and_decrypt(
+            bytes,
+            &bytes[..envelope.content_end],
+            raw,
+            usm,
+            keys,
+            identity,
+            source,
+        )?;
+        // Retention is optional: one-input budgets remain usable and cache
+        // admission never waits on another frame. Keep the bounded prefix.
+        crypto.plaintext = crypto
+            .plaintext
+            .filter(|data| buffers.try_extend(data.len()));
+        let class = prefix.map(|prefix| Some(prefix.kind));
         if matches!(class, Ok(Some(kind)) if !matches!(kind, PduType::Response | PduType::Report)) {
             prepared.client_conflict = false;
         }
-        prepared.crypto = Some(crate::v3::prepared::PreparedCrypto {
-            identity,
-            engine_id: usm.engine_id.clone(),
-            keys,
-            plaintext,
-        });
+        prepared.crypto = Some(crypto);
         class
     }
 }
@@ -610,16 +590,6 @@ fn community_pdu_class(
     peek_pdu_class(&decoder, envelope.version)
 }
 
-// Classification only needs the envelope's PDU tag. Leave varbind decoding,
-// suffix rules and role-specific compatibility checks to the selected consumer.
-// In particular, do not allocate OIDs/varbinds twice for every received message.
-fn scoped_pdu_class(data: Bytes, offset: usize, source: SocketAddr) -> Result<Option<PduType>> {
-    let mut decoder = Decoder::with_context(data, offset, Some(source));
-    let mut scoped = decoder.read_sequence()?;
-    scoped.read_octet_string()?; // contextEngineID
-    scoped.read_octet_string()?; // contextName
-    peek_pdu_class(&scoped, Version::V3)
-}
 fn peek_pdu_class(decoder: &Decoder<'_>, version: Version) -> Result<Option<PduType>> {
     let tag = decoder
         .peek_byte()

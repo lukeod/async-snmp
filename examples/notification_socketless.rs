@@ -1,8 +1,9 @@
 //! One caller-owned socket, two explicitly selected logical USM contexts.
-//! Run: cargo run --example notification_socketless -- ./receiver.state ./received.log
-//! Receives one accepted notification on 127.0.0.1:1162, serving discovery first.
-//! Peer 127.0.0.2 selects tenant A,
-//! 127.0.0.3 selects tenant B; other peers can only obtain engine discovery.
+//! Run `cargo run --example notification_socketless -- ./receiver.state ./received.log`.
+//! Receives one accepted notification on 127.0.0.1:1162 and answers engine discovery.
+//! Peer 127.0.0.2 selects tenant A and 127.0.0.3 selects tenant B. Each selected
+//! processor handles notifications, discovery, and stale Inform engine IDs in one
+//! call. Other peers use the shared local engine for discovery.
 //! Both tenants use username "collector", SHA-256 and distinct demo passwords.
 //! Engine ID/boots are atomically persisted and locked; retain the state file
 //! between runs. The append-and-sync log precedes deferred Inform encoding.
@@ -16,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use async_snmp::{
-    AuthProtocol, EncodedInformResponse, EndpointId, NotificationAcceptance,
+    AuthProtocol, DecodeConfig, EncodedInformResponse, EndpointId, NotificationAdmissionDecision,
     NotificationProcessResult, NotificationProcessor, ProcessingInput, ProcessingLimits,
     ReceivedMessageInfo, ReceivedPacket, SecurityLevel, UsmSecurityContext, UsmUser, UsmUserEntry,
 };
@@ -42,11 +43,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         NotificationProcessor::builder()
             .local_engine(engine.clone())
             .security_context(context)
-            .acceptance_policy(|notification| {
+            .admission_policy(|notification| {
                 if notification.security_level >= Some(SecurityLevel::AuthNoPriv) {
-                    NotificationAcceptance::Accept
+                    NotificationAdmissionDecision::Admit
                 } else {
-                    NotificationAcceptance::Reject
+                    NotificationAdmissionDecision::Reject
                 }
             })
             .build()
@@ -80,8 +81,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ReceivedPacket::new(Bytes::copy_from_slice(&buffer[..len]), info),
             limits,
         )?;
-        // Source addresses are deployment routing hints, not proof of tenant identity.
-        // Select once; never retry another context after a security failure.
+        // Use the source address to select one context. Admission requires USM authentication.
         let selected = match peer.ip() {
             IpAddr::V4(ip) if ip == Ipv4Addr::new(127, 0, 0, 2) => Some(&tenant_a),
             IpAddr::V4(ip) if ip == Ipv4Addr::new(127, 0, 0, 3) => Some(&tenant_b),
@@ -95,18 +95,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Dropping inform_response after persistence failure sends nothing.
                     notification_log::append(log.clone(), format!("{:?}", accepted.notification))
                         .await?;
-                    match accepted
+                    accepted
                         .inform_response
                         .map(|response| response.encode())
                         .transpose()?
-                    {
-                        Some(
-                            EncodedInformResponse::Response(bytes)
-                            | EncodedInformResponse::TooBig(bytes),
-                        ) => Some(bytes),
-                        Some(EncodedInformResponse::Suppressed) | None => None,
-                    }
+                        .and_then(EncodedInformResponse::into_bytes)
                 }
+                Ok(NotificationProcessResult::InformTooBig { response }) => response,
                 Ok(NotificationProcessResult::UsmFailed { failure, report }) => {
                     eprintln!("USM failure: {failure:?}");
                     report // Reports are protocol results, independent of persistence.
@@ -118,10 +113,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         } else {
-            match tenant_a.report_unknown_engine(input) {
+            // With no selected tenant, this endpoint advertises its shared engine.
+            match engine.report_unknown_engine(input, DecodeConfig::DEFAULT) {
                 Ok(report) => report,
                 Err(error) => {
-                    eprintln!("Unclaimed input: {error}");
+                    eprintln!("Invalid discovery input: {error}");
                     None
                 }
             }

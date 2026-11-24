@@ -12,7 +12,7 @@
 //! Run `cargo run --example notification_sender --features agent`.
 
 use async_snmp::agent::{Agent, NotificationOutcome, SinkStatus};
-use async_snmp::notification::{Notification, NotificationAcceptance, NotificationReceiver};
+use async_snmp::notification::{Notification, NotificationAdmissionDecision, NotificationReceiver};
 use async_snmp::v3::AuthoritativeEngine;
 use async_snmp::varbind::VarBind;
 use async_snmp::{
@@ -52,10 +52,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // This local example also receives cleartext SNMPv2c messages. For
         // SNMPv3, require authentication because configured keyed users also
         // support spoofable noAuthNoPriv input.
-        .acceptance_policy(|notification| match notification.security_level {
-            None => NotificationAcceptance::Accept,
-            Some(level) if level >= SecurityLevel::AuthNoPriv => NotificationAcceptance::Accept,
-            Some(_) => NotificationAcceptance::Reject,
+        .admission_policy(|notification| match notification.security_level {
+            None => NotificationAdmissionDecision::Admit,
+            Some(level) if level >= SecurityLevel::AuthNoPriv => {
+                NotificationAdmissionDecision::Admit
+            }
+            Some(_) => NotificationAdmissionDecision::Reject,
         })
         .spawn()
         .await?;

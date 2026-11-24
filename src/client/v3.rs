@@ -1812,6 +1812,7 @@ mod tests {
                     engine_id: engine_id.clone(),
                     keys: security.derive_keys(&engine_id).unwrap(),
                     plaintext: Some(plaintext),
+                    prefix: None,
                 });
                 let mut packet = crate::ReceivedPacket::new(wire.clone(), info);
                 packet.prepared = Some(Box::new(prepared));

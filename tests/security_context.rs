@@ -50,11 +50,11 @@ async fn explicit_empty_contexts_require_engine_and_application_policy() {
         .await
         .err()
         .unwrap();
-    assert!(matches!(*error, Error::Config(ref message) if message.contains("acceptance policy")));
+    assert!(matches!(*error, Error::Config(ref message) if message.contains("admission policy")));
     let error = NotificationReceiver::builder()
         .bind("not an address")
         .security_context(context.clone())
-        .accept_all_notifications()
+        .admit_all_notifications()
         .prepare()
         .await
         .err()
@@ -94,7 +94,7 @@ async fn replacement_reaches_shared_command_and_notification_roles_without_crypt
         .authoritative_engine(engine(b"shared-context-engine"))
         .security_context(context.clone())
         .allow_all_access()
-        .notifications(NotificationReceiver::builder().accept_all_notifications())
+        .notifications(NotificationReceiver::builder().admit_all_notifications())
         .spawn()
         .await
         .unwrap();
@@ -215,7 +215,7 @@ async fn replacement_can_add_aes_after_empty_context_preparation() {
         .authoritative_engine(engine(b"dynamic-privacy-engine"))
         .security_context(context.clone())
         .allow_all_access()
-        .notifications(NotificationReceiver::builder().accept_all_notifications())
+        .notifications(NotificationReceiver::builder().admit_all_notifications())
         .spawn()
         .await
         .unwrap();
@@ -273,7 +273,7 @@ async fn runtime_des_credentials_require_durable_sender_state_before_acknowledge
         .bind("127.0.0.1:0")
         .authoritative_engine(engine(b"dynamic-des-receiver"))
         .security_context(context.clone())
-        .accept_all_notifications()
+        .admit_all_notifications()
         .spawn()
         .await
         .unwrap();

@@ -37,15 +37,15 @@ async fn processing_started(receiver: &NotificationReceiver) {
 }
 
 #[tokio::test]
-async fn unpolled_consumer_acknowledges_and_queue_capacity_precedes_policy() {
+async fn unpolled_consumer_acknowledges_and_full_queue_blocks_the_next_ack() {
     let accepted = Arc::new(AtomicUsize::new(0));
     let calls = accepted.clone();
     let mut receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
         .queue_capacity(1)
-        .acceptance_policy(move |_| {
+        .admission_policy(move |_| {
             calls.fetch_add(1, Ordering::Relaxed);
-            NotificationAcceptance::Accept
+            NotificationAdmissionDecision::Admit
         })
         .spawn()
         .await
@@ -62,7 +62,7 @@ async fn unpolled_consumer_acknowledges_and_queue_capacity_precedes_policy() {
         .await
         .unwrap();
     no_ack(&sender).await;
-    assert_eq!(accepted.load(Ordering::Relaxed), 1);
+    assert_eq!(accepted.load(Ordering::Relaxed), 2);
     assert_eq!(receiver.control().overload_drops(), 1);
     let event = receiver.recv().await.unwrap();
     assert!(matches!(
@@ -447,7 +447,7 @@ async fn persistence_degradation_withholds_local_acceptance_and_recovers_without
             user.auth(crate::AuthProtocol::Sha1, b"authpass12345678")
         })
         .unwrap()
-        .accept_all_notifications()
+        .admit_all_notifications()
         .spawn()
         .await
         .unwrap();

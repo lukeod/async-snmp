@@ -217,7 +217,7 @@ impl AgentProcessor {
             accepted_receive_size: limits.receive.accepted(),
             decode_config: state.decode_config,
             outbound_limit: state.max_message_size.min(limits.send),
-            usm_users: users,
+            usm_users: Some(users),
             stats: &state.usm_stats,
             mpd: Some(MpdCounters {
                 invalid_msgs: &state.snmp_invalid_msgs,
@@ -230,7 +230,7 @@ impl AgentProcessor {
             match process_prepared_v3_inbound(data, &usm_ctx, &V3Role::Authoritative, prepared)? {
                 V3Inbound::Failed { report, .. } => return Ok(report),
                 // Step 7b does not apply to the authoritative role.
-                V3Inbound::RemoteNotInTimeWindow => return Ok(None),
+                V3Inbound::RemoteNotInTimeWindow | V3Inbound::Ignored => return Ok(None),
                 V3Inbound::Message(inbound) => inbound,
             };
         let global_data = &inbound.global_data;

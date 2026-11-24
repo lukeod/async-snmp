@@ -43,6 +43,13 @@ fn response(result: NotificationProcessResult) -> InformResponse {
     event.inform_response.unwrap()
 }
 
+fn ordinary_bytes(pending: InformResponse) -> Bytes {
+    let EncodedInformResponse::Response(bytes) = pending.encode().unwrap() else {
+        panic!("expected ordinary Inform response");
+    };
+    bytes
+}
+
 fn wire_no_auth(id: &[u8], user: &str) -> Bytes {
     let usm = UsmSecurityParams::new(
         Bytes::copy_from_slice(id),
@@ -103,7 +110,7 @@ fn deferred_response_uses_current_clock_and_retains_selected_credentials() {
     let processor = NotificationProcessor::builder()
         .local_engine(local.clone())
         .security_context(context.clone())
-        .accept_all_notifications()
+        .admit_all_notifications()
         .build()
         .unwrap();
     let security = crate::UsmConfig::new("user")
@@ -123,9 +130,7 @@ fn deferred_response_uses_current_clock_and_retains_selected_credentials() {
         .authoritative_engine()
         .unwrap()
         .set_elapsed_for_test(125);
-    let EncodedInformResponse::Response(encoded) = pending.encode().unwrap() else {
-        panic!("expected response")
-    };
+    let encoded = ordinary_bytes(pending);
     let decoded = V3Message::decode(encoded.clone(), crate::DecodeConfig::DEFAULT)
         .unwrap()
         .value;
@@ -196,7 +201,7 @@ fn deferred_des_response_observes_missing_removed_and_replaced_sender_state() {
     let processor = NotificationProcessor::builder()
         .local_engine(local.clone())
         .security_context(context)
-        .accept_all_notifications()
+        .admit_all_notifications()
         .build()
         .unwrap();
     let accept = || {
@@ -209,6 +214,20 @@ fn deferred_des_response_observes_missing_removed_and_replaced_sender_state() {
     let missing = accept();
     assert!(matches!(*missing.encode().unwrap_err(), Error::Config(_)));
     local.set_des_salt_state(Some(state.clone())).unwrap();
+
+    let exact_len = ordinary_bytes(accept()).len();
+    let wire = signed_input(&local, &security, Some(&state))
+        .bytes()
+        .clone();
+    let exact_limit = ProcessingLimits::new(crate::UDP_RECEIVE_LIMITS, exact_len).unwrap();
+    let exact = response(processor.process(input(wire.clone(), exact_limit)).unwrap());
+    assert_eq!(ordinary_bytes(exact).len(), exact_len);
+    let undersized_limit = ProcessingLimits::new(crate::UDP_RECEIVE_LIMITS, exact_len - 1).unwrap();
+    assert!(matches!(
+        processor.process(input(wire, undersized_limit)).unwrap(),
+        NotificationProcessResult::InformTooBig { response: Some(bytes) } if bytes.len() < exact_len
+    ));
+
     let removed = accept();
     local.set_des_salt_state(None).unwrap();
     assert!(matches!(*removed.encode().unwrap_err(), Error::Config(_)));
@@ -229,9 +248,7 @@ fn deferred_des_response_observes_missing_removed_and_replaced_sender_state() {
     let renewed =
         DesSaltState::restart(state.persisted_state(), |_| Ok::<_, Infallible>(())).unwrap();
     local.set_des_salt_state(Some(renewed)).unwrap();
-    let EncodedInformResponse::Response(encoded) = replace.encode().unwrap() else {
-        panic!("expected replacement state response")
-    };
+    let encoded = ordinary_bytes(replace);
     let decoded = V3Message::decode(encoded, crate::DecodeConfig::DEFAULT)
         .unwrap()
         .value;
@@ -270,7 +287,7 @@ fn lower_security_notification_does_not_initialize_unused_aes_state() {
     let processor = NotificationProcessor::builder()
         .local_engine(local.clone())
         .security_context(context)
-        .accept_all_notifications()
+        .admit_all_notifications()
         .build()
         .unwrap();
     let pending = response(
@@ -281,15 +298,12 @@ fn lower_security_notification_does_not_initialize_unused_aes_state() {
             ))
             .unwrap(),
     );
-    assert!(matches!(
-        pending.encode().unwrap(),
-        EncodedInformResponse::Response(_)
-    ));
+    assert!(!ordinary_bytes(pending).is_empty());
     assert!(local.salt_counter().is_none());
 }
 
 #[test]
-fn dropping_deferred_inform_does_not_encode_or_increment_silent_drops() {
+fn suppressed_inform_counts_once_without_producing_response_capability() {
     let local = engine();
     let processor = NotificationProcessor::builder()
         .local_engine(local.clone())
@@ -299,18 +313,62 @@ fn dropping_deferred_inform_does_not_encode_or_increment_silent_drops() {
         .unwrap()
         .encode()
         .unwrap();
-    let limits = ProcessingLimits::new(crate::UDP_RECEIVE_LIMITS, 1).unwrap();
-    let pending = response(processor.process(input(wire.clone(), limits)).unwrap());
-    assert_eq!(local.inner.snmp_silent_drops.load(Ordering::Relaxed), 0);
+    let pending = response(
+        processor
+            .process(input(wire.clone(), ProcessingLimits::UDP))
+            .unwrap(),
+    );
     drop(pending);
     assert_eq!(local.inner.snmp_silent_drops.load(Ordering::Relaxed), 0);
+    let limits = ProcessingLimits::new(crate::UDP_RECEIVE_LIMITS, 1).unwrap();
     assert!(matches!(
-        response(processor.process(input(wire, limits)).unwrap())
-            .encode()
-            .unwrap(),
-        EncodedInformResponse::Suppressed
+        processor.process(input(wire, limits)).unwrap(),
+        NotificationProcessResult::InformTooBig { response: None }
     ));
     assert_eq!(local.inner.snmp_silent_drops.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn deferred_response_width_growth_falls_back_to_too_big() {
+    let local = engine();
+    let authoritative = local.authoritative_engine().unwrap();
+    authoritative.set_elapsed_for_test(127);
+    let context =
+        crate::UsmSecurityContext::new([crate::UsmUserEntry::new(UsmUser::new("user"))]).unwrap();
+    let processor = NotificationProcessor::builder()
+        .local_engine(local.clone())
+        .security_context(context)
+        .admit_all_notifications()
+        .build()
+        .unwrap();
+    let wire = wire_no_auth(local.engine_id(), "user");
+    let size = ordinary_bytes(response(
+        processor
+            .process(input(wire.clone(), ProcessingLimits::UDP))
+            .unwrap(),
+    ))
+    .len();
+    let limits = ProcessingLimits::new(crate::UDP_RECEIVE_LIMITS, size).unwrap();
+    let pending = response(processor.process(input(wire.clone(), limits)).unwrap());
+    authoritative.set_elapsed_for_test(128);
+    let EncodedInformResponse::TooBig(bytes) = pending.encode().unwrap() else {
+        panic!("expected a tooBig reply after the engine time grew");
+    };
+    assert!(bytes.len() <= size);
+    assert!(matches!(
+        processor.process(input(wire, limits)).unwrap(),
+        NotificationProcessResult::InformTooBig { response: Some(early) } if early == bytes
+    ));
+    let decoded = V3Message::decode(bytes, crate::DecodeConfig::DEFAULT)
+        .unwrap()
+        .value;
+    assert_eq!(decoded.global_data().msg_id(), 71);
+    let reply = &decoded.scoped_pdu().unwrap().pdu;
+    assert_eq!(reply.request_id(), 42);
+    assert_eq!(reply.error_status_enum(), crate::ErrorStatus::TooBig);
+    assert_eq!(reply.error_index(), 0);
+    assert!(reply.varbinds().is_empty());
+    assert_eq!(local.inner.snmp_silent_drops.load(Ordering::Relaxed), 0);
 }
 
 #[tokio::test]
@@ -373,8 +431,11 @@ fn unclaimed_and_receiver_invalid_flags_have_common_mpd_accounting() {
     );
     assert_eq!(local.inner.snmp_invalid_msgs.load(Ordering::Relaxed), 1);
     assert!(
-        processor
-            .report_unknown_engine(input(wire, ProcessingLimits::UDP))
+        local
+            .report_unknown_engine(
+                input(wire, ProcessingLimits::UDP),
+                crate::DecodeConfig::DEFAULT
+            )
             .is_err()
     );
     assert_eq!(local.inner.snmp_invalid_msgs.load(Ordering::Relaxed), 2);

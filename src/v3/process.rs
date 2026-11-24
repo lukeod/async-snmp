@@ -18,6 +18,7 @@ use bytes::Bytes;
 use super::DerivedKeys;
 #[cfg(test)]
 use super::UsmUser;
+use super::prepared::{PduPrefix, PreparedCrypto};
 use crate::error::{Error, Result};
 use crate::message::{
     MsgGlobalData, RawMsgData, RawV3Message, ScopedPdu, SecurityLevel, combine_staged_v3_anomalies,
@@ -25,6 +26,7 @@ use crate::message::{
 };
 use crate::message_size::MessageSize;
 use crate::oid::Oid;
+use crate::pdu::PduType;
 use crate::v3::auth::verify_message;
 use crate::v3::encode::encode_v3_report;
 use crate::v3::recency_map::RecencyMap;
@@ -144,6 +146,7 @@ pub(crate) enum V3Role<'a> {
     /// Authoritative engine (agent): only messages under its own engine ID
     /// are accepted (RFC 3414 Section 3.2 Step 3), timeliness is Step 7a
     /// against its own boots/time.
+    #[cfg(any(feature = "agent", test))]
     Authoritative,
     /// Non-authoritative receiver (notification receiver): messages under
     /// its own engine ID (informs) use Step 7a; messages under a remote
@@ -152,19 +155,17 @@ pub(crate) enum V3Role<'a> {
     Receiver {
         remote_engines: &'a Mutex<RemoteEngineTable>,
     },
+    /// An endpoint answering discovery before selecting an application.
+    Unclaimed,
 }
 
 pub(crate) type RemoteEngineTable = RecencyMap<Bytes, EngineState>;
 
 impl V3Role<'_> {
-    fn is_authoritative(&self) -> bool {
-        matches!(self, Self::Authoritative)
-    }
-
     fn remote_engines(&self) -> &Mutex<RemoteEngineTable> {
         match self {
-            Self::Authoritative => unreachable!("authoritative role rejected a foreign engine ID"),
             Self::Receiver { remote_engines } => remote_engines,
+            _ => unreachable!("authoritative role rejected a foreign engine ID"),
         }
     }
 }
@@ -186,7 +187,7 @@ pub(crate) struct V3LocalContext<'a> {
     pub(crate) decode_config: crate::DecodeConfig,
     /// Local policy bound for outbound responses and Reports.
     pub(crate) outbound_limit: usize,
-    pub(crate) usm_users: Arc<super::security::UsmUsers>,
+    pub(crate) usm_users: Option<Arc<super::security::UsmUsers>>,
     pub(crate) stats: &'a UsmStats,
     pub(crate) mpd: Option<MpdCounters<'a>>,
     pub(crate) source: SocketAddr,
@@ -223,6 +224,8 @@ pub(crate) enum V3Inbound {
     /// engine: a bare error indication. usmStatsNotInTimeWindows and the
     /// notInTimeWindows Report apply only to the authoritative case (7a).
     RemoteNotInTimeWindow,
+    /// The discovery fallback received its own engine ID.
+    Ignored,
 }
 
 /// Run the RFC 3414 Section 3.2 step sequence over an inbound V3 message.
@@ -309,77 +312,122 @@ pub(crate) fn process_prepared_v3_inbound(
     decode_anomalies = combine_staged_v3_anomalies(decode_anomalies, usm_params.anomalies);
     let usm_params = usm_params.value;
 
+    let engine_is_local = usm_params.engine_id == *ctx.engine_id;
+    if engine_is_local && matches!(role, V3Role::Unclaimed) {
+        return Ok(V3Inbound::Ignored);
+    }
+    let engine_is_valid = validate_engine_id(&usm_params.engine_id).is_ok();
+    let mut prefix = match &msg.msg_data {
+        RawMsgData::Plaintext { data, offset } => {
+            PduPrefix::read(data.clone(), *offset, source).ok()
+        }
+        RawMsgData::Encrypted(_) => None,
+    };
+
+    // Route evidence can be recovered with the selected application credentials
+    // even when the result will be an authoritative-engine mismatch. Any work
+    // here is speculative until the ordered USM path below publishes its result.
+    let lookup_user = || {
+        ctx.usm_users
+            .as_ref()?
+            .lookup(&usm_params.engine_id, &usm_params.username)
+    };
+    let mut crypto = None;
+    let mut user = None;
+    if let RawMsgData::Encrypted(_) = &msg.msg_data {
+        crypto = prepared
+            .as_mut()
+            .and_then(|prepared| prepared.crypto.take());
+        let mixed_foreign =
+            engine_is_valid && !engine_is_local && matches!(role, V3Role::Receiver { .. });
+        if engine_is_valid && (mixed_foreign || crypto.is_some()) {
+            user = lookup_user();
+            crypto = crypto.filter(|crypto| {
+                user.is_some_and(|user| crypto.matches_user(user, &usm_params.engine_id))
+            });
+        }
+        if mixed_foreign && crypto.is_none() {
+            crypto = user.and_then(|user| {
+                let keys = user.derive_keys(&usm_params.engine_id).ok()?;
+                PreparedCrypto::authenticate_and_decrypt(
+                    &data,
+                    &authenticated_data,
+                    &msg,
+                    &usm_params,
+                    keys,
+                    user.credential_identity(),
+                    source,
+                )
+                .ok()
+                .map(|(crypto, _)| crypto)
+            });
+        }
+        // The prefix decoder has no policy-dependent fields and the envelope
+        // above has already been accepted under the current receive policy.
+        prefix = crypto.as_ref().and_then(|crypto| crypto.prefix);
+    }
+    let reportable = |prefix: Option<PduPrefix>| {
+        prefix.map_or(msg.global_data.msg_flags.reportable, |prefix| {
+            prefix.kind.is_confirmed()
+        })
+    };
+
     // Encodes the Report for `failure` (counting it first), unauthenticated
     // unless `auth_key` is given (notInTimeWindows, RFC 3414 3.2 Step 7a).
-    let fail = |failure: UsmFailure, auth_key: Option<&LocalizedKey>| -> Result<V3Inbound> {
-        let count = ctx.stats.count(failure);
-        // RFC 3412 Section 7.1 Step 3: a Report may only be sent when the
-        // PDU is Confirmed Class or, when the PDU class cannot be determined
-        // (the case here: the message failed USM processing), when the
-        // reportableFlag is set.
-        let report = if msg.global_data.msg_flags.reportable {
-            let (engine_boots, engine_time) = ctx.authoritative_boots_time()?;
-            let encoded = encode_v3_report(
-                msg.global_data.msg_id,
-                ctx.local_receive_capacity,
-                UsmSecurityParams::new(
-                    ctx.engine_id.clone(),
-                    engine_boots,
-                    engine_time,
-                    usm_params.username.clone(),
-                )?,
-                failure.report_oid(),
-                count,
-                auth_key,
-                source,
-            )?;
-            crate::response_finalizer::finalize_report(
-                encoded,
-                ctx.outbound_limit,
-                Some(msg.global_data.msg_max_size.as_usize()),
-            )
-        } else {
-            None
+    let fail =
+        |failure: UsmFailure, auth_key: Option<&LocalizedKey>, prefix| -> Result<V3Inbound> {
+            let count = ctx.stats.count(failure);
+            // RFC 3412 Section 7.1 Step 3 uses the PDU type when available.
+            let report = if reportable(prefix) {
+                let (engine_boots, engine_time) = ctx.authoritative_boots_time()?;
+                let encoded = encode_v3_report(
+                    msg.global_data.msg_id,
+                    prefix.and_then(|prefix| prefix.request_id),
+                    ctx.local_receive_capacity,
+                    UsmSecurityParams::new(
+                        ctx.engine_id.clone(),
+                        engine_boots,
+                        engine_time,
+                        usm_params.username.clone(),
+                    )?,
+                    failure.report_oid(),
+                    count,
+                    auth_key,
+                    source,
+                )?;
+                crate::response_finalizer::finalize_report(
+                    encoded,
+                    ctx.outbound_limit,
+                    Some(msg.global_data.msg_max_size.as_usize()),
+                )
+            } else {
+                None
+            };
+            Ok(V3Inbound::Failed { failure, report })
         };
-        Ok(V3Inbound::Failed { failure, report })
-    };
 
     // RFC 3414 Section 3.2 Step 3: engine-ID handling. An empty engine ID is
     // a discovery request (RFC 3414 Section 4); both cases answer with
     // usmStatsUnknownEngineIDs. Do not validate authentication/privacy field
     // relationships here: Steps 3 and 4 take precedence over those semantics.
-    if usm_params.engine_id.is_empty() {
-        return fail(UsmFailure::UnknownEngineIds, None);
-    }
-    if validate_engine_id(&usm_params.engine_id).is_err() {
+    if !engine_is_valid {
         tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, length = usm_params.engine_id.len() }, "invalid engine ID");
-        return fail(UsmFailure::UnknownEngineIds, None);
+        return fail(UsmFailure::UnknownEngineIds, None, prefix);
     }
-    let engine_is_local = usm_params.engine_id == *ctx.engine_id;
-    if role.is_authoritative() && !engine_is_local {
+    if !engine_is_local && (!matches!(role, V3Role::Receiver { .. }) || reportable(prefix)) {
         tracing::debug!(target: "async_snmp::v3", { snmp.source = %source }, "engine ID mismatch");
-        return fail(UsmFailure::UnknownEngineIds, None);
+        return fail(UsmFailure::UnknownEngineIds, None, prefix);
     }
 
     // RFC 3414 Section 3.2 Step 4: the user must exist in the local user
     // database regardless of security level.
-    let Some(user_config) = ctx
-        .usm_users
-        .lookup(&usm_params.engine_id, &usm_params.username)
-    else {
+    let Some(user_config) = user.or_else(lookup_user) else {
         tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.username = ?usm_params.username }, "unknown user");
-        return fail(UsmFailure::UnknownUserNames, None);
+        return fail(UsmFailure::UnknownUserNames, None, prefix);
     };
     // Keys are localized to the message's (authoritative) engine ID: the
     // local engine ID for the authoritative role and informs, the sender's
     // for traps from a remote authoritative engine.
-    let crypto = prepared
-        .as_mut()
-        .and_then(|p| p.crypto.take())
-        .filter(|crypto| {
-            Arc::ptr_eq(&crypto.identity, &user_config.credential_identity())
-                && crypto.engine_id == usm_params.engine_id
-        });
     let (derived_keys, mut plaintext, authenticated) = if let Some(crypto) = crypto {
         (crypto.keys, crypto.plaintext, true)
     } else {
@@ -400,7 +448,7 @@ pub(crate) fn process_prepared_v3_inbound(
             && (security_level != SecurityLevel::AuthPriv || derived_keys.priv_key.is_some());
         if !supported {
             tracing::debug!(target: "async_snmp::v3", { snmp.source = %source, snmp.username = ?usm_params.username }, "user does not support requested security level");
-            return fail(UsmFailure::UnsupportedSecLevels, None);
+            return fail(UsmFailure::UnsupportedSecLevels, None, prefix);
         }
     }
 
@@ -418,13 +466,13 @@ pub(crate) fn process_prepared_v3_inbound(
                 // defensive. At Step 6 an unusable authentication field is
                 // authentication failure, not an uncounted local decode error.
                 tracing::debug!(target: "async_snmp::v3", { source = %source }, "could not locate authentication parameters");
-                return fail(UsmFailure::WrongDigests, None);
+                return fail(UsmFailure::WrongDigests, None, prefix);
             };
             if !verify_message(auth_key, &authenticated_data, auth_offset, auth_len)
                 .map_err(|_| Error::Auth { target: source }.boxed())?
             {
                 tracing::debug!(target: "async_snmp::v3", { snmp.source = %source }, "authentication failed");
-                return fail(UsmFailure::WrongDigests, None);
+                return fail(UsmFailure::WrongDigests, None, prefix);
             }
         }
 
@@ -444,9 +492,30 @@ pub(crate) fn process_prepared_v3_inbound(
                 // RFC 3414 Section 3.2 Step 7a: the report must be
                 // authenticated at authNoPriv so the sender can authenticate
                 // the tuple and apply normal Step 7(b) timeliness processing.
-                return fail(UsmFailure::NotInTimeWindows, Some(auth_key));
+                let report_prefix = prefix.or_else(|| {
+                    // The digest already passed. Recover a private PDU's
+                    // prefix even on the path with no transport classifier.
+                    let RawMsgData::Encrypted(ciphertext) = &msg.msg_data else {
+                        return None;
+                    };
+                    let plaintext = match plaintext.take() {
+                        Some(plaintext) => plaintext,
+                        None => derived_keys
+                            .priv_key
+                            .as_ref()?
+                            .decrypt(
+                                ciphertext,
+                                usm_params.engine_boots,
+                                usm_params.engine_time,
+                                &usm_params.priv_params,
+                            )
+                            .ok()?,
+                    };
+                    PduPrefix::read(plaintext, 0, source).ok()
+                });
+                return fail(UsmFailure::NotInTimeWindows, Some(auth_key), report_prefix);
             }
-        } else {
+        } else if prefix.is_some_and(|prefix| prefix.kind == PduType::TrapV2) {
             let remote_engines = role.remote_engines();
             // Step 7b: the sender is the authoritative engine (traps sent
             // under the sender's engine ID), checked against per-engine
@@ -494,6 +563,9 @@ pub(crate) fn process_prepared_v3_inbound(
                 return Ok(V3Inbound::RemoteNotInTimeWindow);
             }
         }
+        // An opaque packet with a clear flag takes the non-authoritative
+        // failure path. A positive trap classification is required to change
+        // the clock used for subsequent traps on this mixed listener.
     }
 
     // RFC 3414 does not assign a failure counter to extra auth/priv fields at
@@ -539,7 +611,7 @@ pub(crate) fn process_prepared_v3_inbound(
                 Ok(data) => data,
                 Err(e) => {
                     tracing::debug!(target: "async_snmp::v3", { source = %source, error = %e }, "decryption failed");
-                    return fail(UsmFailure::DecryptionErrors, None);
+                    return fail(UsmFailure::DecryptionErrors, None, prefix);
                 }
             };
 
@@ -605,8 +677,9 @@ mod tests {
             accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
             decode_config: crate::DecodeConfig::default(),
             outbound_limit: 8192,
-            usm_users: super::super::UsmSecurityContext::from_prepared(usm_users.clone())
-                .snapshot(),
+            usm_users: Some(
+                super::super::UsmSecurityContext::from_prepared(usm_users.clone()).snapshot(),
+            ),
             stats,
             mpd,
             source: "127.0.0.1:9999".parse().unwrap(),
@@ -615,6 +688,10 @@ mod tests {
 
     /// Build a plaintext noAuthNoPriv V3 message carrying a GetRequest.
     fn build_msg(engine_id: &[u8], username: &[u8], reportable: bool) -> Bytes {
+        build_msg_with_pdu(engine_id, username, reportable, Pdu::get_request(42, &[]))
+    }
+
+    fn build_msg_with_pdu(engine_id: &[u8], username: &[u8], reportable: bool, pdu: Pdu) -> Bytes {
         let global = MsgGlobalData::new(
             1,
             crate::MessageSize::new(65507).unwrap(),
@@ -632,11 +709,7 @@ mod tests {
             )
             .unwrap()
         };
-        let scoped = ScopedPdu::new(
-            Bytes::copy_from_slice(engine_id),
-            Bytes::new(),
-            Pdu::get_request(42, &[]),
-        );
+        let scoped = ScopedPdu::new(Bytes::copy_from_slice(engine_id), Bytes::new(), pdu);
         V3Message::new(global, usm.encode().unwrap(), scoped)
             .unwrap()
             .encode()
@@ -907,7 +980,7 @@ mod tests {
         assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 0);
     }
 
-    /// A notification receiver accepts a foreign authoritative engine ID, so
+    /// The clear flag of an opaque packet selects the remote failure path.
     /// Step 4 unknown-user processing precedes contradictory required fields.
     #[test]
     fn receiver_unknown_user_precedes_missing_auth_priv_fields() {
@@ -919,7 +992,7 @@ mod tests {
             b"\x80\x00\x00\x00\x01remote",
             b"nobody",
             SecurityLevel::AuthPriv,
-            true,
+            false,
             b"",
             b"",
         );
@@ -929,12 +1002,13 @@ mod tests {
         };
 
         let outcome = process_v3_inbound(data, &ctx, &role).unwrap();
-        assert_report(
+        assert!(matches!(
             outcome,
-            UsmFailure::UnknownUserNames,
-            report_oids::unknown_user_names(),
-            1,
-        );
+            V3Inbound::Failed {
+                failure: UsmFailure::UnknownUserNames,
+                report: None,
+            }
+        ));
         assert!(remote_engines.lock().unwrap().is_empty());
         assert_eq!(stats.unknown_engine_ids.load(Ordering::Relaxed), 0);
         assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 1);
@@ -1122,6 +1196,113 @@ mod tests {
         assert_eq!(stats.decryption_errors.load(Ordering::Relaxed), 1);
     }
 
+    #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+    #[test]
+    fn opaque_authenticated_message_leaves_the_remote_trap_clock_unchanged() {
+        use crate::v3::{AuthProtocol, PrivProtocol, SaltCounter, UsmConfig};
+
+        let foreign = b"remote-sender-engine";
+        let security = UsmConfig::new("user")
+            .auth_priv(
+                AuthProtocol::Sha256,
+                b"auth-password",
+                PrivProtocol::Aes128,
+                b"priv-password",
+            )
+            .unwrap();
+        let keys = security.derive_keys(foreign).unwrap();
+        let auth_key = keys.auth_key.as_ref().unwrap();
+        let users = HashMap::from([(
+            Bytes::from_static(b"user"),
+            UsmUser::new("user")
+                .auth_priv(
+                    AuthProtocol::Sha256,
+                    b"auth-password",
+                    PrivProtocol::Aes128,
+                    b"priv-password",
+                )
+                .unwrap(),
+        )]);
+        let engine_id = local_engine_id();
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let engines = Mutex::new(RemoteEngineTable::new(1));
+        let role = V3Role::Receiver {
+            remote_engines: &engines,
+        };
+        let trap = crate::NotificationPdu::trap_v2(
+            crate::Version::V3,
+            42,
+            1000,
+            &crate::notification::oids::cold_start(),
+            vec![],
+        )
+        .unwrap();
+        let trap: Bytes = crate::v3::encode::encode_v3_message(
+            &trap.into_raw(),
+            71,
+            foreign,
+            6,
+            1000,
+            &security,
+            Some(&keys),
+            Some(&SaltCounter::from_value(1)),
+            None,
+            None,
+            false,
+            crate::UDP_RECEIVE_LIMITS.advertised(),
+        )
+        .unwrap()
+        .into();
+        assert!(matches!(
+            process_v3_inbound(trap.clone(), &ctx, &role).unwrap(),
+            V3Inbound::Message(_)
+        ));
+
+        // The opaque message claims boots 7. Its HMAC is valid but the AES
+        // salt is malformed, so the payload type remains unknown.
+        for reportable in [false, true] {
+            let mut data = build_raw_usm_msg(
+                foreign,
+                b"user",
+                SecurityLevel::AuthPriv,
+                reportable,
+                &vec![0; auth_key.mac_len()],
+                b"bad",
+            )
+            .to_vec();
+            let (offset, len) = UsmSecurityParams::find_auth_params_offset(&data).unwrap();
+            crate::v3::auth::authenticate_message(auth_key, &mut data, offset, len).unwrap();
+            let V3Inbound::Failed { failure, report } =
+                process_v3_inbound(data.into(), &ctx, &role).unwrap()
+            else {
+                panic!("expected a USM failure");
+            };
+            if reportable {
+                assert_eq!(failure, UsmFailure::UnknownEngineIds);
+                let report = V3Message::decode(report.unwrap(), crate::DecodeConfig::DEFAULT)
+                    .unwrap()
+                    .value;
+                assert_eq!(report.pdu().unwrap().request_id, 0);
+            } else {
+                assert_eq!(failure, UsmFailure::DecryptionErrors);
+                assert!(report.is_none());
+            }
+        }
+        assert!(matches!(
+            process_v3_inbound(trap, &ctx, &role).unwrap(),
+            V3Inbound::Message(_)
+        ));
+        assert_eq!(
+            stats.snapshot(),
+            UsmStatsSnapshot {
+                unknown_engine_ids: 1,
+                decryption_errors: 1,
+                ..UsmStatsSnapshot::default()
+            }
+        );
+    }
+
     /// Once valid authPriv input reaches scoped-PDU parsing, any structural
     /// failure is measured in decrypted plaintext rather than packet bytes.
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
@@ -1269,7 +1450,14 @@ mod tests {
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
-        let data = build_msg(&engine_id, b"nobody", false);
+        let data = build_raw_usm_msg(
+            &engine_id,
+            b"nobody",
+            SecurityLevel::AuthPriv,
+            false,
+            b"",
+            b"",
+        );
         let outcome = process_v3_inbound(data, &ctx, &V3Role::Authoritative).unwrap();
 
         let V3Inbound::Failed { failure, report } = outcome else {
@@ -1281,6 +1469,27 @@ mod tests {
             "reportable=false must suppress the report"
         );
         assert_eq!(stats.unknown_usernames.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn malformed_request_id_preserves_the_confirmed_class_for_reports() {
+        let engine_id = local_engine_id();
+        let users = HashMap::new();
+        let stats = UsmStats::default();
+        let ctx = test_ctx(&engine_id, &users, &stats, None);
+        let message = build_msg(b"foreign-engine", b"user", false);
+        let message = patch(&message, &[0x02, 0x01, 42, 0x02, 0x01, 0], 0, 0x04);
+        let V3Inbound::Failed {
+            failure: UsmFailure::UnknownEngineIds,
+            report: Some(report),
+        } = process_v3_inbound(message, &ctx, &V3Role::Authoritative).unwrap()
+        else {
+            panic!("confirmed PDU type must be usable without a request ID");
+        };
+        let report = V3Message::decode(report, crate::DecodeConfig::DEFAULT)
+            .unwrap()
+            .value;
+        assert_eq!(report.pdu().unwrap().request_id, 0);
     }
 
     /// RFC 3414 Section 3.2 Step 6 precedes scoped-PDU parsing: a message
@@ -1419,7 +1628,16 @@ mod tests {
         let stats = UsmStats::default();
         let ctx = test_ctx(&engine_id, &users, &stats, None);
 
-        let data = build_msg(b"\x80\x00\x00\x00\x01remote", b"user", true);
+        let trap = crate::NotificationPdu::trap_v2(
+            crate::Version::V3,
+            42,
+            0,
+            &crate::notification::oids::snmp_trap_oid(),
+            vec![],
+        )
+        .unwrap()
+        .into_raw();
+        let data = build_msg_with_pdu(b"\x80\x00\x00\x00\x01remote", b"user", false, trap);
 
         let outcome = process_v3_inbound(data.clone(), &ctx, &V3Role::Authoritative).unwrap();
         let V3Inbound::Failed { failure, .. } = outcome else {

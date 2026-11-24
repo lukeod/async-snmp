@@ -309,7 +309,7 @@ async fn rejected_and_disabled_notification_inputs_remain_observable() {
                 .bind("127.0.0.1:0")
                 .observer(observer.clone()),
         ))
-        .acceptance_policy(|_| async_snmp::NotificationAcceptance::Reject)
+        .admission_policy(|_| async_snmp::NotificationAdmissionDecision::Reject)
         .spawn()
         .await
         .unwrap();

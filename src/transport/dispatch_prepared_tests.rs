@@ -91,7 +91,7 @@ fn context<'a>(
         accepted_receive_size: crate::UDP_RECEIVE_LIMITS.accepted(),
         decode_config: config,
         outbound_limit: 8192,
-        usm_users: crate::UsmSecurityContext::from_prepared(users.clone()).snapshot(),
+        usm_users: Some(crate::UsmSecurityContext::from_prepared(users.clone()).snapshot()),
         stats,
         mpd: None,
         source: "127.0.0.1:9999".parse().unwrap(),
@@ -383,7 +383,7 @@ async fn credential_selection_survives_success_and_failed_auth_classification() 
             assert!(Arc::ptr_eq(&old, &selected));
             assert!(!Arc::ptr_eq(&selected, &security_context.snapshot()));
             let mut ctx = context(&engine, &empty, &stats, crate::DecodeConfig::DEFAULT);
-            ctx.usm_users = selected;
+            ctx.usm_users = Some(selected);
             process_prepared_v3_inbound(bytes, &ctx, &V3Role::Authoritative, prepared)
         });
         if initially_valid {

@@ -1247,7 +1247,7 @@ mod tests {
                 )
             })
             .unwrap()
-            .accept_all_notifications()
+            .admit_all_notifications()
             .spawn()
             .await
             .unwrap();
@@ -1352,7 +1352,7 @@ mod tests {
                 )
             })
             .unwrap()
-            .accept_all_notifications()
+            .admit_all_notifications()
             .spawn()
             .await
             .unwrap();

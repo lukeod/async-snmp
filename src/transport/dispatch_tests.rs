@@ -22,7 +22,7 @@ fn agent(id: &'static [u8]) -> crate::agent::AgentBuilder {
         .allow_all_access()
         .authoritative_engine(engine(id))
         .client_exchanges(true)
-        .notifications(NotificationReceiver::builder().accept_all_notifications())
+        .notifications(NotificationReceiver::builder().admit_all_notifications())
 }
 fn endpoint(agent: &Agent) -> UdpEndpoint {
     agent
@@ -529,12 +529,19 @@ async fn shared_v3_discovery_get_and_inform_at_every_security_level() {
 #[tokio::test]
 async fn encrypted_collisions_select_commands_informs_and_remote_traps_without_consuming_exchange()
 {
+    const COLLISION_ID: i32 = 77;
+    const REMOTE_ENGINE: &[u8] = b"remote-response-engine";
+
     let mut service = secured_agent(b"collision-local-engine")
         .spawn()
         .await
         .unwrap();
     let mut notifications = service.take_notifications().unwrap();
     let endpoint = endpoint(&service);
+    let mut config = security("priv");
+    config.validate_and_precompute().unwrap();
+    let encode = |pdu, engine| secured(pdu, COLLISION_ID, engine, &config);
+    let trap_oid = crate::notification::oids::cold_start();
     for same_peer in [true, false] {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -542,24 +549,39 @@ async fn encrypted_collisions_select_commands_informs_and_remote_traps_without_c
             .handle(peer.local_addr().unwrap())
             .unwrap()
             .strict_source(true);
-        let config = security("priv");
-        let registration =
-            RequestRegistration::v3(77, tokio::time::Instant::now() + Duration::from_secs(2))
-                .with_classification_usm(
-                    config.clone(),
-                    Some(bytes::Bytes::from_static(b"remote-response-engine")),
-                );
-        let bytes = secured(
-            crate::Pdu::get_request(77, &[get_oid()]),
-            77,
-            b"remote-response-engine",
-            &config,
+        let outgoing = encode(
+            crate::Pdu::get_request(COLLISION_ID, &[get_oid()]),
+            REMOTE_ENGINE,
+        );
+        let command = encode(
+            crate::Pdu::get_request(COLLISION_ID, &[get_oid()]),
+            service.engine_id(),
+        );
+        let inform = encode(
+            crate::Pdu::inform_request(COLLISION_ID, 1, &trap_oid, vec![]),
+            service.engine_id(),
+        );
+        let trap = encode(
+            crate::Pdu::trap_v2(COLLISION_ID, 1, &trap_oid, vec![]),
+            REMOTE_ENGINE,
+        );
+        let response = encode(
+            crate::Pdu::response(COLLISION_ID, 0, 0, vec![]),
+            REMOTE_ENGINE,
         );
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let registration = RequestRegistration::v3(
+            COLLISION_ID,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+        )
+        .with_classification_usm(
+            config.clone(),
+            Some(bytes::Bytes::from_static(REMOTE_ENGINE)),
+        );
         let request = tokio::spawn(async move {
             handle
-                .request_with(bytes.clone(), registration, move |packet| {
+                .request_with(outgoing, registration, move |packet| {
                     let (_, _) = packet.into_parts();
                     count.fetch_add(1, Ordering::Relaxed);
                     Ok(Candidate::Accept(()))
@@ -568,69 +590,21 @@ async fn encrypted_collisions_select_commands_informs_and_remote_traps_without_c
         });
         let (_, source) = receive(&peer).await;
         let sender = if same_peer { &peer } else { &other };
-        sender
-            .send_to(
-                &secured(
-                    crate::Pdu::get_request(77, &[get_oid()]),
-                    77,
-                    service.engine_id(),
-                    &config,
-                ),
-                source,
-            )
-            .await
-            .unwrap();
+        sender.send_to(&command, source).await.unwrap();
         receive(sender).await;
-        sender
-            .send_to(
-                &secured(
-                    crate::Pdu::inform_request(
-                        77,
-                        1,
-                        &crate::notification::oids::cold_start(),
-                        vec![],
-                    ),
-                    77,
-                    service.engine_id(),
-                    &config,
-                ),
-                source,
-            )
-            .await
-            .unwrap();
+        sender.send_to(&inform, source).await.unwrap();
         receive(sender).await;
         assert_eq!(
             notifications.recv().await.unwrap().wire_identity.request_id,
-            Some(77)
+            Some(COLLISION_ID)
         );
-        sender
-            .send_to(
-                &secured(
-                    crate::Pdu::trap_v2(77, 1, &crate::notification::oids::cold_start(), vec![]),
-                    77,
-                    b"remote-response-engine",
-                    &config,
-                ),
-                source,
-            )
-            .await
-            .unwrap();
+        sender.send_to(&trap, source).await.unwrap();
         assert_eq!(
             notifications.recv().await.unwrap().wire_identity.request_id,
-            Some(77)
+            Some(COLLISION_ID)
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
-        peer.send_to(
-            &secured(
-                crate::Pdu::response(77, 0, 0, vec![]),
-                77,
-                b"remote-response-engine",
-                &config,
-            ),
-            source,
-        )
-        .await
-        .unwrap();
+        peer.send_to(&response, source).await.unwrap();
         request.await.unwrap().unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
@@ -1122,13 +1096,17 @@ async fn attached_notification_silent_drop_is_visible_on_shared_engine() {
     )
     .await
     .unwrap();
-    tokio::time::timeout(Duration::from_secs(1), notifications.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while service.snmp_silent_drops() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(service.snmp_silent_drops(), 1);
     assert_eq!(notifications.snmp_silent_drops(), 1);
     service.shutdown().await.unwrap();
+    assert!(notifications.recv().await.is_none());
 }
 
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
@@ -1171,7 +1149,7 @@ async fn replaced_credentials_preserve_udp_application_collisions_and_reject_old
             .security_context(security_context.clone())
             .allow_all_access()
             .client_exchanges(true)
-            .notifications(NotificationReceiver::builder().accept_all_notifications())
+            .notifications(NotificationReceiver::builder().admit_all_notifications())
             .listener(crate::ListenerSource::Udp(
                 UdpEndpoint::builder()
                     .bind("127.0.0.1:0")

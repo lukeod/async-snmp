@@ -1,7 +1,9 @@
 //! Packet-bound reusable parsing and cryptographic work; never an acceptance token.
 use super::{DerivedKeys, UsmSecurityParams};
-use crate::message::{DecodeOutcome, RawV3Message};
-use crate::{DecodeConfig, Result};
+use crate::ber::Decoder;
+use crate::error::internal::DecodeErrorKind;
+use crate::message::{DecodeOutcome, RawMsgData, RawV3Message};
+use crate::{DecodeConfig, Error, PduType, Result, Version};
 use bytes::Bytes;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,6 +23,34 @@ pub(crate) struct PreparedCrypto {
     pub(crate) engine_id: Bytes,
     pub(crate) keys: DerivedKeys,
     pub(crate) plaintext: Option<Bytes>,
+    pub(crate) prefix: Option<PduPrefix>,
+}
+
+/// The routing and correlation fields recoverable without validating the PDU body.
+#[derive(Clone, Copy)]
+pub(crate) struct PduPrefix {
+    pub(crate) kind: PduType,
+    pub(crate) request_id: Option<i32>,
+}
+
+impl PduPrefix {
+    pub(crate) fn read(data: Bytes, offset: usize, source: SocketAddr) -> Result<Self> {
+        // Limit both the scoped sequence and the PDU to their declared TLVs.
+        // Context strings and the request-id use strict, bounded decoders under
+        // every receive policy. Scope suffixes and varbinds are validated later.
+        let mut scoped = Decoder::with_context(data, offset, Some(source)).read_sequence()?;
+        scoped.read_octet_string()?;
+        scoped.read_octet_string()?;
+        let tag = scoped
+            .peek_byte()
+            .ok_or_else(|| scoped.malformed(DecodeErrorKind::TruncatedData))?;
+        let kind = PduType::from_tag(tag)
+            .filter(|kind| crate::pdu::pdu_type_valid_for_version(*kind, Version::V3))
+            .ok_or_else(|| scoped.malformed(DecodeErrorKind::UnknownPduType(tag)))?;
+        let mut pdu = scoped.read_constructed(tag)?;
+        let request_id = pdu.read_bounded_integer(i32::MIN, i32::MAX).ok();
+        Ok(Self { kind, request_id })
+    }
 }
 impl PreparedV3 {
     #[cfg(all(test, any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
@@ -100,8 +130,87 @@ impl PreparedV3 {
             .and_then(|crypto| crypto.plaintext.as_ref())
             .map_or(0, Bytes::len)
     }
+
+    /// Confirm that an Inform found by dispatch cannot be delivered locally.
+    pub(crate) fn proves_foreign_inform(&self, local_engine_id: &[u8]) -> bool {
+        let Some(usm) = self.usm.as_ref().map(|decoded| &decoded.value) else {
+            return false;
+        };
+        if usm.engine_id.as_ref() == local_engine_id {
+            return false;
+        }
+        if self
+            .raw
+            .as_ref()
+            .is_some_and(|raw| matches!(raw.value.msg_data, RawMsgData::Plaintext { .. }))
+        {
+            return true;
+        }
+        // Dispatch can also classify under a client exchange's keys. Only
+        // evidence from the selected application user can decide admission.
+        self.crypto.as_ref().is_some_and(|crypto| {
+            crypto
+                .prefix
+                .is_some_and(|prefix| prefix.kind == PduType::InformRequest)
+                && self
+                    .selected_users
+                    .as_ref()
+                    .and_then(|users| users.lookup(&usm.engine_id, &usm.username))
+                    .is_some_and(|user| crypto.matches_user(user, &usm.engine_id))
+        })
+    }
 }
 impl PreparedCrypto {
+    /// Verify and decrypt for routing without committing USM state or counters.
+    pub(crate) fn authenticate_and_decrypt(
+        bytes: &Bytes,
+        authenticated_data: &[u8],
+        raw: &RawV3Message,
+        usm: &UsmSecurityParams,
+        keys: DerivedKeys,
+        identity: Arc<()>,
+        source: SocketAddr,
+    ) -> Result<(Self, Result<PduPrefix>)> {
+        let auth_error = || Error::Auth { target: source }.boxed();
+        let auth_key = keys.auth_key.as_ref().ok_or_else(auth_error)?;
+        let priv_key = keys.priv_key.as_ref().ok_or_else(auth_error)?;
+        let (offset, length) =
+            UsmSecurityParams::find_auth_params_offset(bytes).ok_or_else(auth_error)?;
+        if !raw.security_level().requires_auth()
+            || !super::auth::verify_message(auth_key, authenticated_data, offset, length)
+                .map_err(|_| auth_error())?
+        {
+            return Err(auth_error());
+        }
+        let RawMsgData::Encrypted(ciphertext) = &raw.msg_data else {
+            unreachable!("encrypted classification requires an encrypted scoped PDU")
+        };
+        let (plaintext, prefix) = match priv_key.decrypt(
+            ciphertext,
+            usm.engine_boots,
+            usm.engine_time,
+            &usm.priv_params,
+        ) {
+            Ok(plaintext) => {
+                let prefix = PduPrefix::read(plaintext.clone(), 0, source);
+                (Some(plaintext), prefix)
+            }
+            Err(_) => (None, Err(auth_error())),
+        };
+        let crypto = Self {
+            identity,
+            engine_id: usm.engine_id.clone(),
+            keys,
+            plaintext,
+            prefix: prefix.as_ref().ok().copied(),
+        };
+        Ok((crypto, prefix))
+    }
+
+    pub(crate) fn matches_user(&self, user: &super::UsmUser, engine_id: &Bytes) -> bool {
+        self.engine_id == *engine_id && Arc::ptr_eq(&self.identity, &user.credential_identity())
+    }
+
     pub(crate) fn matches_keys(&self, keys: &DerivedKeys, engine_id: &Bytes) -> bool {
         if self.engine_id != *engine_id {
             return false;

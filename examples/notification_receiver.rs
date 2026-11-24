@@ -21,7 +21,8 @@
 //! ```
 
 use async_snmp::notification::{
-    Notification, NotificationAcceptance, NotificationEnvelope, NotificationReceiver, oids,
+    Notification, NotificationAdmissionDecision, NotificationAdmissionInfo, NotificationReceiver,
+    oids,
 };
 use async_snmp::{AuthProtocol, AuthoritativeEngine, PrivProtocol, SecurityLevel};
 use std::net::SocketAddr;
@@ -84,18 +85,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .usm_user("readonly", |u| {
             u.auth(AuthProtocol::Sha256, b"readonlypass")
         })?
-        // This synchronous policy runs after applicable USM processing and
-        // notification-prefix validation, but before any Inform response. It
-        // can inspect all normalized content; keep it bounded and non-blocking.
-        .acceptance_policy(|notification: &NotificationEnvelope<'_>| {
+        // This policy runs after USM processing and notification-prefix
+        // validation, before Inform sizing. Keep it bounded and non-blocking.
+        .admission_policy(|notification: &NotificationAdmissionInfo<'_>| {
             if notification.security_level >= Some(SecurityLevel::AuthNoPriv)
                 && notification
                     .trap_oid()
                     .is_ok_and(|oid| oid.starts_with(&oids::snmp_traps()))
             {
-                NotificationAcceptance::Accept
+                NotificationAdmissionDecision::Admit
             } else {
-                NotificationAcceptance::Reject
+                NotificationAdmissionDecision::Reject
             }
         })
         .spawn()

@@ -25,34 +25,36 @@ use async_snmp::{
 use bytes::Bytes;
 
 #[test]
-fn notification_acceptance_policy_surface_is_public() {
+fn notification_admission_policy_surface_is_public() {
     use async_snmp::{
-        NotificationAcceptance, NotificationAcceptanceError, NotificationAcceptancePolicy,
-        NotificationAcceptanceResult, NotificationEnvelope, NotificationReceiver,
+        NotificationAdmissionDecision, NotificationAdmissionError, NotificationAdmissionInfo,
+        NotificationAdmissionPolicy, NotificationAdmissionResult, NotificationReceiver,
     };
 
-    fn accepts_public_policy(_policy: impl NotificationAcceptancePolicy) {}
+    fn accepts_public_policy(_policy: impl NotificationAdmissionPolicy) {}
 
     accepts_public_policy(
-        |notification: &NotificationEnvelope<'_>| -> NotificationAcceptanceResult {
+        |notification: &NotificationAdmissionInfo<'_>| -> NotificationAdmissionResult {
             if notification
                 .security_level
                 .is_some_and(|level| level.requires_auth())
             {
-                Ok(NotificationAcceptance::Accept)
+                Ok(NotificationAdmissionDecision::Admit)
             } else {
-                Err(NotificationAcceptanceError::new(
+                Err(NotificationAdmissionError::new(
                     "authenticated notification required",
                 ))
             }
         },
     );
 
-    let _infallible = NotificationReceiver::builder()
-        .acceptance_policy(|_: &NotificationEnvelope<'_>| NotificationAcceptance::Reject);
-    let _fallible = NotificationReceiver::builder().try_acceptance_policy(
-        |_: &NotificationEnvelope<'_>| -> NotificationAcceptanceResult {
-            Ok(NotificationAcceptance::Reject)
+    let _infallible =
+        NotificationReceiver::builder().admission_policy(|_: &NotificationAdmissionInfo<'_>| {
+            NotificationAdmissionDecision::Reject
+        });
+    let _fallible = NotificationReceiver::builder().try_admission_policy(
+        |_: &NotificationAdmissionInfo<'_>| -> NotificationAdmissionResult {
+            Ok(NotificationAdmissionDecision::Reject)
         },
     );
 }

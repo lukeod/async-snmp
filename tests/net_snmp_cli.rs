@@ -383,7 +383,7 @@ async fn v3_traps_and_informs_over_udp_and_tcp() {
         return;
     }
     let mut receiver = NotificationReceiver::builder()
-        .accept_all_notifications()
+        .admit_all_notifications()
         .authoritative_engine(engine())
         .usm_user("noAuthNoPriv", Ok)
         .unwrap()

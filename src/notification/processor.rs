@@ -7,13 +7,13 @@ use bytes::Bytes;
 
 use super::varbind::extract_notification_varbinds;
 use super::{
-    Community, Notification, NotificationAcceptance, NotificationAcceptancePolicy,
-    NotificationEnvelope, NotificationVarbindValidation, NotificationWireIdentity,
-    V3NotificationWireIdentity,
+    Community, Notification, NotificationAdmissionDecision, NotificationAdmissionInfo,
+    NotificationAdmissionPolicy, NotificationPduClass, NotificationVarbindValidation,
+    NotificationWireIdentity, V3NotificationWireIdentity,
 };
 use crate::message::{CommunityMessage, CommunityPdu};
-use crate::pdu::{Pdu, PduType};
-use crate::response_finalizer::{FinalizedResponse, finalize_response};
+use crate::pdu::{Pdu, PduType, ResponsePdu};
+use crate::response_finalizer::effective_limit;
 use crate::v3::process::{
     MpdCounters, UsmFailure, V3Inbound, V3InboundMessage, V3LocalContext, V3Role,
     process_prepared_v3_inbound,
@@ -26,7 +26,7 @@ use crate::{
 ///
 /// Building creates no sockets or background tasks. An explicitly configured
 /// USM context, including an empty one, requires a persisted local engine and
-/// an explicit acceptance policy before users can be installed at runtime.
+/// an explicit admission policy before users can be installed at runtime.
 pub struct NotificationProcessorBuilder {
     local_engine: Option<LocalEngine>,
     security_context: Option<UsmSecurityContext>,
@@ -34,7 +34,7 @@ pub struct NotificationProcessorBuilder {
     varbind_validation: NotificationVarbindValidation,
     max_message_size: usize,
     decode_config: crate::DecodeConfig,
-    acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
+    admission_policy: Option<Arc<dyn NotificationAdmissionPolicy>>,
 }
 
 impl Default for NotificationProcessorBuilder {
@@ -46,7 +46,7 @@ impl Default for NotificationProcessorBuilder {
             varbind_validation: NotificationVarbindValidation::Tolerant,
             max_message_size: crate::MESSAGE_SIZE_MAXIMUM,
             decode_config: crate::DecodeConfig::DEFAULT,
-            acceptance_policy: None,
+            admission_policy: None,
         }
     }
 }
@@ -92,24 +92,27 @@ impl NotificationProcessorBuilder {
         self
     }
 
-    /// Apply a synchronous policy before accepting a notification. An error or
-    /// panic rejects it without producing an Inform response capability.
-    pub fn try_acceptance_policy(mut self, policy: impl NotificationAcceptancePolicy) -> Self {
-        self.acceptance_policy = Some(Arc::new(policy));
+    /// Apply a fallible admission policy before Inform sizing and delivery.
+    /// An error or panic discards the notification without an Inform Response.
+    pub fn try_admission_policy(mut self, policy: impl NotificationAdmissionPolicy) -> Self {
+        self.admission_policy = Some(Arc::new(policy));
         self
     }
 
-    /// Apply an infallible synchronous acceptance policy.
-    pub fn acceptance_policy(
+    /// Apply an infallible synchronous admission policy.
+    pub fn admission_policy(
         self,
-        policy: impl Fn(&NotificationEnvelope<'_>) -> NotificationAcceptance + Send + Sync + 'static,
+        policy: impl Fn(&NotificationAdmissionInfo<'_>) -> NotificationAdmissionDecision
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
-        self.try_acceptance_policy(super::InfallibleAcceptancePolicy(policy))
+        self.try_admission_policy(super::InfallibleAdmissionPolicy(policy))
     }
 
-    /// Explicitly accept all notifications, including unauthenticated messages.
-    pub fn accept_all_notifications(self) -> Self {
-        self.try_acceptance_policy(super::AcceptAllNotifications)
+    /// Explicitly admit all validated notifications, including unauthenticated messages.
+    pub fn admit_all_notifications(self) -> Self {
+        self.try_admission_policy(super::AdmitAllNotifications)
     }
 
     /// Validate configuration and prepare protocol state without I/O or tasks.
@@ -123,9 +126,9 @@ impl NotificationProcessorBuilder {
             );
         }
         if self.security_context.is_some() {
-            if self.acceptance_policy.is_none() {
+            if self.admission_policy.is_none() {
                 return Err(Error::Config(
-                    "a USM notification processor requires an acceptance policy".into(),
+                    "a USM notification processor requires an admission policy".into(),
                 )
                 .boxed());
             }
@@ -155,7 +158,7 @@ impl NotificationProcessorBuilder {
             self.varbind_validation,
             self.max_message_size,
             self.decode_config,
-            self.acceptance_policy,
+            self.admission_policy,
         ))
     }
 }
@@ -180,7 +183,7 @@ pub(super) struct ProcessorInner {
     pub(super) varbind_validation: NotificationVarbindValidation,
     pub(super) max_message_size: usize,
     pub(super) decode_config: crate::DecodeConfig,
-    pub(super) acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
+    pub(super) admission_policy: Option<Arc<dyn NotificationAdmissionPolicy>>,
 }
 
 impl std::ops::Deref for ProcessorInner {
@@ -204,15 +207,24 @@ impl std::fmt::Debug for NotificationProcessor {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum NotificationProcessResult {
-    /// Notification passed security, prefix validation and acceptance policy.
+    /// Notification passed security, prefix validation and admission policy.
     Accepted(Box<ProcessedNotification>),
-    /// Not a notification, or filtered/rejected by application policy.
+    /// An admitted Inform exceeded the effective response-size limit.
+    /// Processing ends before delivery.
+    InformTooBig {
+        /// Encoded empty-varbind `tooBig` reply to send, or `None` for a
+        /// counted silent drop.
+        response: Option<Bytes>,
+    },
+    /// The input was filtered by notification processing or the admission policy.
     Rejected,
     /// Failed USM processing; the corresponding local counter was incremented.
     UsmFailed {
         /// Specific failed USM step.
         failure: UsmFailure,
-        /// Report permitted by the message flags and effective size limit.
+        /// Encoded Report when the PDU type and effective size limit permit one.
+        /// If the type is unknown, the reportable flag determines
+        /// eligibility. Send the Report on the incoming route.
         report: Option<Bytes>,
     },
     /// Remote-authoritative timeliness failure; no counter or Report is emitted.
@@ -254,6 +266,11 @@ enum InformRequest {
     V3(Box<V3InboundMessage>),
 }
 
+enum InformResponseSize {
+    Fits,
+    Oversized(Option<Bytes>),
+}
+
 impl std::fmt::Debug for InformResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("InformResponse")
@@ -262,14 +279,26 @@ impl std::fmt::Debug for InformResponse {
     }
 }
 
-/// Exact Inform response encoding result. Encoded bytes have not been sent.
+/// Result of encoding the response to an accepted Inform.
+#[non_exhaustive]
 pub enum EncodedInformResponse {
-    /// The ordinary Response fit.
+    /// The ordinary response fit.
     Response(Bytes),
-    /// The exact empty-varbind `tooBig` alternate fit.
+    /// The ordinary response grew beyond the limit after admission and the
+    /// empty-varbind `tooBig` alternate fit.
     TooBig(Bytes),
-    /// Neither encoding fit; the engine's silent-drop counter was incremented.
+    /// Both responses exceeded the limit and the silent drop was counted.
     Suppressed,
+}
+
+impl EncodedInformResponse {
+    /// Take the encoded reply, if one fit.
+    pub fn into_bytes(self) -> Option<Bytes> {
+        match self {
+            Self::Response(bytes) | Self::TooBig(bytes) => Some(bytes),
+            Self::Suppressed => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for EncodedInformResponse {
@@ -283,78 +312,166 @@ impl std::fmt::Debug for EncodedInformResponse {
 }
 
 impl InformResponse {
-    /// Encode now, using captured request keys and current local engine state.
-    /// No socket, timer or runtime is required. DES absence/rollover, persistence
-    /// failure and encoding failures are returned without sending anything.
-    pub fn encode(self) -> Result<EncodedInformResponse> {
-        let local_limit = self.max_message_size.min(self.limits.send());
-        let finalized = match self.request {
-            InformRequest::Community { community, pdu } => finalize_response(
-                Version::V2c,
-                &pdu,
-                pdu.to_response(Version::V2c)?,
-                local_limit,
-                None,
-                &self.engine.inner.snmp_silent_drops,
-                |response| CommunityMessage::v2c(community.clone(), response)?.encode(),
-            )?,
-            InformRequest::V3(inbound) => {
-                let (boots, time) = self.engine.current_boots_time()?;
-                if inbound.security_level.requires_auth() && boots == crate::v3::MAX_ENGINE_TIME {
-                    return Err(Error::Auth {
-                        target: self.info.peer_addr(),
-                    }
-                    .boxed());
-                }
-                if inbound.security_level.requires_priv()
-                    && inbound
-                        .derived_keys
-                        .priv_key
-                        .as_ref()
-                        .is_some_and(|key| !key.protocol().is_des_family())
-                {
-                    self.engine
-                        .ensure_salt_counter(crate::v3::SaltCounter::new)?;
-                }
-                let usm = crate::v3::UsmSecurityParams::new(
-                    self.engine.inner.engine_id.clone(),
-                    boots,
-                    time,
-                    inbound.usm_params.username.clone(),
-                )?;
-                let salts = self.engine.salt_counter();
-                let des = self.engine.des_salt_state();
-                let pdu = &inbound.scoped_pdu.pdu;
-                finalize_response(
-                    Version::V3,
-                    pdu,
-                    pdu.to_response(Version::V3)?,
-                    local_limit,
-                    Some(inbound.global_data.msg_max_size.as_usize()),
-                    &self.engine.inner.snmp_silent_drops,
-                    |response| {
-                        crate::v3::encode::encode_v3_response(
-                            response,
-                            inbound.global_data.msg_id,
-                            self.limits.receive().advertised(),
-                            inbound.security_level,
-                            usm.clone(),
-                            inbound.scoped_pdu.context_engine_id.clone(),
-                            inbound.scoped_pdu.context_name.clone(),
-                            Some(&inbound.derived_keys),
-                            salts.as_deref(),
-                            des.as_ref(),
-                            self.info.peer_addr(),
-                        )
-                    },
-                )?
-            }
+    fn limit(&self) -> usize {
+        let peer_limit = match &self.request {
+            InformRequest::Community { .. } => None,
+            InformRequest::V3(inbound) => Some(inbound.global_data.msg_max_size.as_usize()),
         };
-        Ok(match finalized {
-            FinalizedResponse::Candidate(bytes) => EncodedInformResponse::Response(bytes),
-            FinalizedResponse::Alternate(bytes) => EncodedInformResponse::TooBig(bytes),
-            FinalizedResponse::Dropped => EncodedInformResponse::Suppressed,
-        })
+        effective_limit(self.max_message_size.min(self.limits.send()), peer_limit)
+    }
+
+    /// Encode the reply using captured request keys and current local engine
+    /// state. This requires no socket, timer or runtime.
+    /// If updated SNMPv3 boots or time push the ordinary response over the
+    /// limit after admission, try the empty-varbind `tooBig` alternate.
+    pub fn encode(self) -> Result<EncodedInformResponse> {
+        match &self.request {
+            InformRequest::Community { community, pdu } => self
+                .encode_community(community, pdu.to_response(Version::V2c)?)
+                .map(EncodedInformResponse::Response),
+            InformRequest::V3(inbound) => {
+                let usm = self.response_usm(inbound)?;
+                let ordinary = inbound.scoped_pdu.pdu.to_response(Version::V3)?;
+                match self.check_response_size(
+                    Version::V3,
+                    &ordinary,
+                    |pdu| self.v3_response_size(inbound, pdu, &usm),
+                    |pdu| self.encode_v3(inbound, pdu, usm.clone()),
+                )? {
+                    InformResponseSize::Fits => self
+                        .encode_v3(inbound, ordinary, usm)
+                        .map(EncodedInformResponse::Response),
+                    InformResponseSize::Oversized(Some(bytes)) => {
+                        Ok(EncodedInformResponse::TooBig(bytes))
+                    }
+                    InformResponseSize::Oversized(None) => Ok(EncodedInformResponse::Suppressed),
+                }
+            }
+        }
+    }
+
+    fn preflight(&self) -> Result<InformResponseSize> {
+        // RFC 3416 §4.2.7 sizes a Response with the Inform's original fields.
+        // The ordinary acknowledgement uses zero status and index on the wire.
+        match &self.request {
+            InformRequest::Community { community, pdu } => self.check_response_size(
+                Version::V2c,
+                pdu,
+                |pdu| {
+                    use crate::ber::{integer_content_len, tlv_encoded_len};
+                    Ok(tlv_encoded_len(
+                        tlv_encoded_len(integer_content_len(Version::V2c.as_i32()))
+                            + tlv_encoded_len(community.as_bytes().len())
+                            + pdu.standard_encoded_size(),
+                    ))
+                },
+                |pdu| self.encode_community(community, pdu),
+            ),
+            InformRequest::V3(inbound) => {
+                let usm = self.response_usm(inbound)?;
+                self.check_response_size(
+                    Version::V3,
+                    &inbound.scoped_pdu.pdu,
+                    |pdu| self.v3_response_size(inbound, pdu, &usm),
+                    |pdu| self.encode_v3(inbound, pdu, usm.clone()),
+                )
+            }
+        }
+    }
+
+    fn check_response_size(
+        &self,
+        version: Version,
+        candidate: &Pdu,
+        encoded_size: impl Fn(&Pdu) -> Result<usize>,
+        encode: impl FnOnce(Pdu) -> Result<Bytes>,
+    ) -> Result<InformResponseSize> {
+        let limit = self.limit();
+        if encoded_size(candidate)? <= limit {
+            return Ok(InformResponseSize::Fits);
+        }
+        let alternate =
+            ResponsePdu::too_big(version, candidate.request_id(), Vec::new())?.into_raw();
+        if encoded_size(&alternate)? <= limit {
+            return Ok(InformResponseSize::Oversized(Some(encode(alternate)?)));
+        }
+        self.engine
+            .inner
+            .snmp_silent_drops
+            .fetch_add(1, Ordering::Relaxed);
+        Ok(InformResponseSize::Oversized(None))
+    }
+
+    fn encode_community(&self, community: &Community, pdu: Pdu) -> Result<Bytes> {
+        let bytes = CommunityMessage::v2c(community.clone(), pdu)?.encode()?;
+        crate::message_size::enforce_outbound_size(bytes.len(), self.limit())?;
+        Ok(bytes)
+    }
+
+    fn response_usm(&self, inbound: &V3InboundMessage) -> Result<crate::v3::UsmSecurityParams> {
+        let (boots, time) = self.engine.current_boots_time()?;
+        if inbound.security_level.requires_auth() && boots == crate::v3::MAX_ENGINE_TIME {
+            return Err(Error::Auth {
+                target: self.info.peer_addr(),
+            }
+            .boxed());
+        }
+        crate::v3::UsmSecurityParams::new(
+            self.engine.inner.engine_id.clone(),
+            boots,
+            time,
+            inbound.usm_params.username.clone(),
+        )
+    }
+
+    fn v3_response_size(
+        &self,
+        inbound: &V3InboundMessage,
+        pdu: &Pdu,
+        usm: &crate::v3::UsmSecurityParams,
+    ) -> Result<usize> {
+        crate::v3::encode::v3_response_encoded_size(
+            pdu.standard_encoded_size(),
+            &inbound.global_data,
+            self.limits.receive().advertised(),
+            usm,
+            &inbound.scoped_pdu,
+            &inbound.derived_keys,
+            self.info.peer_addr(),
+        )
+    }
+
+    fn encode_v3(
+        &self,
+        inbound: &V3InboundMessage,
+        pdu: Pdu,
+        usm: crate::v3::UsmSecurityParams,
+    ) -> Result<Bytes> {
+        if inbound.security_level.requires_priv()
+            && inbound
+                .derived_keys
+                .priv_key
+                .as_ref()
+                .is_some_and(|key| !key.protocol().is_des_family())
+        {
+            self.engine
+                .ensure_salt_counter(crate::v3::SaltCounter::new)?;
+        }
+        let bytes = crate::v3::encode::encode_v3_response(
+            pdu,
+            inbound.global_data.msg_id,
+            self.limits.receive().advertised(),
+            inbound.security_level,
+            usm,
+            inbound.scoped_pdu.context_engine_id.clone(),
+            inbound.scoped_pdu.context_name.clone(),
+            Some(&inbound.derived_keys),
+            self.engine.salt_counter().as_deref(),
+            self.engine.des_salt_state().as_ref(),
+            self.info.peer_addr(),
+        )?;
+        crate::message_size::enforce_outbound_size(bytes.len(), self.limit())?;
+        Ok(bytes)
     }
 }
 
@@ -372,7 +489,7 @@ impl NotificationProcessor {
         varbind_validation: NotificationVarbindValidation,
         max_message_size: usize,
         decode_config: crate::DecodeConfig,
-        acceptance_policy: Option<Arc<dyn NotificationAcceptancePolicy>>,
+        admission_policy: Option<Arc<dyn NotificationAdmissionPolicy>>,
     ) -> Self {
         Self {
             inner: Arc::new(ProcessorInner {
@@ -382,7 +499,7 @@ impl NotificationProcessor {
                 varbind_validation,
                 max_message_size,
                 decode_config,
-                acceptance_policy,
+                admission_policy,
             }),
         }
     }
@@ -392,9 +509,11 @@ impl NotificationProcessor {
         self.inner.local_engine.clone()
     }
 
-    /// Process one complete message without encoding an Inform response or
-    /// performing transport I/O. Reports are protocol results and may already
-    /// be encoded independently of application persistence/acknowledgement.
+    /// Process one complete message after selecting this logical listener.
+    ///
+    /// This also handles SNMPv3 engine discovery and stale Inform engine IDs.
+    /// Send Reports and `tooBig` replies from the result on the incoming route.
+    /// An accepted Inform carries an [`InformResponse`] for deferred encoding.
     pub fn process(&self, input: ProcessingInput) -> Result<NotificationProcessResult> {
         self.process_admitted(input, &mut |_| true)
     }
@@ -405,61 +524,59 @@ impl NotificationProcessor {
         reserve: &mut impl FnMut(super::NotificationPduClass) -> bool,
     ) -> Result<NotificationProcessResult> {
         let result = self.process_inner(input, reserve);
-        self.observe_error(&result);
+        self.inner.local_engine.count_asn_parse_error(&result);
         result
     }
 
-    fn observe_error<T>(&self, result: &Result<T>) {
-        if matches!(result, Err(error) if matches!(&**error,
-            Error::Decode(error) if !matches!(error.kind, crate::DecodeErrorKind::UnknownVersion(_)
-                | crate::DecodeErrorKind::InvalidMsgFlags | crate::DecodeErrorKind::UnknownSecurityModel(_))))
-        {
-            self.inner
-                .snmp_in_asn_parse_errs
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn accepted(
+    fn admit_notification(
         &self,
         notification: Notification,
         info: crate::ReceivedMessageInfo,
         identity: NotificationWireIdentity,
         response: Option<InformResponse>,
         reserve: &mut impl FnMut(super::NotificationPduClass) -> bool,
-    ) -> NotificationProcessResult {
-        if !reserve(if response.is_some() {
-            super::NotificationPduClass::Inform
+    ) -> Result<NotificationProcessResult> {
+        let pdu_class = if response.is_some() {
+            NotificationPduClass::Inform
         } else {
-            super::NotificationPduClass::Trap
-        }) {
-            return NotificationProcessResult::Rejected;
-        }
-        if let Some(policy) = &self.inner.acceptance_policy {
-            let envelope = NotificationEnvelope::new(info, &notification);
+            NotificationPduClass::Trap
+        };
+        if let Some(policy) = &self.inner.admission_policy {
+            let admission =
+                NotificationAdmissionInfo::new(info, &notification, &identity, pdu_class);
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                policy.evaluate(&envelope)
+                policy.evaluate(&admission)
             })) {
-                Ok(Ok(NotificationAcceptance::Accept)) => {}
-                Ok(Ok(NotificationAcceptance::Reject)) => {
-                    return NotificationProcessResult::Rejected;
+                Ok(Ok(NotificationAdmissionDecision::Admit)) => {}
+                Ok(Ok(NotificationAdmissionDecision::Reject)) => {
+                    return Ok(NotificationProcessResult::Rejected);
                 }
                 Ok(Err(error)) => {
-                    tracing::error!(target: "async_snmp::notification", source = %info.peer_addr(), %error, "notification acceptance policy failed; rejected notification");
-                    return NotificationProcessResult::Rejected;
+                    tracing::error!(target: "async_snmp::notification", source = %info.peer_addr(), %error, "notification admission policy failed; rejected notification");
+                    return Ok(NotificationProcessResult::Rejected);
                 }
                 Err(_) => {
-                    tracing::error!(target: "async_snmp::notification", source = %info.peer_addr(), "notification acceptance policy panicked; rejected notification");
-                    return NotificationProcessResult::Rejected;
+                    tracing::error!(target: "async_snmp::notification", source = %info.peer_addr(), "notification admission policy panicked; rejected notification");
+                    return Ok(NotificationProcessResult::Rejected);
                 }
             }
         }
-        NotificationProcessResult::Accepted(Box::new(ProcessedNotification {
-            notification,
-            receive_info: info,
-            wire_identity: identity,
-            inform_response: response,
-        }))
+        if let Some(inform) = &response
+            && let InformResponseSize::Oversized(response) = inform.preflight()?
+        {
+            return Ok(NotificationProcessResult::InformTooBig { response });
+        }
+        if !reserve(pdu_class) {
+            return Ok(NotificationProcessResult::Rejected);
+        }
+        Ok(NotificationProcessResult::Accepted(Box::new(
+            ProcessedNotification {
+                notification,
+                receive_info: info,
+                wire_identity: identity,
+                inform_response: response,
+            },
+        )))
     }
 
     fn process_inner(
@@ -472,16 +589,14 @@ impl NotificationProcessor {
         if version == Version::V3 {
             let info = input.info();
             let limits = input.limits();
-            return match self
-                .v3_inbound(input, false)?
-                .expect("receiver processes every input")
-            {
+            return match self.v3_inbound(input)? {
                 V3Inbound::Failed { failure, report } => {
                     Ok(NotificationProcessResult::UsmFailed { failure, report })
                 }
                 V3Inbound::RemoteNotInTimeWindow => {
                     Ok(NotificationProcessResult::RemoteNotInTimeWindow)
                 }
+                V3Inbound::Ignored => Ok(NotificationProcessResult::Rejected),
                 V3Inbound::Message(inbound) => {
                     let scoped = &inbound.scoped_pdu;
                     let pdu = &scoped.pdu;
@@ -531,7 +646,7 @@ impl NotificationProcessor {
                     };
                     let response =
                         inform.then(|| self.response(info, limits, InformRequest::V3(inbound)));
-                    Ok(self.accepted(notification, info, identity, response, reserve))
+                    self.admit_notification(notification, info, identity, response, reserve)
                 }
             };
         }
@@ -552,7 +667,7 @@ impl NotificationProcessor {
             return Ok(NotificationProcessResult::Rejected);
         }
         match pdu {
-            CommunityPdu::TrapV1(trap) => Ok(self.accepted(
+            CommunityPdu::TrapV1(trap) => self.admit_notification(
                 Notification::TrapV1 {
                     community,
                     trap,
@@ -566,7 +681,7 @@ impl NotificationProcessor {
                 },
                 None,
                 reserve,
-            )),
+            ),
             CommunityPdu::Standard(pdu) if version == Version::V2c => {
                 if !matches!(pdu.pdu_type(), PduType::TrapV2 | PduType::InformRequest) {
                     return Ok(NotificationProcessResult::Rejected);
@@ -597,7 +712,7 @@ impl NotificationProcessor {
                 let response = inform.then(|| {
                     self.response(info, limits, InformRequest::Community { community, pdu })
                 });
-                Ok(self.accepted(
+                self.admit_notification(
                     notification,
                     info,
                     NotificationWireIdentity {
@@ -607,7 +722,7 @@ impl NotificationProcessor {
                     },
                     response,
                     reserve,
-                ))
+                )
             }
             _ => Ok(NotificationProcessResult::Rejected),
         }
@@ -628,20 +743,7 @@ impl NotificationProcessor {
         }
     }
 
-    /// Report an unclaimed v3 datagram/frame as this local authoritative engine.
-    /// Empty, invalid or foreign engine IDs use common authoritative processing.
-    /// A message naming this local engine returns `None` without user lookup,
-    /// application acceptance, timeliness updates or unknown-user accounting.
-    pub fn report_unknown_engine(&self, input: ProcessingInput) -> Result<Option<Bytes>> {
-        let result = self.v3_inbound(input, true).map(|inbound| match inbound {
-            Some(V3Inbound::Failed { report, .. }) => report,
-            _ => None,
-        });
-        self.observe_error(&result);
-        result
-    }
-
-    fn v3_inbound(&self, input: ProcessingInput, unclaimed: bool) -> Result<Option<V3Inbound>> {
+    fn v3_inbound(&self, input: ProcessingInput) -> Result<V3Inbound> {
         let (packet, limits) = input.into_parts();
         let (data, info, prepared) = packet.into_prepared();
         let users = self
@@ -661,7 +763,7 @@ impl NotificationProcessor {
             accepted_receive_size: limits.receive().accepted(),
             decode_config: self.inner.decode_config,
             outbound_limit: self.inner.max_message_size.min(limits.send()),
-            usm_users: users,
+            usm_users: Some(users),
             stats: &self.inner.usm_stats,
             mpd: Some(MpdCounters {
                 invalid_msgs: &self.inner.snmp_invalid_msgs,
@@ -669,54 +771,9 @@ impl NotificationProcessor {
             }),
             source: info.peer_addr(),
         };
-        let role = if unclaimed {
-            V3Role::Authoritative
-        } else {
-            V3Role::Receiver {
-                remote_engines: self.inner.security_context.remote_engines(),
-            }
+        let role = V3Role::Receiver {
+            remote_engines: self.inner.security_context.remote_engines(),
         };
-        let prepared = if unclaimed {
-            let peeked = (|| {
-                let mut prepared = prepared.unwrap_or_else(|| {
-                    Box::new(crate::v3::prepared::PreparedV3::selected(
-                        data.clone(),
-                        self.inner.decode_config,
-                        context.usm_users.clone(),
-                    ))
-                });
-                let raw = prepared.decode_raw(
-                    data.clone(),
-                    limits.receive().accepted(),
-                    info.peer_addr(),
-                    self.inner.decode_config,
-                )?;
-                let usm =
-                    prepared.decode_usm(&raw.value, info.peer_addr(), self.inner.decode_config)?;
-                if usm.value.engine_id == self.inner.engine_id {
-                    return Ok(None);
-                }
-                let mut selected = crate::v3::prepared::PreparedV3::selected(
-                    data.clone(),
-                    self.inner.decode_config,
-                    context.usm_users.clone(),
-                );
-                selected.raw = Some(raw);
-                selected.usm = Some(usm);
-                Ok::<_, Box<Error>>(Some(Box::new(selected)))
-            })();
-            match peeked {
-                Ok(Some(prepared)) => Some(prepared),
-                Ok(None) => return Ok(None),
-                // Let the common core account for invalid flags/security models
-                // and return its ordinary decode indication exactly once.
-                Err(_) => {
-                    return process_prepared_v3_inbound(data, &context, &role, None).map(Some);
-                }
-            }
-        } else {
-            prepared
-        };
-        process_prepared_v3_inbound(data, &context, &role, prepared).map(Some)
+        process_prepared_v3_inbound(data, &context, &role, prepared)
     }
 }

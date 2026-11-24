@@ -3,10 +3,11 @@ use std::convert::Infallible;
 use async_snmp::message::{CommunityMessage, MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
 use async_snmp::v3::UsmSecurityParams;
 use async_snmp::{
-    AuthoritativeEngine, EncodedInformResponse, EndpointId, LocalEngine, MessageSize, Notification,
-    NotificationPdu, NotificationProcessResult, NotificationProcessor, ProcessingInput,
-    ProcessingLimits, ReceiveLimits, ReceivedMessageInfo, ReceivedPacket, SecurityLevel, SessionId,
-    UsmFailure, UsmSecurityContext, UsmUser, UsmUserEntry, Value, VarBind, Version, oid,
+    AuthoritativeEngine, DecodeConfig, EncodedInformResponse, EndpointId, LocalEngine, MessageSize,
+    Notification, NotificationPdu, NotificationProcessResult, NotificationProcessor,
+    ProcessingInput, ProcessingLimits, ReceiveLimits, ReceivedMessageInfo, ReceivedPacket,
+    SecurityLevel, SessionId, UsmFailure, UsmSecurityContext, UsmUser, UsmUserEntry, Value,
+    VarBind, Version, oid,
 };
 use bytes::Bytes;
 
@@ -93,6 +94,14 @@ fn accepted(result: NotificationProcessResult) -> async_snmp::ProcessedNotificat
     }
 }
 
+fn ordinary_bytes(event: async_snmp::ProcessedNotification) -> Bytes {
+    let EncodedInformResponse::Response(bytes) = event.inform_response.unwrap().encode().unwrap()
+    else {
+        panic!("expected ordinary Inform response");
+    };
+    bytes
+}
+
 #[test]
 fn public_processor_build_process_and_encode_require_no_tokio_runtime() {
     assert!(tokio::runtime::Handle::try_current().is_err());
@@ -141,15 +150,15 @@ fn public_processor_build_process_and_encode_require_no_tokio_runtime() {
     let event = accepted(processor.process(received).unwrap());
     assert_eq!(event.receive_info, info);
     assert_eq!(event.wire_identity.request_id, Some(42));
-    let encoded = event.inform_response.unwrap().encode().unwrap();
-    assert!(matches!(encoded, EncodedInformResponse::Response(_)));
+    let encoded = ordinary_bytes(event);
+    assert!(!encoded.is_empty());
 
     let local = engine();
     let context = UsmSecurityContext::new([UsmUserEntry::new(UsmUser::new("user"))]).unwrap();
     let processor = NotificationProcessor::builder()
         .local_engine(local.clone())
         .security_context(context)
-        .accept_all_notifications()
+        .admit_all_notifications()
         .build()
         .unwrap();
     let wire = v3(
@@ -164,19 +173,16 @@ fn public_processor_build_process_and_encode_require_no_tokio_runtime() {
             .unwrap(),
     );
     assert!(matches!(event.notification, Notification::InformV3 { .. }));
-    assert!(matches!(
-        event.inform_response.unwrap().encode().unwrap(),
-        EncodedInformResponse::Response(_)
-    ));
+    assert!(!ordinary_bytes(event).is_empty());
     assert!(tokio::runtime::Handle::try_current().is_err());
 }
 
 #[test]
-fn explicit_empty_context_requires_engine_and_acceptance_policy() {
+fn explicit_empty_context_requires_engine_and_admission_policy() {
     assert!(
         NotificationProcessor::builder()
             .security_context(UsmSecurityContext::default())
-            .accept_all_notifications()
+            .admit_all_notifications()
             .build()
             .is_err()
     );
@@ -191,7 +197,7 @@ fn explicit_empty_context_requires_engine_and_acceptance_policy() {
         NotificationProcessor::builder()
             .local_engine(engine())
             .security_context(UsmSecurityContext::default())
-            .accept_all_notifications()
+            .admit_all_notifications()
             .build()
             .is_ok()
     );
@@ -209,7 +215,7 @@ fn community_policy_and_filter_rejection_produce_no_response_capability() {
             .build()
             .unwrap(),
         NotificationProcessor::builder()
-            .acceptance_policy(|_| async_snmp::NotificationAcceptance::Reject)
+            .admission_policy(|_| async_snmp::NotificationAdmissionDecision::Reject)
             .build()
             .unwrap(),
     ] {
@@ -223,37 +229,54 @@ fn community_policy_and_filter_rejection_produce_no_response_capability() {
 }
 
 #[test]
-fn inform_response_is_encoded_lazily_with_exact_size_fallback() {
-    let local = engine();
+fn inform_response_fits_before_delivery_on_udp_and_tcp() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let policy_calls = calls.clone();
     let processor = NotificationProcessor::builder()
-        .local_engine(local.clone())
+        .local_engine(engine())
+        .admission_policy(move |_| {
+            policy_calls.fetch_add(1, Ordering::Relaxed);
+            async_snmp::NotificationAdmissionDecision::Admit
+        })
         .build()
         .unwrap();
-    let wire = CommunityMessage::v2c("public", inform(Version::V2c, 256).into_raw())
+    let request = inform(Version::V2c, 256).into_raw();
+    let wire = CommunityMessage::v2c("public", request.clone())
         .unwrap()
         .encode()
         .unwrap();
-    for (send, suppressed) in [(64, false), (1, true)] {
+    let ordinary_len = wire.len();
+    for (send, suppressed) in [(ordinary_len - 1, false), (1, true)] {
         let limits = ProcessingLimits::new(ReceiveLimits::udp(8192).unwrap(), send).unwrap();
-        let event = accepted(
-            processor
-                .process(input(wire.clone(), limits, false))
-                .unwrap(),
-        );
-        let encoded = event.inform_response.unwrap().encode().unwrap();
-        if suppressed {
-            assert!(matches!(encoded, EncodedInformResponse::Suppressed));
-        } else {
-            let EncodedInformResponse::TooBig(bytes) = encoded else {
-                panic!("expected tooBig");
-            };
+        let result = processor
+            .process(input(wire.clone(), limits, false))
+            .unwrap();
+        let NotificationProcessResult::InformTooBig { response } = result else {
+            panic!("expected oversized result: {result:?}");
+        };
+        assert_eq!(response.is_none(), suppressed);
+        if let Some(bytes) = response {
             assert!(bytes.len() <= send);
             let decoded = CommunityMessage::decode(bytes, async_snmp::DecodeConfig::DEFAULT)
                 .unwrap()
                 .value;
-            assert!(decoded.pdu().standard().unwrap().varbinds().is_empty());
+            let pdu = decoded.pdu().standard().unwrap();
+            assert_eq!(pdu.error_status_enum(), async_snmp::ErrorStatus::TooBig);
+            assert_eq!(pdu.request_id(), request.request_id());
+            assert_eq!(pdu.error_index(), 0);
+            assert!(pdu.varbinds().is_empty());
         }
     }
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    let limits = ProcessingLimits::new(ReceiveLimits::udp(8192).unwrap(), ordinary_len).unwrap();
+    let event = accepted(processor.process(input(wire, limits, false)).unwrap());
+    assert_eq!(ordinary_bytes(event).len(), ordinary_len);
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
     let limits =
         ProcessingLimits::new(ReceiveLimits::tcp(128 * 1024).unwrap(), 128 * 1024).unwrap();
     let wire = CommunityMessage::v2c("public", inform(Version::V2c, 70 * 1024).into_raw())
@@ -264,11 +287,9 @@ fn inform_response_is_encoded_lazily_with_exact_size_fallback() {
     let info = received.info();
     let event = accepted(processor.process(received).unwrap());
     assert_eq!(event.receive_info, info);
-    let EncodedInformResponse::Response(bytes) = event.inform_response.unwrap().encode().unwrap()
-    else {
-        panic!("expected full stream response");
-    };
+    let bytes = ordinary_bytes(event);
     assert!(bytes.len() > async_snmp::UDP_RECEIVE_BUFFER_SIZE);
+    assert_eq!(calls.load(Ordering::Relaxed), 4);
 }
 
 #[test]
@@ -277,7 +298,7 @@ fn usm_failure_keeps_report_and_unclaimed_engine_uses_authoritative_core() {
     let processor = NotificationProcessor::builder()
         .local_engine(local.clone())
         .security_context(UsmSecurityContext::default())
-        .accept_all_notifications()
+        .admit_all_notifications()
         .build()
         .unwrap();
     let local_wire = v3(
@@ -298,8 +319,11 @@ fn usm_failure_keeps_report_and_unclaimed_engine_uses_authoritative_core() {
     ));
     let before = local.usm_stats();
     assert!(
-        processor
-            .report_unknown_engine(input(local_wire, ProcessingLimits::UDP, false))
+        local
+            .report_unknown_engine(
+                input(local_wire, ProcessingLimits::UDP, false),
+                DecodeConfig::DEFAULT
+            )
             .unwrap()
             .is_none()
     );
@@ -307,12 +331,235 @@ fn usm_failure_keeps_report_and_unclaimed_engine_uses_authoritative_core() {
     for id in [b"foreign-engine".as_slice(), b"".as_slice()] {
         let wire = v3(id, "unknown", inform(Version::V3, 0).into_raw(), true);
         assert!(
-            processor
-                .report_unknown_engine(input(wire, ProcessingLimits::UDP, false))
+            local
+                .report_unknown_engine(
+                    input(wire, ProcessingLimits::UDP, false),
+                    DecodeConfig::DEFAULT
+                )
                 .unwrap()
                 .is_some()
         );
     }
     assert_eq!(local.usm_stats().unknown_engine_ids, 2);
     assert_eq!(local.usm_stats().unknown_usernames, 1);
+}
+
+#[test]
+fn selected_peer_routes_by_pdu_type_when_reportable_flag_disagrees() {
+    use async_snmp::v3::{ReportStatus, classify_report};
+
+    let local = engine();
+    let processor = NotificationProcessor::builder()
+        .local_engine(local.clone())
+        .security_context(
+            UsmSecurityContext::new([UsmUserEntry::new(UsmUser::new("user"))]).unwrap(),
+        )
+        .admit_all_notifications()
+        .build()
+        .unwrap();
+    let foreign = b"previous-receiver-engine";
+    let inform = NotificationPdu::inform(
+        Version::V3,
+        -42,
+        100,
+        &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1),
+        vec![],
+    )
+    .unwrap();
+    let wire = v3(foreign, "user", inform.into_raw(), false);
+    let received = input(wire, ProcessingLimits::UDP, false);
+    let NotificationProcessResult::UsmFailed {
+        failure: UsmFailure::UnknownEngineIds,
+        report: Some(report),
+    } = processor.process(received).unwrap()
+    else {
+        panic!("expected a Report for the stale Inform");
+    };
+    let report = V3Message::decode(report, DecodeConfig::DEFAULT)
+        .unwrap()
+        .value;
+    assert_eq!(report.global_data().msg_id(), 71);
+    assert_eq!(
+        report.global_data().msg_flags(),
+        MsgFlags::new(SecurityLevel::NoAuthNoPriv, false)
+    );
+    let scoped = report.scoped_pdu().unwrap();
+    assert_eq!(scoped.context_engine_id.as_ref(), local.engine_id());
+    assert!(scoped.context_name.is_empty());
+    assert_eq!(scoped.pdu.request_id(), -42);
+    assert_eq!(
+        classify_report(&scoped.pdu).unwrap(),
+        ReportStatus::UnknownEngineId { counter: 1 },
+    );
+    let usm = UsmSecurityParams::decode(report.security_params().clone(), DecodeConfig::DEFAULT)
+        .unwrap()
+        .value;
+    assert_eq!(usm.engine_id().as_ref(), local.engine_id());
+
+    let trap = NotificationPdu::trap_v2(
+        Version::V3,
+        42,
+        100,
+        &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1),
+        vec![],
+    )
+    .unwrap();
+    let trap = trap.into_raw();
+    let received = input(
+        v3(foreign, "nobody", trap.clone(), true),
+        ProcessingLimits::UDP,
+        false,
+    );
+    assert!(matches!(
+        processor.process(received).unwrap(),
+        NotificationProcessResult::UsmFailed {
+            failure: UsmFailure::UnknownUserNames,
+            report: None
+        }
+    ));
+    let received = input(
+        v3(foreign, "user", trap, true),
+        ProcessingLimits::UDP,
+        false,
+    );
+    let event = accepted(processor.process(received).unwrap());
+    assert!(matches!(event.notification, Notification::TrapV3 { .. }));
+    assert!(event.inform_response.is_none());
+    assert_eq!(local.usm_stats().unknown_engine_ids, 1);
+    assert_eq!(local.usm_stats().unknown_usernames, 1);
+}
+
+#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
+#[tokio::test]
+async fn caller_owned_udp_defers_two_auth_priv_informs_until_persistence() {
+    use std::io::Write;
+    use std::time::Duration;
+
+    use async_snmp::{
+        AuthProtocol, Client, NotificationAdmissionDecision, PrivProtocol, Retry, UdpEndpoint,
+        UsmConfig,
+    };
+    use tokio::net::UdpSocket;
+    use tokio::time::{Instant, timeout};
+
+    const WAIT: Duration = Duration::from_secs(10);
+    const USER: &str = "collector";
+    let passwords = ["tenant-a-password", "tenant-b-password"];
+    let engine = engine();
+    let contexts = passwords.map(|password| {
+        let user = UsmUser::new(USER)
+            .auth_priv(
+                AuthProtocol::Sha256,
+                password,
+                PrivProtocol::Aes128,
+                password,
+            )
+            .unwrap();
+        let entry = UsmUserEntry::for_engine(engine.engine_id().to_vec(), user).unwrap();
+        UsmSecurityContext::new([entry]).unwrap()
+    });
+    let processors = contexts.clone().map(|context| {
+        NotificationProcessor::builder()
+            .local_engine(engine.clone())
+            .security_context(context)
+            .admission_policy(|event| {
+                if event.security_level == Some(SecurityLevel::AuthPriv) {
+                    NotificationAdmissionDecision::Admit
+                } else {
+                    NotificationAdmissionDecision::Reject
+                }
+            })
+            .build()
+            .unwrap()
+    });
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let local = socket.local_addr().unwrap();
+    let endpoints = [
+        UdpEndpoint::spawn("127.0.0.1:0").await.unwrap(),
+        UdpEndpoint::spawn("127.0.0.1:0").await.unwrap(),
+    ];
+    let make_client = |password: &str| {
+        let security = UsmConfig::new(USER)
+            .auth_priv(
+                AuthProtocol::Sha256,
+                password,
+                PrivProtocol::Aes128,
+                password,
+            )
+            .unwrap();
+        Client::builder(local, security)
+            .request_timeout(WAIT)
+            .retry(Retry::none())
+    };
+    let client_a = make_client(passwords[0])
+        .build_with(&endpoints[0])
+        .await
+        .unwrap();
+    let client_b = make_client(passwords[1])
+        .build_with(&endpoints[1])
+        .await
+        .unwrap();
+
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    let send_a = client_a.send_inform(&trap_oid, 1, vec![]);
+    let send_b = client_b.send_inform(&trap_oid, 2, vec![]);
+    tokio::pin!(send_a, send_b);
+
+    let endpoint = EndpointId::new();
+    let limits = ProcessingLimits::UDP;
+    let mut buffer = vec![0; limits.receive().accepted()];
+    let mut pending = [None, None];
+    while pending.iter().any(Option::is_none) {
+        let (len, peer) = tokio::select! {
+            result = &mut send_a => panic!("tenant A completed before persistence: {result:?}"),
+            result = &mut send_b => panic!("tenant B completed before persistence: {result:?}"),
+            packet = timeout(WAIT, socket.recv_from(&mut buffer)) => packet.unwrap().unwrap(),
+        };
+        let tenant = endpoints
+            .iter()
+            .position(|endpoint| endpoint.local_addr() == peer)
+            .unwrap();
+        let info = ReceivedMessageInfo::udp(endpoint, local, peer, None, Instant::now(), len);
+        let packet = ReceivedPacket::new(Bytes::copy_from_slice(&buffer[..len]), info);
+        let received = ProcessingInput::new(packet, limits).unwrap();
+        let processor = &processors[tenant];
+        match processor.process(received).unwrap() {
+            NotificationProcessResult::UsmFailed {
+                failure: UsmFailure::UnknownEngineIds | UsmFailure::NotInTimeWindows,
+                report: Some(report),
+            } => {
+                socket.send_to(&report, peer).await.unwrap();
+            }
+            NotificationProcessResult::Accepted(event) => {
+                assert_eq!(event.receive_info, info);
+                assert!(
+                    matches!(&event.notification, Notification::InformV3 { username, uptime, security_level: SecurityLevel::AuthPriv, .. }
+                    if username.as_ref() == USER.as_bytes() && *uptime == tenant as u32 + 1)
+                );
+                assert!(pending[tenant].is_none());
+                pending[tenant] = Some(event);
+            }
+            other => panic!("unexpected notification result: {other:?}"),
+        }
+    }
+    assert!(futures::poll!(&mut send_a).is_pending());
+    assert!(futures::poll!(&mut send_b).is_pending());
+    let mut stored = tempfile::NamedTempFile::new().unwrap();
+    for event in pending.iter().flatten() {
+        writeln!(stored, "{:?}", event.notification).unwrap();
+    }
+    stored.as_file().sync_all().unwrap();
+
+    for (context, event) in contexts.into_iter().zip(pending.into_iter().flatten()) {
+        context.replace_users([]).unwrap();
+        let peer = event.receive_info.peer_addr();
+        let bytes = ordinary_bytes(*event);
+        socket.send_to(&bytes, peer).await.unwrap();
+    }
+    let (a, b) = timeout(WAIT, async { tokio::join!(send_a, send_b) })
+        .await
+        .unwrap();
+    a.unwrap();
+    b.unwrap();
+    assert_eq!(engine.usm_stats().unknown_engine_ids, 2);
 }

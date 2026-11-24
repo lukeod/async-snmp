@@ -65,7 +65,7 @@ impl UsmUserEntry {
 /// default after an exact entry fails security checks.
 ///
 /// Managed builders require persisted local engine state and applicable
-/// application authorization/acceptance policy even for an initially empty
+/// application authorization or admission policy even for an initially empty
 /// explicit context. User replacement cannot supply those prerequisites.
 ///
 /// ```rust
@@ -369,7 +369,7 @@ mod tests {
             accepted_receive_size: 8192,
             decode_config: crate::DecodeConfig::DEFAULT,
             outbound_limit: 8192,
-            usm_users: context.snapshot(),
+            usm_users: Some(context.snapshot()),
             stats: &engine.inner.usm_stats,
             mpd: None,
             source: "127.0.0.1:9999".parse().unwrap(),

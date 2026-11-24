@@ -21,6 +21,14 @@ impl NotificationRole {
         })?;
         match result {
             NotificationProcessResult::Rejected => Ok(None),
+            NotificationProcessResult::InformTooBig { response } => {
+                if let Some(response) = response
+                    && let Err(error) = self.send_response(response, &route).await
+                {
+                    tracing::debug!(target: "async_snmp::notification", { snmp.source = %source, error = %error }, "failed to send Inform tooBig response");
+                }
+                Ok(None)
+            }
             NotificationProcessResult::UsmFailed { failure, report } => {
                 tracing::warn!(target: "async_snmp::notification", { snmp.source = %source, snmp.failure = ?failure }, "USM processing failed for inbound message");
                 if let Some(report) = report
@@ -125,25 +133,25 @@ impl NotificationRole {
                 "pending Inform expired",
             );
         }
-        match encoded {
-            Ok(EncodedInformResponse::Suppressed) => InformAckOutcome::SuppressedBySize,
-            Ok(EncodedInformResponse::Response(bytes) | EncodedInformResponse::TooBig(bytes)) => {
-                let sent = match deadline {
-                    Some(deadline) => self.send_response_before(bytes, &route, deadline).await,
-                    None => self.send_response(bytes, &route).await,
-                };
-                match sent {
-                    Ok(()) => InformAckOutcome::Sent,
-                    Err(error) => InformAckOutcome::Failed(
-                        Error::Network {
-                            target: source,
-                            source: error,
-                        }
-                        .boxed(),
-                    ),
+        let (bytes, outcome) = match encoded {
+            Ok(EncodedInformResponse::Response(bytes)) => (bytes, InformAckOutcome::Sent),
+            Ok(EncodedInformResponse::TooBig(bytes)) => (bytes, InformAckOutcome::SentTooBig),
+            Ok(EncodedInformResponse::Suppressed) => return InformAckOutcome::SuppressedBySize,
+            Err(error) => return InformAckOutcome::Failed(error),
+        };
+        let sent = match deadline {
+            Some(deadline) => self.send_response_before(bytes, &route, deadline).await,
+            None => self.send_response(bytes, &route).await,
+        };
+        match sent {
+            Ok(()) => outcome,
+            Err(error) => InformAckOutcome::Failed(
+                Error::Network {
+                    target: source,
+                    source: error,
                 }
-            }
-            Err(error) => InformAckOutcome::Failed(error),
+                .boxed(),
+            ),
         }
     }
 
