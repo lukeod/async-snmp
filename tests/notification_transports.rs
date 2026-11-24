@@ -1,9 +1,10 @@
 #![cfg(feature = "agent")]
 use async_snmp::{
-    Agent, Auth, ClientBuilder, ListenerSource, NotificationReceiver, NotificationSinkId,
-    NotificationTarget, RequestTransport, Retry, SinkStatus, TcpTransport, TransportKind,
-    UdpEndpoint, oid,
+    Agent, Auth, ClientBuilder, ListenerSource, Notification, NotificationReceiver,
+    NotificationSinkId, NotificationTarget, RequestTransport, Retry, SinkStatus, TcpTransport,
+    TransportKind, UdpEndpoint, Value, VarBind, oid,
 };
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 const WAIT: Duration = Duration::from_secs(3);
@@ -75,6 +76,70 @@ async fn shared_wildcard_udp_commands_and_notifications_use_one_port() {
     assert_eq!(summary.transport(), TransportKind::Udp);
     assert_eq!(summary.session_id(), None);
     agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn v1_udp_traps_use_the_sink_source_address_and_port() {
+    for bind in [
+        "0.0.0.0:0",
+        #[cfg(target_os = "linux")]
+        "[::]:0",
+        #[cfg(target_os = "linux")]
+        "[::ffff:127.0.0.1]:0",
+    ] {
+        let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
+        let agent = Agent::builder()
+            .bind("127.0.0.1:0")
+            .notification_sink(
+                id("udp"),
+                NotificationTarget::udp(
+                    UdpEndpoint::builder().bind(bind),
+                    receiver.bound_addresses()[0].local_addr.to_string(),
+                ),
+                Auth::v1("public"),
+            )
+            .spawn()
+            .await
+            .unwrap();
+        let source_port = agent
+            .notification_sinks()
+            .next()
+            .unwrap()
+            .local_addr()
+            .port();
+
+        for explicit in [None, Some([192, 0, 2, 1])] {
+            let varbinds = explicit
+                .into_iter()
+                .map(|address| {
+                    VarBind::new(
+                        async_snmp::notification::oids::snmp_trap_address(),
+                        Value::IpAddress(address),
+                    )
+                })
+                .collect();
+            let outcome = agent.send_trap(&cold(), 0, varbinds).await;
+            assert!(outcome.all_succeeded(), "{bind}: {outcome:?}");
+            let event = tokio::time::timeout(WAIT, receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let source = event.receive_info.peer_addr();
+            assert_eq!(source.port(), source_port, "{bind}");
+            assert_eq!(source.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST), "{bind}");
+            let Notification::TrapV1 { trap, .. } = event.notification else {
+                panic!("expected an SNMPv1 trap from {bind}");
+            };
+            assert_eq!(
+                trap.agent_addr(),
+                explicit.unwrap_or(Ipv4Addr::LOCALHOST.octets()),
+                "{bind}"
+            );
+        }
+
+        agent.shutdown().await.unwrap();
+        receiver.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]

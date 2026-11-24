@@ -1622,6 +1622,13 @@ impl NotificationPdu {
     /// OID cannot be represented by the v1 fields, or the derived enterprise
     /// and copied varbinds do not form an encodable SNMPv1 Trap.
     pub fn to_v1_trap(&self, default_addr: [u8; 4]) -> Result<TrapV1Notification> {
+        self.to_v1_trap_with(|| default_addr)
+    }
+
+    pub(crate) fn to_v1_trap_with(
+        &self,
+        default_addr: impl FnOnce() -> [u8; 4],
+    ) -> Result<TrapV1Notification> {
         use crate::notification::oids;
 
         if self
@@ -1674,7 +1681,7 @@ impl NotificationPdu {
                 Value::IpAddress(address) => Some(address),
                 _ => None,
             })
-            .unwrap_or(default_addr);
+            .unwrap_or_else(default_addr);
 
         TrapV1Notification::new(
             enterprise,

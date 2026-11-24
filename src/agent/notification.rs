@@ -6,7 +6,7 @@
 use std::fmt;
 use std::fmt::Write;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
@@ -367,6 +367,31 @@ impl TrapSink {
                 inform_retry,
                 inform_client: AsyncMutex::new(None),
             },
+        }
+    }
+
+    fn local_ipv4_addr(&self) -> Option<[u8; 4]> {
+        let local = self.summary.local_addr.ip().to_canonical();
+        if let IpAddr::V4(address) = local
+            && !address.is_unspecified()
+        {
+            return Some(address.octets());
+        }
+        if !local.is_unspecified() || self.summary.transport != crate::TransportKind::Udp {
+            return None;
+        }
+
+        let IpAddr::V4(target) = self.summary.dest.ip().to_canonical() else {
+            return None;
+        };
+        // Connecting a separate UDP socket selects a route without sending a
+        // datagram or changing the originator endpoint's peer or source port.
+        let probe = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+        let _ = probe.set_broadcast(true);
+        probe.connect((target, self.summary.dest.port())).ok()?;
+        match probe.local_addr().ok()?.ip() {
+            IpAddr::V4(address) if !address.is_unspecified() => Some(address.octets()),
+            _ => None,
         }
     }
 
@@ -744,6 +769,12 @@ impl super::Agent {
     /// fire-and-forget and remote receipt is not confirmed.
     ///
     /// V1 trap sinks receive a converted v1 trap (RFC 3584 Section 3.2).
+    /// A valid `snmpTrapAddress.0` supplies `agent-addr`. Otherwise the agent
+    /// uses the sink's concrete local IPv4 address, including mapped IPv4. A
+    /// wildcard UDP sink targeting IPv4 does a best-effort lookup of the
+    /// ordinary route on a separate socket and sends on its original endpoint.
+    /// Socket-specific routing options can affect the actual source. If no IPv4
+    /// address is available, the field is `0.0.0.0`.
     /// For a V3 sink, this Agent is authoritative and sends its persisted
     /// engine ID with the current boots/time tuple.
     ///
@@ -956,13 +987,7 @@ impl super::Agent {
         self.ensure_notification_active()?;
         let data = match sink.summary.version {
             Version::V1 => {
-                // Convert the v2 PDU to a v1 TrapV1Pdu (RFC 3584 Section 3.2).
-                // Use the agent's bound address as agent_addr if available.
-                let local_ip = match sink.peer.local_addr().ip() {
-                    std::net::IpAddr::V4(v4) => v4.octets(),
-                    std::net::IpAddr::V6(_) => [0; 4],
-                };
-                let trap = pdu.to_v1_trap(local_ip)?;
+                let trap = pdu.to_v1_trap_with(|| sink.local_ipv4_addr().unwrap_or_default())?;
                 let msg = CommunityMessage::v1_trap(sink.community.clone(), trap.into_raw())?;
                 msg.encode()
             }
