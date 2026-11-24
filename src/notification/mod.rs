@@ -1412,7 +1412,7 @@ impl NotificationReceiverBuilder {
         };
         let capacity_registration =
             crate::transport::listener::PreparedListener::register_receive_capacities(
-                &listeners,
+                &mut listeners,
                 &local_engine,
             );
         let enabled = self.client_exchanges;

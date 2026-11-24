@@ -214,12 +214,14 @@ struct UdpRecvTaskCleanup {
     core: Arc<UdpCore>,
     shutdown_complete: CancellationToken,
     status: Arc<Mutex<UdpStatus>>,
+    receive_capacity: Option<crate::ReceiveCapacityRegistration>,
 }
 
 impl Drop for UdpRecvTaskCleanup {
     fn drop(&mut self) {
         self.responder.close();
         self.core.close();
+        drop(self.receive_capacity.take());
         let mut status = self.status.lock().unwrap();
         if matches!(*status, UdpStatus::Prepared | UdpStatus::Running) {
             *status = UdpStatus::Interrupted;
@@ -248,13 +250,6 @@ impl UdpEndpoint {
     pub(crate) fn test_responder(&self) -> Arc<UdpResponder> {
         self.inner.responder.clone()
     }
-    pub(crate) fn limits(&self) -> super::ProcessingLimits {
-        super::ProcessingLimits {
-            receive: self.inner.receive_limits,
-            send: self.inner.config.send_capacity,
-        }
-    }
-
     /// Bind and explicitly start a receiver with default configuration.
     ///
     /// Use `0.0.0.0:0` for IPv4 targets or `[::]:0` for IPv6 targets.
@@ -391,6 +386,11 @@ pub struct UdpRunner {
     receive_error_ready: Arc<tokio::sync::Notify>,
 }
 impl UdpRunner {
+    pub(crate) fn register_receive_capacity(&mut self, engine: &crate::LocalEngine) {
+        self.cleanup.receive_capacity =
+            Some(engine.register_receive_capacity(self.receive_limits.advertised()));
+    }
+
     #[cfg(test)]
     pub(crate) fn test_receive_faults(
         &mut self,
@@ -425,6 +425,7 @@ impl UdpRunner {
                 core: inner.core.clone(),
                 shutdown_complete: inner.shutdown_complete.clone(),
                 status: inner.status.clone(),
+                receive_capacity: None,
             },
             #[cfg(test)]
             receive_errors: inner.receive_errors.clone(),
@@ -867,6 +868,9 @@ impl UdpEndpointBuilder {
 /// This capability is cloneable. Every clone controls the same socket, and
 /// shutdown is irreversible and idempotent. It affects all clients and handles
 /// that share the endpoint, including clients for other targets.
+/// For an endpoint owned by an agent or notification service, shutting down the
+/// endpoint leaves the service and its other endpoints running. Use service
+/// control to shut down the service, even after closing every UDP endpoint.
 #[derive(Clone)]
 pub struct UdpControl {
     _service_lease: Option<Arc<dyn Send + Sync>>,

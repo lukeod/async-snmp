@@ -376,9 +376,9 @@ impl LocalEngine {
     }
 
     /// Minimum advertised receive capacity of declared endpoints and retained
-    /// processing inputs. Managed listener registrations remain through runner
-    /// drain. Configured TCP sessions unregister when they close. Client
-    /// registrations remain until their last clone is dropped.
+    /// processing inputs. UDP endpoints and configured TCP sessions unregister
+    /// when they close. TCP listener registrations remain through service drain.
+    /// Client registrations remain until their last clone is dropped.
     /// Caller-owned command processing retains admitted input capacity through
     /// cleanup. Returns `None` while no registrations remain. Per-message v3
     /// advertisement uses the receiving endpoint's own capacity.

@@ -4,8 +4,8 @@ use async_snmp::handler::{
     BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext,
 };
 use async_snmp::{
-    Agent, Auth, AuthoritativeEngine, Client, ListenerSource, Retry, TcpListenerSource, TcpOptions,
-    TransportKind, Value, oid,
+    Agent, AgentStatus, Auth, AuthoritativeEngine, Client, ListenerSource, Retry,
+    TcpListenerSource, TcpOptions, TransportKind, UdpEndpoint, UdpStatus, Value, oid,
 };
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
@@ -382,33 +382,58 @@ async fn v3_discovery_authentication_and_privacy_across_udp_tcp() {
 }
 
 #[tokio::test]
-async fn unexpectedly_stopped_udp_endpoint_reports_listener_identity() {
+async fn agent_udp_endpoint_shutdown_preserves_tcp_commands() {
+    let mut options = TcpOptions::default();
+    options.max_message_size = 4096;
     let agent = Agent::builder()
-        .listener(ListenerSource::udp("127.0.0.1:0"))
-        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .community("public")
+        .allow_all_access()
+        .listener(ListenerSource::Udp(
+            UdpEndpoint::builder()
+                .bind("127.0.0.1:0")
+                .receive_capacity(484),
+        ))
+        .listener(ListenerSource::Tcp(
+            TcpListenerSource::bind("127.0.0.1:0").session_options(options),
+        ))
         .spawn()
         .await
         .unwrap();
-    let bound = agent.bound_addresses()[0];
-    agent
-        .udp_endpoint(bound.endpoint_id)
+    let udp = agent
+        .udp_endpoint(agent.bound_addresses()[0].endpoint_id)
         .unwrap()
-        .control()
-        .request_shutdown();
-    let error = agent.join().await.unwrap_err();
-    match *error {
-        async_snmp::Error::Listener {
-            endpoint_id,
-            transport,
-            local_addr,
-            ..
-        } => {
-            assert_eq!(endpoint_id, bound.endpoint_id);
-            assert_eq!(transport, TransportKind::Udp);
-            assert_eq!(local_addr, bound.local_addr);
-        }
-        error => panic!("unexpected listener error: {error}"),
-    }
+        .control();
+    let tcp = Client::builder(agent.bound_addresses()[1].local_addr, Auth::v2c("public"))
+        .request_timeout(Duration::from_secs(2))
+        .connect_tcp()
+        .await
+        .unwrap();
+    let capacity_oid = oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0);
+    let before = tcp.get(&capacity_oid).await.unwrap();
+    assert_eq!(before.varbinds[0].value, Value::Integer(484));
+
+    udp.shutdown().await;
+    assert_eq!(udp.status(), UdpStatus::Stopped);
+    let after = tcp.get(&capacity_oid).await.unwrap();
+    assert_eq!(after.varbinds[0].value, Value::Integer(4096));
+    assert_eq!(agent.control().status(), AgentStatus::Running);
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn closing_the_only_udp_endpoint_leaves_agent_under_service_control() {
+    let agent = Agent::builder().bind("127.0.0.1:0").spawn().await.unwrap();
+    let udp = agent
+        .udp_endpoint(agent.bound_addresses()[0].endpoint_id)
+        .unwrap()
+        .control();
+    udp.shutdown().await;
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), agent.control().wait_closed())
+            .await
+            .is_err()
+    );
+    agent.shutdown().await.unwrap();
 }
 
 #[tokio::test]

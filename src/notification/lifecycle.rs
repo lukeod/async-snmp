@@ -494,9 +494,11 @@ impl NotificationRunner {
             cleanup,
         }
     }
-    /// Run all prepared sources. Graceful shutdown invalidates pending manual
-    /// acknowledgements and drains admitted automatic response attempts before
-    /// closing session writers. Queued events remain available after shutdown.
+    /// Drive the receiver until service shutdown or a fatal listener failure.
+    /// Individual endpoints can stop while the service remains active.
+    /// Graceful shutdown invalidates pending manual acknowledgements and drains
+    /// admitted automatic response attempts before closing session writers.
+    /// Queued events remain available after shutdown.
     pub async fn run(self) -> Result<()> {
         // On cancellation, drop the network before publishing runner completion.
         let Self {
@@ -521,14 +523,16 @@ impl NotificationRunner {
             let failures = failures.clone();
             children.spawn(state.run_source(source, cancel, failures));
         }
-        let result = tokio::select! {
-            biased;
-            () = cleanup.state.shutdown.cancelled() => Ok(()),
-            Some(error) = failure_rx.recv() => Err(error),
-            joined = children.join_next() => match joined {
-                Some(Ok(result)) => result,
-                Some(Err(error)) => Err(Error::Config(format!("notification network task failed: {error}").into()).boxed()),
-                None => Ok(()),
+        let result = loop {
+            tokio::select! {
+                biased;
+                () = cleanup.state.shutdown.cancelled() => break Ok(()),
+                Some(error) = failure_rx.recv() => break Err(error),
+                joined = children.join_next(), if !children.is_empty() => match joined {
+                    Some(Ok(Err(error))) => break Err(error),
+                    Some(Err(error)) => break Err(Error::Config(format!("notification network task failed: {error}").into()).boxed()),
+                    Some(Ok(Ok(()))) | None => {},
+                }
             }
         };
         cleanup.stop_admission();

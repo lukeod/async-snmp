@@ -141,6 +141,58 @@ async fn udp_manual_ack_preserves_wildcard_destination_and_close_keeps_admitted_
 }
 
 #[tokio::test]
+async fn receiver_udp_endpoint_shutdown_preserves_tcp_informs() {
+    let mut receiver = manual()
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let udp = receiver
+        .udp_endpoint(receiver.bound_addresses()[0].endpoint_id)
+        .unwrap()
+        .control();
+    let mut peer = TcpStream::connect(receiver.bound_addresses()[1].local_addr)
+        .await
+        .unwrap();
+    peer.write_all(&wire(1)).await.unwrap();
+    let first = pending(event(&mut receiver).await);
+
+    udp.shutdown().await;
+    assert_eq!(udp.status(), async_snmp::UdpStatus::Stopped);
+    assert!(matches!(first.acknowledge().await, InformAckOutcome::Sent));
+    let reply = tcp_reply(&mut peer).await;
+    assert_eq!(reply.pdu().standard().unwrap().request_id(), 1);
+
+    peer.write_all(&wire(2)).await.unwrap();
+    let second = pending(event(&mut receiver).await);
+    assert!(matches!(second.acknowledge().await, InformAckOutcome::Sent));
+    let reply = tcp_reply(&mut peer).await;
+    assert_eq!(reply.pdu().standard().unwrap().request_id(), 2);
+    assert_eq!(
+        receiver.control().status(),
+        async_snmp::NotificationStatus::Running
+    );
+    receiver.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn closing_the_only_udp_endpoint_leaves_receiver_under_service_control() {
+    let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
+    let udp = receiver
+        .udp_endpoint(receiver.bound_addresses()[0].endpoint_id)
+        .unwrap()
+        .control();
+    udp.shutdown().await;
+    assert!(
+        tokio::time::timeout(WAIT, receiver.control().wait_closed())
+            .await
+            .is_err()
+    );
+    receiver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn tcp_pending_saturation_preserves_session_and_drop_releases_outstanding_slot() {
     let mut receiver = manual()
         .listener(ListenerSource::tcp("127.0.0.1:0"))

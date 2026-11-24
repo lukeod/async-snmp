@@ -235,16 +235,19 @@ impl PreparedListener {
             }
         }
     }
-    /// Configured sessions unregister on close. Root runners retain their UDP
-    /// and TCP listener minimum through service drain.
+    /// UDP endpoints and configured TCP sessions unregister when they close.
+    /// The root runner retains the TCP listener minimum through service drain.
     pub(crate) fn register_receive_capacities(
-        listeners: &[Self],
+        listeners: &mut [Self],
         engine: &crate::LocalEngine,
     ) -> Option<crate::ReceiveCapacityRegistration> {
         listeners
-            .iter()
+            .iter_mut()
             .filter_map(|listener| match listener {
-                Self::Udp { endpoint, .. } => Some(endpoint.limits().receive.advertised()),
+                Self::Udp { runner, .. } => {
+                    runner.register_receive_capacity(engine);
+                    None
+                }
                 Self::Tcp { options, .. } => Some(
                     crate::ReceiveLimits::tcp(options.max_message_size)
                         .expect("validated")

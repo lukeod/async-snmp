@@ -1606,7 +1606,7 @@ impl AgentBuilder {
         };
         construction.check(ConstructionStage::Prepare, None, None)?;
         let capacity_registration =
-            PreparedListener::register_receive_capacities(&listeners, &local_engine);
+            PreparedListener::register_receive_capacities(&mut listeners, &local_engine);
         let inner = command::prepare_application(command::ApplicationConfig {
             local_engine,
             security_context,
@@ -3677,8 +3677,21 @@ mod tests {
             .unwrap()
             .push_back(std::io::Error::from(std::io::ErrorKind::InvalidInput));
 
+        let bound = agent.bound_addresses()[0];
         let error = agent.run().await.unwrap_err();
-        let Error::Network { source, .. } = error.exchange_source() else {
+        let Error::Listener {
+            endpoint_id,
+            transport,
+            local_addr,
+            source,
+        } = *error
+        else {
+            panic!("fatal receive error lost its listener identity");
+        };
+        assert_eq!(endpoint_id, bound.endpoint_id);
+        assert_eq!(transport, bound.transport);
+        assert_eq!(local_addr, bound.local_addr);
+        let Error::Network { source, .. } = *source else {
             panic!("fatal receive error lost its network classification");
         };
         assert_eq!(source.kind(), std::io::ErrorKind::InvalidInput);

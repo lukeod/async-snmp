@@ -267,6 +267,8 @@ impl AgentRunner {
             },
         }
     }
+    /// Drive the agent until service shutdown or a fatal listener failure.
+    /// Individual endpoints can stop while the service remains active.
     pub async fn run(mut self) -> Result<()> {
         self.processor
             .inner
@@ -315,14 +317,10 @@ impl AgentRunner {
                 joined = children.join_next(), if !children.is_empty() => match joined {
                     Some(Ok(Err(error))) => break Err(error),
                     Some(Err(error)) => break Err(Error::Config(format!("agent listener task failed: {error}").into()).boxed()),
-                    Some(Ok(Ok(()))) => break Err(Error::Config("agent listener stopped unexpectedly".into()).boxed()),
-                    None => {},
+                    Some(Ok(Ok(()))) | None => {},
                 },
                 joined = requests.join_next(), if !requests.is_empty() => { log_request_result(joined); },
-                work = self.incoming.recv() => {
-                    let Some(work) = work else { break Ok(()); };
-                    self.dispatch(&mut requests, work);
-                }
+                Some(work) = self.incoming.recv() => self.dispatch(&mut requests, work),
             }
         };
         if let Some((_, role)) = &self.notification_role {

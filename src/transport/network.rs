@@ -82,13 +82,10 @@ impl NetworkState {
         };
         async move {
             match source {
-                PreparedListener::Udp { bound, runner, .. } => match runner.run().await {
-                    Ok(()) => Err(listener_error(
-                        bound,
-                        Error::Config("UDP listener stopped unexpectedly".into()).boxed(),
-                    )),
-                    Err(error) => Err(listener_error(bound, error)),
-                },
+                PreparedListener::Udp { bound, runner, .. } => runner
+                    .run()
+                    .await
+                    .map_err(|error| listener_error(bound, error)),
                 source @ PreparedListener::Tcp { .. } => {
                     run_tcp_listener(source, self, cancel, failures).await
                 }
@@ -98,7 +95,6 @@ impl NetworkState {
                     }
                     drop(configured_guard);
                     // A configured connection failure is scoped to that session.
-                    self.stop.cancelled().await;
                     Ok(())
                 }
             }
