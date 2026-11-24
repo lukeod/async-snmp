@@ -380,11 +380,6 @@ impl std::ops::Deref for RunningNotificationReceiver {
         &self.receiver
     }
 }
-impl std::ops::DerefMut for RunningNotificationReceiver {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.receiver
-    }
-}
 impl Drop for RunningNotificationReceiver {
     fn drop(&mut self) {
         if self.task.is_some() {
@@ -393,9 +388,21 @@ impl Drop for RunningNotificationReceiver {
     }
 }
 impl RunningNotificationReceiver {
-    /// Access task status or abort execution.
-    pub fn task(&self) -> &JoinHandle<Result<()>> {
-        self.task.as_ref().expect("running task retained")
+    /// Receive the next event. See [`NotificationReceiver::recv`] for delivery and
+    /// cancellation semantics.
+    pub async fn recv(&mut self) -> Option<ReceivedNotification> {
+        self.receiver.recv().await
+    }
+
+    /// Stop new event admission. Use [`Self::recv`] to drain queued and admitted events.
+    pub fn close(&mut self) {
+        self.receiver.close();
+    }
+
+    /// Access the retained runner handle for status or aborting execution.
+    /// Returns `None` after [`Self::join`] or [`Self::shutdown`] finishes.
+    pub fn task(&self) -> Option<&JoinHandle<Result<()>>> {
+        self.task.as_ref()
     }
     /// Join while retaining the consumer for queued events. This does not request shutdown.
     pub async fn join(&mut self) -> Result<()> {

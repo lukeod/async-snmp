@@ -85,6 +85,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer cloneable. Controls expose shutdown, terminal status and coalesced
   authoritative persistence health. Deliverable Informs reserve queue capacity
   before ordinary acknowledgement. Closure drains admitted events.
+  `RunningNotificationReceiver` provides `recv()` and `close()` directly and
+  dereferences to the consumer immutably. Its `task()` returns an optional
+  handle, which is absent once `join()` or `shutdown()` finishes.
 
 - TCP sessions now own one reader and serialized writer, with bounded concurrent
   exchanges and aggregate message buffering. Cancelling a request leaves framing

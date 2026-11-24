@@ -3,6 +3,7 @@ use super::*;
 use std::sync::atomic::AtomicUsize;
 
 static_assertions::assert_not_impl_any!(NotificationReceiver: Clone);
+static_assertions::assert_not_impl_any!(RunningNotificationReceiver: std::ops::DerefMut);
 static_assertions::assert_impl_all!(NotificationReceiver: Send);
 static_assertions::assert_impl_all!(NotificationRunner: Send);
 
@@ -267,10 +268,11 @@ async fn unpolled_drop_and_task_abort_close_event_stream() {
         assert!(receiver.recv().await.is_none());
     }
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
-    receiver.task().abort();
+    receiver.task().unwrap().abort();
     receiver.control().wait_closed().await;
     assert!(receiver.recv().await.is_none());
     assert!(receiver.join().await.is_err());
+    assert!(receiver.task().is_none());
 }
 
 #[tokio::test]
@@ -406,6 +408,7 @@ fn supplied_socket_prepares_outside_runtime_then_runs_on_second_runtime() {
         .build()
         .unwrap();
     let mut receiver = prepared.spawn_on(execution.handle());
+    assert!(receiver.task().is_some());
     execution.block_on(async {
         let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         sender
@@ -414,6 +417,7 @@ fn supplied_socket_prepares_outside_runtime_then_runs_on_second_runtime() {
             .unwrap();
         await_ack(&sender).await;
         receiver.shutdown().await.unwrap();
+        assert!(receiver.task().is_none());
         assert!(receiver.recv().await.is_some());
         assert!(receiver.recv().await.is_none());
     });
