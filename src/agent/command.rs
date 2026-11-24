@@ -266,11 +266,13 @@ impl CommandProcessor {
     /// Process one input on the current Tokio runtime, returning a Response or
     /// Report when applicable. Requires an active runtime; build does not.
     ///
-    /// Register each custom endpoint with [`crate::LocalEngine::register_receive_capacity`].
-    /// Missing declaration, or an input advertisement below the minimum of
-    /// live endpoint declarations, is rejected before admission. Each admitted request keeps
-    /// its input capacity registered through completion even if the endpoint's
-    /// public registration is dropped meanwhile.
+    /// Register each custom endpoint with [`crate::LocalEngine::register_receive_capacity`]
+    /// and retain its registration while the endpoint serves this engine.
+    /// Admission checks the live declarations for the engine as a whole. It
+    /// requires at least one live declaration and an input advertisement at
+    /// or above their minimum. Each admitted request keeps its input capacity
+    /// registered through completion even if the endpoint registration is
+    /// dropped meanwhile.
     ///
     /// `None` means the input did not require a response or was rejected.
     /// Caller cancellation/deadline/shutdown can return before owned cleanup

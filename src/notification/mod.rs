@@ -1967,11 +1967,13 @@ impl NotificationReceiver {
         NotificationReceiverBuilder::new()
     }
 
-    /// Return the receiver's `snmpSilentDrops` value.
+    /// Return the `snmpSilentDrops` value shared by roles using this
+    /// receiver's [`crate::LocalEngine`].
     ///
-    /// This counter increments when the receiver discards an Inform during
-    /// protocol processing because both the ordinary response and its exact
-    /// empty-varbind `tooBig` alternate exceed the effective size limit.
+    /// For Informs, the counter increments when both the ordinary response
+    /// and its empty-varbind `tooBig` alternate exceed the effective size
+    /// limit. This can occur during initial processing or deferred response
+    /// encoding.
     #[must_use]
     pub fn snmp_silent_drops(&self) -> u32 {
         self.inner.snmp_silent_drops.load(Ordering::Relaxed)
@@ -1983,12 +1985,12 @@ impl NotificationReceiver {
     /// [`NotificationVarbindValidation::Tolerant`]; use the builder to select
     /// strict validation.
     ///
-    /// A receiver constructed this way handles v1 and v2c notifications
-    /// only: it has no USM user table, so every v3 notification (including
-    /// noAuthNoPriv) is rejected with `usmStatsUnknownUserNames` (RFC 3414
-    /// Section 3.2 Step 4). To receive v3 notifications, use
-    /// [`NotificationReceiver::builder()`] and register users with
-    /// `usm_user`.
+    /// This convenience constructor receives v1 and v2c notifications. The
+    /// default USM user table is empty, so v3 messages that pass engine ID
+    /// checks and reach USM user validation increment
+    /// `usmStatsUnknownUserNames`. To receive v3 notifications, use
+    /// [`NotificationReceiver::builder()`] to configure users, an authoritative
+    /// engine and an admission policy.
     ///
     /// This path configures no community allowlist. Received v1/v2c community
     /// strings and content are therefore cleartext, unverified, and spoofable;
@@ -2048,9 +2050,9 @@ impl NotificationReceiver {
 
     /// Returns the local engine ID.
     ///
-    /// With an [`AuthoritativeEngine`] this is the stable persisted V3
-    /// identity. A receiver without USM users instead has a generated
-    /// process-local ID.
+    /// A configured [`AuthoritativeEngine`] or a shared [`crate::LocalEngine`]
+    /// supplies the ID, even for an empty USM user table. A standalone receiver
+    /// with default engine settings generates a process-local ID.
     #[must_use]
     pub fn engine_id(&self) -> &[u8] {
         &self.inner.engine_id
