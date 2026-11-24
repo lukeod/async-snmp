@@ -126,6 +126,12 @@ jobs:
       - run: "cargo test --locked --no-default-features --features agent,${{ matrix.feature }} --test client_v3"
       - run: "cargo test --locked --no-default-features --features agent,${{ matrix.feature }} --test notification_sender"
       - run: "cargo test --locked --no-default-features --features agent,${{ matrix.feature }} --lib v3::config::tests"
+      - name: Run FIPS-only agent and notification integrations
+        if: matrix.feature == 'crypto-fips'
+        run: >-
+          cargo test --locked --no-default-features --features agent,crypto-fips
+          --test command_processor --test manual_ack --test notification_processor
+          --test notification_transports --test security_context
 
   test:
     name: Test (${{ matrix.os }}, ${{ matrix.toolchain }})
@@ -183,6 +189,27 @@ jobs:
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  net-snmp-listener-tests:
+    name: Net-SNMP Listener Interoperability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Net-SNMP command-line tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends snmp
+      - name: Run listener tests
+        run: |
+          for tool in snmpget snmpgetnext snmpbulkget snmpset snmptrap snmpinform; do
+            if ! command -v "$tool"; then
+              echo "Missing Net-SNMP executable $tool" >&2
+              exit 1
+            fi
+          done
+          cargo test --locked --features agent --test net_snmp_cli -- --ignored
 
   # Container integration tests - run separately as they require Docker
   container-tests:
