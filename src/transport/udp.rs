@@ -152,7 +152,6 @@ struct UdpEndpointInner {
     admission: Arc<Mutex<bool>>,
     status: Arc<Mutex<UdpStatus>>,
     ipv6_only: bool,
-    ingress: Option<super::ingress::ApplicationIngress>,
     dispatch: Arc<std::sync::OnceLock<Arc<super::dispatch::DispatchRoles>>>,
     #[cfg(test)]
     receive_errors: Arc<std::sync::Mutex<std::collections::VecDeque<std::io::Error>>>,
@@ -366,7 +365,6 @@ pub struct UdpRunner {
     local_addr: SocketAddr,
     receive_limits: ReceiveLimits,
     cleanup: UdpRecvTaskCleanup,
-    ingress: Option<super::ingress::ApplicationIngress>,
     dispatch: Arc<std::sync::OnceLock<Arc<super::dispatch::DispatchRoles>>>,
     send_capacity: usize,
     #[cfg(test)]
@@ -404,7 +402,6 @@ impl UdpRunner {
             endpoint_id: inner.endpoint_id,
             local_addr: inner.local_addr,
             receive_limits: inner.receive_limits,
-            ingress: inner.ingress.clone(),
             dispatch: inner.dispatch.clone(),
             send_capacity: inner.config.send_capacity,
             #[cfg(test)]
@@ -497,10 +494,6 @@ impl UdpRunner {
                             if let Some(roles) = self.dispatch.get() {
                                 let message = super::ReceivedMessage::udp(data, info, self.socket.clone(), self.responder.clone(), received, super::ProcessingLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone());
                                 roles.dispatch(message, core.clone(), &mut dispatch_tasks);
-                                continue;
-                            }
-                            if let Some(ingress) = &self.ingress {
-                                ingress.deliver_udp(super::ReceivedMessage::udp(data, info, self.socket.clone(), self.responder.clone(), received, super::ProcessingLimits { receive: receive_limits, send: self.send_capacity }).with_udp_admission(self.cleanup.admission.clone(), self.cleanup.shutdown.clone()));
                                 continue;
                             }
                             if let Some(envelope) = CorrelationEnvelope::parse(&data)
@@ -615,7 +608,6 @@ pub struct UdpEndpointBuilder {
     config: UdpEndpointConfig,
     recv_buffer_size: Option<usize>,
     send_buffer_size: Option<usize>,
-    ingress: Option<super::ingress::ApplicationIngress>,
 }
 
 impl UdpEndpointBuilder {
@@ -625,12 +617,6 @@ impl UdpEndpointBuilder {
         self.observation = super::observation::Observation(Some(observer));
         self
     }
-    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
-    pub(crate) fn ingress(mut self, ingress: super::ingress::ApplicationIngress) -> Self {
-        self.ingress = Some(ingress);
-        self
-    }
-
     /// Create a builder with the default settings.
     ///
     /// Default bind address is `0.0.0.0:0` (IPv4).
@@ -643,7 +629,6 @@ impl UdpEndpointBuilder {
             config: UdpEndpointConfig::default(),
             recv_buffer_size: None,
             send_buffer_size: None,
-            ingress: None,
         }
     }
 
@@ -842,7 +827,6 @@ impl UdpEndpointBuilder {
             admission: Arc::new(Mutex::new(true)),
             status: Arc::new(Mutex::new(UdpStatus::Prepared)),
             ipv6_only,
-            ingress: self.ingress,
             dispatch: Arc::new(std::sync::OnceLock::new()),
             #[cfg(test)]
             receive_errors: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
@@ -1038,11 +1022,6 @@ impl RequestTransport for UdpHandle {
 
         if let Some(roles) = self.inner.dispatch.get() {
             roles.validate_registration(&registration)?;
-        } else if self.inner.ingress.is_some() {
-            return Err(Error::Config(
-                "client exchanges were not enabled during endpoint preparation".into(),
-            )
-            .boxed());
         }
 
         // Admission is owned by the registration/window, not this attempt's

@@ -51,6 +51,7 @@ async fn tcp_budget_reserves_space_for_a_maximum_sized_reply() {
         let prepared = Agent::builder()
             .community(b"public")
             .allow_all_access()
+            .buffered_bytes(2048)
             .max_message_size(1024)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(BytesHandler(960)))
             .listener(ListenerSource::Tcp(
@@ -88,14 +89,36 @@ async fn tcp_budget_reserves_space_for_a_maximum_sized_reply() {
 }
 
 #[tokio::test]
-async fn service_buffer_partition_validates_all_listener_capacities() {
+async fn agent_buffer_partition_includes_udp_command_capacity() {
+    let mut options = TcpOptions::default();
+    options.max_message_size = 1024;
+    options.send_capacity = 1024;
+    options.max_buffered_bytes = 2048;
+    let result = Agent::builder()
+        .buffered_bytes(async_snmp::UDP_RECEIVE_BUFFER_SIZE)
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .listener(ListenerSource::Tcp(
+            TcpListenerSource::bind("127.0.0.1:0").session_options(options),
+        ))
+        .prepare()
+        .await;
+    let error = result
+        .err()
+        .expect("full UDP input and TCP output must fit");
+    assert!(matches!(*error, async_snmp::Error::Config(_)));
+}
+
+#[tokio::test]
+async fn receiver_tcp_buffer_partition_uses_only_tcp_listener_capacities() {
     for reverse in [false, true] {
         for total in [6144, 8192] {
             let mut capacities = [(1024, 4096), (4096, 1024)];
             if reverse {
                 capacities.reverse();
             }
-            let mut builder = async_snmp::NotificationReceiver::builder().max_buffered_bytes(total);
+            let mut builder = async_snmp::NotificationReceiver::builder()
+                .max_tcp_buffered_bytes(total)
+                .listener(ListenerSource::udp("127.0.0.1:0"));
             for (receive, send) in capacities {
                 let mut options = TcpOptions::default();
                 options.max_message_size = receive;
@@ -115,7 +138,7 @@ async fn service_buffer_partition_validates_all_listener_capacities() {
                 ));
             } else {
                 let (receiver, runner) = prepared.unwrap().into_parts();
-                assert_eq!(receiver.bound_addresses().len(), 2);
+                assert_eq!(receiver.bound_addresses().len(), 3);
                 drop(runner);
             }
         }

@@ -756,7 +756,7 @@ pub struct NotificationReceiverBuilder {
     listeners: Vec<crate::ListenerSource>,
     network_explicit: bool,
     max_connections: usize,
-    buffered_bytes: usize,
+    tcp_buffered_bytes: usize,
     overload_timeout: Duration,
     client_exchanges: bool,
     bind_addr: String,
@@ -836,7 +836,7 @@ impl NotificationReceiverBuilder {
             listeners: Vec::new(),
             network_explicit: false,
             max_connections: 128,
-            buffered_bytes: 64 * 1024 * 1024,
+            tcp_buffered_bytes: 64 * 1024 * 1024,
             overload_timeout: Duration::from_secs(5),
             client_exchanges: false,
             bind_addr: "0.0.0.0:162".to_string(),
@@ -877,12 +877,14 @@ impl NotificationReceiverBuilder {
         self.max_connections = limit;
         self
     }
-    /// Bound transport-retained bytes across sources (default 64 MiB).
-    /// The largest configured TCP send capacity is reserved for output; the
-    /// remainder must accommodate every listener's inbound buffer capacity.
-    pub fn max_buffered_bytes(mut self, limit: usize) -> Self {
+    /// Set the shared budget for buffered TCP input and queued writes (default 64 MiB).
+    /// The largest configured TCP send capacity is reserved for output, and the
+    /// remainder must accommodate the largest configured TCP inbound partition.
+    /// UDP processing and response candidates use independent dispatch budgets.
+    /// Decoded events are governed by [`Self::queue_capacity`].
+    pub fn max_tcp_buffered_bytes(mut self, limit: usize) -> Self {
         self.network_explicit = true;
-        self.buffered_bytes = limit;
+        self.tcp_buffered_bytes = limit;
         self
     }
     /// Limit intentional inbound-only TCP admission pauses (default 5 seconds).
@@ -1344,9 +1346,9 @@ impl NotificationReceiverBuilder {
                 > self.max_connections
             || self.max_connections == 0
             || self.max_connections > tokio::sync::Semaphore::MAX_PERMITS
-            || self.buffered_bytes == 0
-            || self.buffered_bytes > u32::MAX as usize
-            || self.buffered_bytes > tokio::sync::Semaphore::MAX_PERMITS
+            || self.tcp_buffered_bytes == 0
+            || self.tcp_buffered_bytes > u32::MAX as usize
+            || self.tcp_buffered_bytes > tokio::sync::Semaphore::MAX_PERMITS
             || self.overload_timeout.is_zero()
         {
             return Err(Error::Config("invalid notification network limits".into()).boxed());
@@ -1360,7 +1362,7 @@ impl NotificationReceiverBuilder {
             disabled: tokio_util::sync::CancellationToken::new(),
             capacity: Arc::new(tokio::sync::Semaphore::new(self.max_processing)),
             budget: Arc::new(crate::transport::framing::BufferBudget::new(
-                self.buffered_bytes,
+                self.tcp_buffered_bytes,
             )),
             overload_timeout: self.overload_timeout,
             drops: Arc::new(AtomicU64::new(0)),

@@ -51,9 +51,7 @@ impl ListenerSource {
     ) -> Result<PreparedListener> {
         match self {
             Self::Udp(builder) => {
-                let budget = ingress.budget.clone();
-                let (endpoint, runner) = builder.ingress(ingress).prepare().await?.into_parts();
-                budget.reserve(endpoint.limits().receive.accepted(), 0)?;
+                let (endpoint, runner) = builder.prepare().await?.into_parts();
                 let bound = BoundListener {
                     endpoint_id: endpoint.endpoint_id(),
                     transport: TransportKind::Udp,

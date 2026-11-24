@@ -211,6 +211,7 @@ use crate::oid::Oid;
 #[cfg(test)]
 use crate::pdu::NotificationPdu;
 use crate::pdu::{Pdu, PduBody, PduType, ResponsePdu};
+use crate::transport::framing::BufferBudget;
 use crate::transport::listener::PreparedListener;
 use crate::transport::normalize_udp_target;
 #[cfg(test)]
@@ -602,7 +603,7 @@ struct ValidatedTrapSink {
 struct ValidatedAgentBuilder {
     listeners: Vec<crate::transport::ListenerSource>,
     max_connections: usize,
-    buffered_bytes: usize,
+    buffer_budget: Arc<BufferBudget>,
     overload_timeout: Duration,
     discard_notifications: bool,
     client_exchanges: bool,
@@ -670,9 +671,15 @@ impl AgentBuilder {
         self.max_connections = count;
         self
     }
-    /// Bound transport-retained message bytes across listeners (default 64 MiB).
-    /// The largest configured TCP send capacity is reserved for output; the
-    /// remainder must accommodate every listener's inbound buffer capacity.
+    /// Set the shared buffer budget for command listeners and sessions (default 64 MiB).
+    /// The largest TCP send capacity is reserved for queued TCP writes. The
+    /// remaining budget covers TCP frame assembly, dispatch, processing, and
+    /// candidate validation, plus queued and active UDP command input. The
+    /// minimum input budget is the maximum of all configured TCP inbound partitions
+    /// and one full datagram if UDP command listeners are configured.
+    /// UDP application classification and notification processing share a separate
+    /// dispatch budget. UDP response candidates have their own dispatch budget.
+    /// Separately prepared sink endpoints use their own limits.
     #[must_use]
     pub fn buffered_bytes(mut self, bytes: usize) -> Self {
         self.buffered_bytes = bytes;
@@ -1424,9 +1431,7 @@ impl AgentBuilder {
             sender,
             disabled: CancellationToken::new(),
             capacity,
-            budget: Arc::new(crate::transport::framing::BufferBudget::new(
-                config.buffered_bytes,
-            )),
+            budget: config.buffer_budget,
             overload_timeout: config.overload_timeout,
             drops: Arc::new(AtomicU64::new(0)),
             session: None,
@@ -1735,7 +1740,7 @@ impl AgentBuilder {
                 > self.max_connections
             || self.max_connections == 0
             || self.max_connections > 65536
-            || self.buffered_bytes < crate::UDP_RECEIVE_BUFFER_SIZE
+            || self.buffered_bytes == 0
             || self.buffered_bytes > u32::MAX as usize
             || self.buffered_bytes > Semaphore::MAX_PERMITS
         {
@@ -1743,6 +1748,15 @@ impl AgentBuilder {
                 "invalid listener, connection or aggregate buffer limit".into(),
             )
             .boxed());
+        }
+        let buffer_budget = Arc::new(BufferBudget::new(self.buffered_bytes));
+        if self.listeners.is_empty()
+            || self
+                .listeners
+                .iter()
+                .any(|source| matches!(source, crate::ListenerSource::Udp(_)))
+        {
+            buffer_budget.reserve(crate::UDP_RECEIVE_BUFFER_SIZE, 0)?;
         }
         if self.overload_timeout.is_zero() {
             return Err(Error::Config("overload timeout must be nonzero".into()).boxed());
@@ -1875,7 +1889,7 @@ impl AgentBuilder {
         Ok(ValidatedAgentBuilder {
             listeners: self.listeners,
             max_connections: self.max_connections,
-            buffered_bytes: self.buffered_bytes,
+            buffer_budget,
             overload_timeout: self.overload_timeout,
             discard_notifications: self.discard_notifications,
             client_exchanges: self.client_exchanges,

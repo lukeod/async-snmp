@@ -108,7 +108,7 @@ async fn coalesced_informs_with_budgets(session_budget: usize, service_budget: u
         ..TcpOptions::default()
     };
     let mut receiver = NotificationReceiver::builder()
-        .max_buffered_bytes(service_budget)
+        .max_tcp_buffered_bytes(service_budget)
         .queue_capacity(32)
         .listener(ListenerSource::Tcp(
             TcpListenerSource::bind("127.0.0.1:0").session_options(options),

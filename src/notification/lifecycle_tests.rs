@@ -541,6 +541,7 @@ async fn colliding_informs_blocked_in_ack_leave_response_allowance_available() {
     };
     let mut receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
+        .max_tcp_buffered_bytes(1)
         .client_exchanges(true)
         .queue_capacity(64)
         .max_processing(64)

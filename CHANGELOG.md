@@ -103,6 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   block Responses or Inform acknowledgements. Session budgets must accommodate
   the sum of receive/send limits; service budgets must accommodate the largest
   inbound partition and largest send capacity across their listeners.
+  `NotificationReceiverBuilder::max_tcp_buffered_bytes` replaces
+  `max_buffered_bytes` and sets the shared TCP budget. UDP notification processing
+  and response candidates use independent dispatch budgets.
 
 - Shared endpoint dispatch retains packet-bound v3 header and cryptographic work
   for the selected consumer. Applications retain their own decode policy,
