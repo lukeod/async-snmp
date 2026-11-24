@@ -48,6 +48,7 @@ jobs:
           - name: agent without crypto
             arguments: --no-default-features --features agent
             complete_lib: true
+            agent_integrations: true
           - name: RustCrypto client
             arguments: --no-default-features --features crypto-rustcrypto
           - name: FIPS client
@@ -67,6 +68,12 @@ jobs:
       - name: Complete agent library tests
         if: matrix.complete_lib == true
         run: "cargo test --locked ${{ matrix.arguments }} --lib"
+      - name: Run agent and notification integrations without crypto
+        if: matrix.agent_integrations == true
+        run: >-
+          cargo test --locked ${{ matrix.arguments }}
+          --test command_processor --test manual_ack --test notification_processor
+          --test notification_transports --test security_context
 
   minimal-features:
     name: No defaults (library, integrations, docs, examples)
