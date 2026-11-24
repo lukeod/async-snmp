@@ -270,8 +270,10 @@ async fn unpolled_drop_and_task_abort_close_event_stream() {
     let mut receiver = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
     receiver.task().unwrap().abort();
     receiver.control().wait_closed().await;
+    assert_eq!(receiver.control().status(), NotificationStatus::Interrupted);
     assert!(receiver.recv().await.is_none());
     assert!(receiver.join().await.is_err());
+    assert_eq!(receiver.control().status(), NotificationStatus::Interrupted);
     assert!(receiver.task().is_none());
 }
 

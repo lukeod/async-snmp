@@ -435,8 +435,10 @@ impl RunningNotificationReceiver {
         let result = task.await;
         self.task.take();
         result.map_err(|source| {
-            *self.receiver.state.status.lock().unwrap() =
-                NotificationStatus::Failed(Arc::from(source.to_string()));
+            if source.is_panic() {
+                *self.receiver.state.status.lock().unwrap() =
+                    NotificationStatus::Failed(Arc::from(source.to_string()));
+            }
             Error::Network {
                 target: self.bound_addresses()[0].local_addr,
                 source: std::io::Error::other(source),
