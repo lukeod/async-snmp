@@ -240,9 +240,9 @@ finishes. Keep the Tokio runtime driven and close admission with
 waits for SET and unclassified work; `drain_requests` also waits for retrievals.
 A drain timeout reports incomplete work without aborting retained cleanup.
 `shutdown(timeout)` combines closing admission and full request drain. Dropping
-the last processor/control also closes admission; runtime teardown cannot
-guarantee asynchronous cleanup. Command responses are encoded results: the caller
-still owns their send and its deadline.
+the last processor/control also closes admission. A drain returns an error if a
+classified SET task panics or runtime teardown interrupts it before completion.
+The caller sends each encoded command response and sets its send deadline.
 
 Response histories contain each accepted message's PDU kind, decode anomalies and
 `ReceivedMessageInfo`, including discovery/correction Reports and error Responses.

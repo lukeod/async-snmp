@@ -797,6 +797,44 @@ async fn retained_mutation_panics_are_reported_by_concurrent_drains() {
 }
 
 #[tokio::test]
+async fn runtime_shutdown_interrupts_retained_mutation_drain() {
+    let state = Arc::new(State::default());
+    state.block_commit.store(true, Ordering::SeqCst);
+    let processor = builder(state.clone()).build().unwrap();
+    let _registration = processor
+        .local_engine()
+        .register_receive_capacity(limits().receive().advertised());
+    let control = processor.control();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .build()
+        .unwrap();
+    runtime.spawn(async move {
+        processor
+            .process(community(
+                Version::V2c,
+                set(Version::V2c, Value::Integer(9)),
+                limits(),
+            ))
+            .await
+    });
+    entered(&state.started).await;
+    assert_eq!(control.outstanding_mutations(), 1);
+    control.request_shutdown();
+    let mut mutations = Box::pin(control.drain_mutations(WAIT));
+    assert!(futures_util::poll!(&mut mutations).is_pending());
+
+    runtime.shutdown_background();
+
+    assert!(matches!(
+        *mutations.await.unwrap_err(),
+        Error::Config(reason) if &*reason == "retained mutation cleanup failed"
+    ));
+    assert_eq!(control.outstanding_requests(), 0);
+    assert_eq!(state.finalized.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
 async fn spawning_on_a_stopped_runtime_leaves_no_retained_request() {
     let state = Arc::new(State::default());
     let processor = builder(state.clone()).build().unwrap();

@@ -277,20 +277,16 @@ fn transient_recv_errno(_code: i32) -> bool {
 struct ActiveRequestGuard {
     inner: Arc<AgentInner>,
     task_id: u64,
+    completed: bool,
 }
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
         let mut registry = self.inner.request_registry.lock().unwrap();
-        if std::thread::panicking()
-            && registry
-                .tasks
-                .get(&self.task_id)
-                .is_some_and(RequestTaskControl::is_mutation)
-        {
+        let task = registry.tasks.remove(&self.task_id);
+        if !self.completed && task.as_ref().is_some_and(RequestTaskControl::is_mutation) {
             registry.mutation_failed = true;
         }
-        registry.tasks.remove(&self.task_id);
         if self
             .inner
             .active_request_tasks
@@ -381,13 +377,15 @@ impl RequestTasks {
             ActiveRequestGuard {
                 inner: Arc::clone(&self.inner),
                 task_id,
+                completed: false,
             }
         };
         // Tokio can drop the future and its guard during spawn on a stopped runtime.
         let abort = self.tasks.spawn(async move {
-            let _activity = activity;
+            let mut activity = activity;
             if start_rx.await.is_ok() {
                 task.await;
+                activity.completed = true;
             }
         });
         if let Some(control) = self
@@ -3899,6 +3897,11 @@ mod tests {
             .unwrap();
         assert_eq!(agent.active_request_count(), 0);
         assert_eq!(agent.inner.concurrency_limit.available_permits(), 1);
+        agent
+            .control()
+            .drain_mutations(Duration::ZERO)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

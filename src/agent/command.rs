@@ -407,12 +407,14 @@ impl CommandControl {
         outstanding_mutations(&self.inner)
     }
     /// Wait for SET/unclassified work after closing admission. Timeout never
-    /// aborts cleanup. Retained mutation panics remain observable as an error.
+    /// aborts cleanup. A classified mutation task that panics or is interrupted
+    /// before completion causes the drain to return an error.
     pub async fn drain_mutations(&self, timeout: Duration) -> Result<()> {
         self.drain(timeout, false).await
     }
     /// Wait for every registered request after closing admission, including
-    /// retrieval handlers that have not cooperatively completed.
+    /// retrieval handlers that have not cooperatively completed. An interrupted
+    /// or panicking classified mutation causes the drain to return an error.
     pub async fn drain_requests(&self, timeout: Duration) -> Result<()> {
         self.drain(timeout, true).await
     }

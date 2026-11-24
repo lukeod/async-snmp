@@ -98,8 +98,9 @@ impl AgentControl {
     pub fn outstanding_mutations(&self) -> usize {
         command::outstanding_mutations(&self.agent.inner)
     }
-    /// Wait for mutation and unclassified tasks after network admission stopped.
-    /// A timeout or retained task panic is reported without aborting cleanup.
+    /// Wait for mutation and unclassified tasks after network admission stops.
+    /// Timeout leaves cleanup running. A classified mutation task that panics
+    /// or is interrupted before completion causes the drain to return an error.
     pub async fn drain_mutations(&self, timeout: Duration) -> Result<()> {
         if !self.is_shutdown() {
             return Err(
