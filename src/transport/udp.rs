@@ -849,7 +849,14 @@ impl UdpEndpointBuilder {
     pub async fn spawn(self) -> Result<RunningUdpEndpoint> {
         Ok(self.prepare().await?.spawn())
     }
-    /// Prepare and start on `runtime`. Supplied socket registrations do not migrate.
+    /// Prepare the endpoint where this future is polled, then spawn its runner
+    /// on `runtime`.
+    ///
+    /// Binding a new socket requires an I/O-enabled Tokio runtime during
+    /// preparation. It registers the socket with that runtime. A supplied
+    /// socket keeps its existing registration. Keep the socket's I/O runtime
+    /// alive and driven while the endpoint is in use. The runner uses timers
+    /// on `runtime`.
     pub async fn spawn_on(self, runtime: &tokio::runtime::Handle) -> Result<RunningUdpEndpoint> {
         Ok(self.prepare().await?.spawn_on(runtime))
     }

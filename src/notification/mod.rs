@@ -1592,7 +1592,15 @@ impl NotificationReceiverBuilder {
         Ok(self.prepare().await?.spawn())
     }
 
-    /// Prepare and spawn without moving a supplied socket's I/O registration.
+    /// Prepare the receiver where this future is polled, then spawn its runner
+    /// on `runtime`.
+    ///
+    /// Preparation registers new sockets with the polling Tokio runtime's I/O
+    /// driver. A configured TCP connect timeout also uses timers on that
+    /// runtime. Supplied, registered I/O keeps its original registration.
+    /// Keep the I/O runtimes alive and driven while their sockets are in use.
+    /// The runner uses timers on `runtime` and registers accepted TCP streams
+    /// there.
     pub async fn spawn_on(
         self,
         runtime: &tokio::runtime::Handle,

@@ -359,7 +359,15 @@ impl TcpTransportBuilder {
     pub async fn spawn(self) -> Result<RunningTcpSession> {
         Ok(self.prepare().await?.spawn())
     }
-    /// Prepare and spawn without migrating existing I/O registration.
+    /// Prepare the session where this future is polled, then spawn its runner
+    /// on `runtime`.
+    ///
+    /// Connecting registers the resulting stream with the polling Tokio
+    /// runtime's I/O driver, including when a pre-connect socket is supplied.
+    /// A configured connect timeout also uses timers on that runtime. A
+    /// supplied connected stream keeps its existing registration. Keep the
+    /// stream's I/O runtime alive and driven while the session is in use.
+    /// The runner uses framing and write timers on `runtime`.
     pub async fn spawn_on(self, runtime: &tokio::runtime::Handle) -> Result<RunningTcpSession> {
         Ok(self.prepare().await?.spawn_on(runtime))
     }

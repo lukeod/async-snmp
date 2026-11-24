@@ -701,7 +701,14 @@ impl AgentBuilder {
     pub async fn spawn(self) -> Result<RunningAgent> {
         Ok(self.prepare().await?.spawn())
     }
-    /// Start without moving existing Tokio I/O registrations between runtimes.
+    /// Prepare the agent where this future is polled, then spawn its runner
+    /// on `runtime`.
+    ///
+    /// Preparation uses the polling Tokio runtime's timers for the construction
+    /// deadline and its I/O driver to register new sockets. Supplied, registered
+    /// I/O keeps its original registration. Keep the I/O runtimes alive and
+    /// driven while their sockets are in use. The runner uses timers on
+    /// `runtime` and registers accepted TCP streams there.
     pub async fn spawn_on(self, runtime: &tokio::runtime::Handle) -> Result<RunningAgent> {
         Ok(self.prepare().await?.spawn_on(runtime))
     }
