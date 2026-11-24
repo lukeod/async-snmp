@@ -29,9 +29,9 @@ pub struct FixedCardinalityChunk {
     /// Bindings and shape diagnostics for this leaf.
     ///
     /// Anomaly request and response indices are global to the original chunked
-    /// operation rather than local to this response. Metadata also includes
-    /// recovered ancestor `tooBig` responses observed since the preceding
-    /// successful leaf, so each accepted response is represented once.
+    /// operation. Metadata includes accepted inputs from split requests since
+    /// the preceding successful leaf, such as `tooBig` responses and discovery
+    /// Reports received before an outbound size check failed.
     pub response: FixedCardinalityResponse,
 }
 
@@ -283,60 +283,33 @@ impl<T: RequestTransport + 'static> Stream for FixedCardinalityChunkStream<T> {
                         response,
                     })));
                 }
-                Err(source)
-                    if request_range.len() > 1
-                        && matches!(
-                            &*source,
-                            Error::Snmp {
-                                status: ErrorStatus::TooBig,
-                                ..
-                            }
-                        ) =>
-                {
-                    if let Some(metadata) = source.response_metadata().cloned() {
-                        this.deferred_metadata.append(metadata);
-                    }
-                    let middle = request_range.start + request_range.len() / 2;
-                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.split_at = middle, snmp.limit_source = "remote_too_big" }, "agent tooBig response, bisecting batch");
-                    this.ranges.push_front(middle..request_range.end);
-                    this.ranges.push_front(request_range.start..middle);
-                }
-                Err(source)
-                    if request_range.len() > 1
-                        && matches!(&*source, Error::OutboundMessageTooLarge { .. }) =>
-                {
-                    let Error::OutboundMessageTooLarge { size, limit } = &*source else {
-                        unreachable!();
-                    };
-                    let middle = request_range.start + request_range.len() / 2;
-                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.split_at = middle, snmp.encoded_size = size, snmp.outbound_limit = limit, snmp.limit_source = "local_outbound" }, "local outbound limit exceeded, bisecting batch");
-                    this.ranges.push_front(middle..request_range.end);
-                    this.ranges.push_front(request_range.start..middle);
-                }
-                Err(source)
-                    if matches!(
-                        &*source,
+                Err(source) => {
+                    let split_at = (request_range.len() > 1)
+                        .then(|| request_range.start + request_range.len() / 2);
+                    match source.exchange_source() {
                         Error::Snmp {
                             status: ErrorStatus::TooBig,
                             ..
+                        } => {
+                            tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.split_at = split_at, snmp.limit_source = "remote_too_big" }, "agent tooBig response");
                         }
-                    ) =>
-                {
-                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.limit_source = "remote_too_big" }, "agent tooBig response for indivisible batch");
-                    let error = this.terminal_error(request_range, source);
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Err(source) if matches!(&*source, Error::OutboundMessageTooLarge { .. }) => {
-                    let Error::OutboundMessageTooLarge { size, limit } = &*source else {
-                        unreachable!();
+                        Error::OutboundMessageTooLarge { size, limit } => {
+                            tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.split_at = split_at, snmp.encoded_size = size, snmp.outbound_limit = limit, snmp.limit_source = "local_outbound" }, "local outbound limit exceeded");
+                        }
+                        _ => {
+                            let error = this.terminal_error(request_range, source);
+                            return Poll::Ready(Some(Err(error)));
+                        }
+                    }
+                    let Some(middle) = split_at else {
+                        let error = this.terminal_error(request_range, source);
+                        return Poll::Ready(Some(Err(error)));
                     };
-                    tracing::debug!(target: "async_snmp::client", { peer = %this.client.peer_addr(), snmp.batch_size = request_range.len(), snmp.encoded_size = size, snmp.outbound_limit = limit, snmp.limit_source = "local_outbound" }, "local outbound limit exceeded for indivisible batch");
-                    let error = this.terminal_error(request_range, source);
-                    return Poll::Ready(Some(Err(error)));
-                }
-                Err(source) => {
-                    let error = this.terminal_error(request_range, source);
-                    return Poll::Ready(Some(Err(error)));
+                    if let Some(metadata) = source.response_metadata().cloned() {
+                        this.deferred_metadata.append(metadata);
+                    }
+                    this.ranges.push_front(middle..request_range.end);
+                    this.ranges.push_front(request_range.start..middle);
                 }
             }
         }

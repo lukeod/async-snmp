@@ -148,6 +148,123 @@ async fn udp_batch_error_and_inform_histories_keep_each_input_length() {
     endpoint.shutdown().await.unwrap();
 }
 
+#[cfg(feature = "agent")]
+mod v3_batch {
+    use super::*;
+    use async_snmp::{
+        Agent, AuthoritativeEngine, Error, FixedCardinalityOperation, ListenerSource, RunningAgent,
+        UdpEndpoint,
+    };
+
+    const RECEIVE_CAPACITY: usize = 484;
+
+    async fn start_agent() -> RunningAgent {
+        let engine = AuthoritativeEngine::install(b"batch-history".as_slice(), |_| {
+            Ok::<_, std::convert::Infallible>(())
+        })
+        .unwrap();
+        Agent::builder()
+            .listener(ListenerSource::Udp(
+                UdpEndpoint::builder()
+                    .bind("127.0.0.1:0")
+                    .receive_capacity(RECEIVE_CAPACITY),
+            ))
+            .authoritative_engine(engine)
+            .usm_user("monitor", Ok)
+            .unwrap()
+            .allow_all_access()
+            .spawn()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn cold_v3_batches_split_and_keep_discovery_once() {
+        let running = start_agent().await;
+        for operation in [
+            FixedCardinalityOperation::Get,
+            FixedCardinalityOperation::GetNext,
+        ] {
+            let client = Client::builder(
+                running.agent().bound_addresses()[0].local_addr,
+                Auth::usm("monitor"),
+            )
+            .max_oids_per_request(80)
+            .retry(Retry::none())
+            .connect()
+            .await
+            .unwrap();
+            let engine_boots_oid = oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 2, 0);
+            let response = if operation == FixedCardinalityOperation::Get {
+                client.get_many(&vec![engine_boots_oid.clone(); 80]).await
+            } else {
+                let engine_boots_prefix = oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 2);
+                client.get_next_many(&vec![engine_boots_prefix; 80]).await
+            }
+            .unwrap();
+            assert_eq!(response.operation, operation);
+            assert_eq!(response.varbinds.len(), 80);
+            assert!(
+                response
+                    .varbinds
+                    .iter()
+                    .all(|vb| vb.oid == engine_boots_oid)
+            );
+            let (discovery, responses) = response.metadata.received_messages.split_first().unwrap();
+            assert_eq!(discovery.pdu_type, PduType::Report);
+            assert!(responses.len() > 1);
+            assert!(
+                responses
+                    .iter()
+                    .all(|record| record.pdu_type == PduType::Response)
+            );
+        }
+        running.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cold_v3_batch_keeps_discovery_on_a_failed_singleton() {
+        let running = start_agent().await;
+        let client = Client::builder(
+            running.agent().bound_addresses()[0].local_addr,
+            Auth::usm("monitor"),
+        )
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+        let mut arcs = [u32::MAX; async_snmp::oid::MAX_OID_LEN];
+        arcs[..2].copy_from_slice(&[1, 3]);
+        let oids = [
+            async_snmp::Oid::from_slice(&arcs),
+            oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 2, 0),
+        ];
+        let mut chunks = client.get_many_chunks(&oids).unwrap();
+
+        let error = chunks.next().await.unwrap().unwrap_err();
+        assert_eq!(error.failed_request_range, 0..1);
+        assert!(matches!(
+            error.source.exchange_source(),
+            Error::OutboundMessageTooLarge {
+                limit: RECEIVE_CAPACITY,
+                ..
+            }
+        ));
+        let [discovery] = error
+            .source
+            .response_metadata()
+            .unwrap()
+            .received_messages
+            .as_slice()
+        else {
+            panic!("expected only the discovery Report");
+        };
+        assert_eq!(discovery.pdu_type, PduType::Report);
+        assert!(chunks.next().await.is_none());
+        running.shutdown().await.unwrap();
+    }
+}
+
 async fn read_frame(stream: &mut TcpStream) -> Bytes {
     let mut bytes = vec![0; 2];
     stream.read_exact(&mut bytes).await.unwrap();
