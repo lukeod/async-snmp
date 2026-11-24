@@ -257,6 +257,31 @@ operations retain individual records. Shared discovery retains the same
 `reception_id()` in every operation using it; histories describe provenance rather
 than unique endpoint traffic. Rejected candidates do not create history records.
 
+### Transport observation
+
+`TransportObserver::channel` creates a bounded metadata channel. The runnable
+example queries `sysDescr.0` over SNMPv2c and prints send and receive events,
+processing dispositions, and counters. Run it against an agent that accepts the
+`public` community. [Transport observation example](examples/transport_observation.rs)
+
+```bash
+cargo run --locked --example transport_observation -- 127.0.0.1:161
+```
+
+Configure the same observer on selected UDP/TCP builders or a `TcpListenerSource`
+to aggregate their counters. Agent and notification listeners accept those sources.
+`Received` events retain the same reception identity as response histories and
+notification metadata. Shared discovery can appear in several operation histories,
+while observation records the physical input once. `Sent` records a completed local
+socket write. Events contain metadata only.
+
+Complete-message counters include malformed UDP input and complete TCP frames before
+security processing. Socket-byte counters also include partial TCP I/O and UDP input
+rejected after ancillary-metadata validation. They exclude network headers, TCP
+retransmissions and kernel drops. Processing dispositions record individual stages,
+including candidate validation before an operation's final result. Full or dropped
+event consumers increase `dropped_events` while protocol work and counters continue.
+
 ## Command-line tools
 
 The `cli` feature provides the `asnmp-get`, `asnmp-walk`, and `asnmp-set`
@@ -309,34 +334,3 @@ You can use async-snmp under either the
 ## Contributing
 
 See the [contribution guide](CONTRIBUTING.md).
-
-Transport observation uses a bounded metadata channel:
-
-```rust,no_run
-# async fn example() -> async_snmp::Result<()> {
-use async_snmp::{TransportObserver, UdpEndpoint, DEFAULT_OBSERVATION_CAPACITY};
-let (observer, mut events) = TransportObserver::channel(DEFAULT_OBSERVATION_CAPACITY)?;
-let running = UdpEndpoint::builder().observer(observer.clone()).spawn().await?;
-// Consume events in application-owned work, or poll them with try_recv().
-while let Ok(event) = events.try_recv() {
-    println!("{event:?}");
-}
-println!("{:?}", observer.stats());
-running.shutdown().await?;
-# Ok(()) }
-```
-
-Configure the same observer on selected UDP/TCP builders or a `TcpListenerSource`
-to aggregate their counters. Agent and notification listeners accept those sources.
-`Received` events retain the same reception identity as response histories and
-notification metadata. Shared discovery can appear in several operation histories,
-while observation records the physical input once. `Sent` means a completed local
-socket write; it does not confirm peer receipt. Events contain no packets or credentials.
-
-Complete-message counters include malformed UDP input and complete TCP frames before
-security processing. Socket-byte counters also include partial TCP I/O and UDP input
-rejected after ancillary-metadata validation. They exclude network headers, TCP
-retransmissions and kernel drops. Processing dispositions are separate stage events,
-not complete terminal outcomes; candidate validation can precede a later operation
-failure. Full or dropped event consumers do not slow protocol work: counters continue
-and `dropped_events` increases. See [the observation example](examples/transport_observation.rs).
