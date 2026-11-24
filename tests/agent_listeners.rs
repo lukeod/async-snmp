@@ -4,8 +4,9 @@ use async_snmp::handler::{
     BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext,
 };
 use async_snmp::{
-    Agent, AgentStatus, Auth, AuthoritativeEngine, Client, ListenerSource, Retry,
-    TcpListenerSource, TcpOptions, TransportKind, UdpEndpoint, UdpStatus, Value, oid,
+    Agent, AgentStatus, Auth, AuthoritativeEngine, Client, Error, ListenerSource,
+    NotificationSinkId, NotificationTarget, Retry, TcpListenerSource, TcpOptions, TcpTransport,
+    TransportKind, UdpEndpoint, UdpStatus, Value, oid,
 };
 use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::io::AsyncWriteExt;
@@ -39,6 +40,144 @@ fn engine() -> AuthoritativeEngine {
         |_| Ok::<_, Infallible>(()),
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn invalid_listener_and_sink_configs_never_connect_to_an_earlier_session_peer() {
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = peer.local_addr().unwrap();
+    let agent = || Agent::builder().session(TcpTransport::builder().target(peer_addr));
+    let sink = || NotificationSinkId::new("sink").unwrap();
+    let auth = || Auth::v2c("public");
+    let udp_bind = "127.0.0.1:0";
+    let udp_target = "127.0.0.1:162";
+    let options = TcpTransport::builder()
+        .target(peer_addr)
+        .max_message_size(8 * 1024 * 1024)
+        .send_capacity(26 * 1024 * 1024)
+        .max_buffered_bytes(34 * 1024 * 1024);
+
+    for (builder, expected) in [
+        (
+            agent().notification_sink(
+                sink(),
+                NotificationTarget::shared_udp(1, udp_target),
+                auth(),
+            ),
+            "existing UDP listener index",
+        ),
+        (
+            agent().notification_sink(
+                sink(),
+                NotificationTarget::shared_udp(0, udp_target),
+                auth(),
+            ),
+            "existing UDP listener index",
+        ),
+        (
+            agent().listener(ListenerSource::tcp("invalid address")),
+            "invalid TCP listener address",
+        ),
+        (
+            agent().notification_sink(
+                sink(),
+                NotificationTarget::udp(
+                    UdpEndpoint::builder().max_inflight_requests(0),
+                    udp_target,
+                ),
+                auth(),
+            ),
+            "UDP max_inflight_requests",
+        ),
+        (
+            agent().notification_sink(
+                sink(),
+                NotificationTarget::tcp(TcpTransport::builder()),
+                auth(),
+            ),
+            "TCP target or connected stream is required",
+        ),
+        (
+            agent().max_connections(1).notification_sink(
+                sink(),
+                NotificationTarget::tcp(TcpTransport::builder().target(peer_addr)),
+                auth(),
+            ),
+            "invalid listener, connection or aggregate buffer limit",
+        ),
+        (
+            agent().buffered_bytes(40 * 1024 * 1024).session(options),
+            "buffer budget must accommodate",
+        ),
+        (
+            agent()
+                .listener(ListenerSource::udp(udp_bind))
+                .notification_sink(
+                    sink(),
+                    NotificationTarget::shared_udp(1, "[::1]:162"),
+                    auth(),
+                ),
+            "incompatible with IPv4 socket",
+        ),
+    ] {
+        let error = builder
+            .prepare()
+            .await
+            .err()
+            .expect("invalid configuration");
+        assert!(
+            matches!(*error, Error::Config(ref message) if message.contains(expected)),
+            "{error}"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), peer.accept())
+                .await
+                .is_err(),
+            "configuration error '{expected}' followed a connection to the peer",
+        );
+    }
+
+    let running = agent()
+        .listener(ListenerSource::udp(udp_bind))
+        .notification_sink(
+            sink(),
+            NotificationTarget::shared_udp(1, udp_target),
+            auth(),
+        )
+        .spawn()
+        .await
+        .unwrap();
+    let (connected, _) = tokio::time::timeout(Duration::from_secs(1), peer.accept())
+        .await
+        .expect("valid configuration must connect to its peer")
+        .unwrap();
+    assert_eq!(
+        connected.peer_addr().unwrap(),
+        running.bound_addresses()[0].local_addr
+    );
+    let sink = running.notification_sinks().next().unwrap();
+    assert_eq!(sink.endpoint_id(), running.bound_addresses()[1].endpoint_id);
+    running.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn default_udp_listener_index_is_validated_before_bind() {
+    let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let error = Agent::builder()
+        .bind(occupied.local_addr().unwrap().to_string())
+        .notification_sink(
+            NotificationSinkId::new("sink").unwrap(),
+            NotificationTarget::shared_udp(1, "127.0.0.1:162"),
+            Auth::v2c("public"),
+        )
+        .prepare()
+        .await
+        .err()
+        .expect("default UDP listener has index zero");
+    assert!(
+        matches!(*error, Error::Config(ref message) if message.contains("existing UDP listener index")),
+        "{error}"
+    );
 }
 
 #[tokio::test]

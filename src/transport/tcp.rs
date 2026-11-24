@@ -128,6 +128,13 @@ impl TcpOptions {
         }
         Ok(limits)
     }
+
+    pub(super) fn reserve_buffer_budget(&self, budget: &BufferBudget) -> Result<()> {
+        budget.reserve(
+            self.max_buffered_bytes - self.send_capacity,
+            self.send_capacity,
+        )
+    }
 }
 
 /// Prepare a connected or accepted TCP session. A supplied stream conflicts
@@ -249,35 +256,43 @@ impl TcpTransportBuilder {
         self
     }
 
-    /// Validate and establish initial resources, without creating background tasks.
-    /// Packaging a registered supplied stream requires no entered Tokio runtime.
-    pub async fn prepare(self) -> Result<PreparedTcpSession> {
-        let started = Instant::now();
+    pub(crate) fn validate_config(
+        &self,
+        shared_budget: Option<&BufferBudget>,
+    ) -> Result<(ReceiveLimits, Option<Instant>)> {
         let connect_deadline = self
             .connect_timeout
             .map(|duration| tcp_deadline(duration, "TCP connect timeout"))
             .transpose()?;
         let limits = self.options.validate()?;
-        let budget = Arc::new(BufferBudget::new(self.options.max_buffered_bytes));
-        let inbound = self.options.max_buffered_bytes - self.options.send_capacity;
-        budget.reserve(inbound, self.options.send_capacity)?;
-        if let Some(ingress) = &self.ingress {
-            ingress
-                .budget
-                .reserve(inbound, self.options.send_capacity)?;
+        if let Some(budget) = shared_budget {
+            self.options.reserve_buffer_budget(budget)?;
         }
-        let stream = if let Some(stream) = self.stream {
+        if self.stream.is_some() {
             if self.target.is_some() || self.socket.is_some() || self.connect_timeout.is_some() {
                 return Err(Error::Config(
                     "supplied TCP stream conflicts with target, socket or connect timeout".into(),
                 )
                 .boxed());
             }
+        } else if self.target.is_none() {
+            return Err(Error::Config("TCP target or connected stream is required".into()).boxed());
+        }
+        Ok((limits, connect_deadline))
+    }
+
+    /// Validate and establish initial resources, without creating background tasks.
+    /// Packaging a registered supplied stream requires no entered Tokio runtime.
+    pub async fn prepare(self) -> Result<PreparedTcpSession> {
+        let started = Instant::now();
+        let (limits, connect_deadline) =
+            self.validate_config(self.ingress.as_ref().map(|ingress| ingress.budget.as_ref()))?;
+        let budget = Arc::new(BufferBudget::new(self.options.max_buffered_bytes));
+        self.options.reserve_buffer_budget(&budget)?;
+        let stream = if let Some(stream) = self.stream {
             stream
         } else {
-            let target = self.target.ok_or_else(|| {
-                Error::Config("TCP target or connected stream is required".into()).boxed()
-            })?;
+            let target = self.target.expect("validated outbound TCP target");
             let connect = async {
                 match self.socket {
                     Some(socket) => socket.connect(target).await,

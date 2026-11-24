@@ -1,4 +1,5 @@
 //! Concrete listener sources, with preparation independent of execution.
+use super::framing::BufferBudget;
 use super::{TcpOptions, TransportKind, UdpEndpoint, UdpEndpointBuilder, UdpRunner};
 use crate::{EndpointId, Error, RequestTransport, Result};
 use std::net::SocketAddr;
@@ -45,6 +46,23 @@ impl ListenerSource {
     pub fn tcp_listener(listener: TcpListener) -> Self {
         Self::Tcp(TcpListenerSource::from_listener(listener))
     }
+
+    /// Validate authored settings and return the UDP bind address when one was configured.
+    #[cfg(feature = "agent")]
+    pub(crate) fn validate_config(&self, budget: &BufferBudget) -> Result<Option<SocketAddr>> {
+        match self {
+            Self::Udp(builder) => Ok(builder.validate_config()?.1),
+            Self::Tcp(source) => {
+                source.validate_config(budget)?;
+                Ok(None)
+            }
+            Self::Session(builder) => {
+                builder.validate_config(Some(budget))?;
+                Ok(None)
+            }
+        }
+    }
+
     pub(crate) async fn prepare(
         self,
         ingress: super::ingress::ApplicationIngress,
@@ -79,23 +97,11 @@ impl ListenerSource {
                 })
             }
             Self::Tcp(source) => {
-                source.options.validate()?;
-                ingress.budget.reserve(
-                    source.options.max_buffered_bytes - source.options.send_capacity,
-                    source.options.send_capacity,
-                )?;
-                let listener = match (source.address, source.listener) {
-                    (Some(_), Some(_)) => {
-                        return Err(Error::Config(
-                            "TCP bind address conflicts with supplied listener".into(),
-                        )
-                        .boxed());
-                    }
-                    (None, Some(listener)) => listener,
-                    (Some(address), None) => {
-                        let address: SocketAddr = address.parse().map_err(|_| {
-                            Error::Config("invalid TCP listener address".into()).boxed()
-                        })?;
+                let address = source.validate_config(&ingress.budget)?;
+                let listener = match source.listener {
+                    Some(listener) => listener,
+                    None => {
+                        let address = address.expect("validated TCP listener address");
                         TcpListener::bind(address).await.map_err(|source| {
                             Error::Network {
                                 target: address,
@@ -103,9 +109,6 @@ impl ListenerSource {
                             }
                             .boxed()
                         })?
-                    }
-                    _ => {
-                        return Err(Error::Config("TCP listener source is required".into()).boxed());
                     }
                 };
                 let local_addr = listener.local_addr().map_err(|source| {
@@ -182,6 +185,23 @@ impl TcpListenerSource {
     pub fn session_options(mut self, options: TcpOptions) -> Self {
         self.options = options;
         self
+    }
+
+    fn validate_config(&self, budget: &BufferBudget) -> Result<Option<SocketAddr>> {
+        self.options.validate()?;
+        self.options.reserve_buffer_budget(budget)?;
+        match (self.address.as_deref(), self.listener.as_ref()) {
+            (Some(address), None) => address
+                .parse()
+                .map(Some)
+                .map_err(|_| Error::Config("invalid TCP listener address".into()).boxed()),
+            (None, Some(_)) => Ok(None),
+            (Some(_), Some(_)) => Err(Error::Config(
+                "TCP bind address conflicts with supplied listener".into(),
+            )
+            .boxed()),
+            (None, None) => Err(Error::Config("TCP listener source is required".into()).boxed()),
+        }
     }
 
     #[cfg(test)]

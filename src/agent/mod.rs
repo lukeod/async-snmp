@@ -1381,6 +1381,8 @@ impl AgentBuilder {
     ///
     /// Pure deterministic validation and normalization precedes socket I/O,
     /// DNS, entropy, and authoritative engine clock or persistence access.
+    /// Socket properties such as the address family of a supplied socket are
+    /// checked during preparation.
     /// Checking whether configured durations can form deadlines observes the
     /// process monotonic clock during that validation phase.
     pub async fn prepare(self) -> Result<PreparedAgent> {
@@ -1482,14 +1484,8 @@ impl AgentBuilder {
         for (index, sink) in config.trap_sinks.into_iter().enumerate() {
             let peer = match sink.transport {
                 NotificationTarget::SharedUdp { listener, .. } => {
-                    let Some(PreparedListener::Udp { endpoint, .. }) = listeners
-                        .get(listener)
-                        .filter(|_| listener < shared_listener_count)
-                    else {
-                        return Err(Error::Config(
-                            "notification sink must select an existing UDP listener index".into(),
-                        )
-                        .boxed());
+                    let PreparedListener::Udp { endpoint, .. } = &listeners[listener] else {
+                        unreachable!("validated shared UDP listener index");
                     };
                     shared_sink_listeners.insert(listener);
                     let peer = resolve_udp_sink_handle(
@@ -1736,13 +1732,18 @@ impl AgentBuilder {
             )
             .boxed());
         }
-        if self.listeners.len() > 32
-            || self
-                .listeners
+        let configured_sessions = self
+            .listeners
+            .iter()
+            .filter(|source| matches!(source, crate::ListenerSource::Session(_)))
+            .count()
+            + self
+                .trap_sinks
                 .iter()
-                .filter(|source| matches!(source, crate::ListenerSource::Session(_)))
-                .count()
-                > self.max_connections
+                .filter(|(_, target, _)| matches!(target, NotificationTarget::Tcp(_)))
+                .count();
+        if self.listeners.len() > 32
+            || configured_sessions > self.max_connections
             || self.max_connections == 0
             || self.max_connections > 65536
             || self.buffered_bytes == 0
@@ -1869,25 +1870,59 @@ impl AgentBuilder {
         let bind_addr = self.bind_addr.parse().map_err(|_| {
             Error::Config(format!("invalid bind address: {}", self.bind_addr).into()).boxed()
         })?;
-        let trap_sinks = self
-            .trap_sinks
-            .into_iter()
-            .map(|(id, transport, auth)| {
-                let target = match &transport {
-                    NotificationTarget::SharedUdp { destination, .. }
-                    | NotificationTarget::Udp { destination, .. } => {
-                        Some(parse_trap_sink_target(destination.clone())?)
-                    }
-                    _ => None,
-                };
-                Ok(ValidatedTrapSink {
-                    id,
-                    target,
-                    transport,
-                    auth,
-                })
-            })
+        let configured_udp_binds = self
+            .listeners
+            .iter()
+            .map(|source| source.validate_config(&buffer_budget))
             .collect::<Result<Vec<_>>>()?;
+        let mut trap_sinks = Vec::with_capacity(self.trap_sinks.len());
+        for (id, transport, auth) in self.trap_sinks {
+            let (destination, local_addr) = match &transport {
+                NotificationTarget::SharedUdp {
+                    listener,
+                    destination,
+                } => {
+                    let local_addr = if self.listeners.is_empty() && *listener == 0 {
+                        Some(bind_addr)
+                    } else if matches!(
+                        self.listeners.get(*listener),
+                        Some(crate::ListenerSource::Udp(_))
+                    ) {
+                        configured_udp_binds[*listener]
+                    } else {
+                        return Err(Error::Config(
+                            "notification sink must select an existing UDP listener index".into(),
+                        )
+                        .boxed());
+                    };
+                    (Some(destination), local_addr)
+                }
+                NotificationTarget::Udp {
+                    endpoint,
+                    destination,
+                } => (Some(destination), endpoint.validate_config()?.1),
+                NotificationTarget::Tcp(builder) => {
+                    builder.validate_config(None)?;
+                    (None, None)
+                }
+                NotificationTarget::Peer(_) => (None, None),
+            };
+            let target = destination
+                .cloned()
+                .map(parse_trap_sink_target)
+                .transpose()?;
+            if let (Some(local_addr), Some(TrapSinkTarget::Address(address))) =
+                (local_addr, &target)
+            {
+                crate::transport::normalize_udp_target(local_addr, *address)?;
+            }
+            trap_sinks.push(ValidatedTrapSink {
+                id,
+                target,
+                transport,
+                auth,
+            });
+        }
 
         let concurrency_limit = Arc::new(Semaphore::new(self.max_concurrent_requests));
 

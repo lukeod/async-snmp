@@ -380,6 +380,9 @@ async fn failed_sink_preparation_releases_prior_tcp_and_udp_resources() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
+    // Preparation discovers the supplied socket's state after opening the TCP sink.
+    let connected = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    connected.connect(addr).await.unwrap();
     let failed = Agent::builder()
         .listener(ListenerSource::udp_socket(socket))
         .notification_sink(
@@ -389,14 +392,24 @@ async fn failed_sink_preparation_releases_prior_tcp_and_udp_resources() {
         )
         .notification_sink(
             id("invalid"),
-            NotificationTarget::shared_udp(99, "127.0.0.1:9"),
+            NotificationTarget::udp(
+                UdpEndpoint::builder().from_socket(connected),
+                addr.to_string(),
+            ),
             Auth::v2c("public"),
         )
         .prepare()
         .await;
-    assert!(failed.is_err());
+    assert!(matches!(
+        failed.err().as_deref(),
+        Some(async_snmp::Error::Config(message))
+            if message.contains("requires an unconnected socket")
+    ));
     UdpSocket::bind(addr).await.unwrap();
-    let (mut stream, _) = listener.accept().await.unwrap();
+    let (mut stream, _) = tokio::time::timeout(WAIT, listener.accept())
+        .await
+        .unwrap()
+        .unwrap();
     use tokio::io::AsyncReadExt;
     assert_eq!(
         tokio::time::timeout(WAIT, stream.read(&mut [0; 1]))

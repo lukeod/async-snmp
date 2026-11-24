@@ -727,10 +727,7 @@ impl UdpEndpointBuilder {
         self
     }
 
-    /// Prepare resources without starting any background task. Supplied sockets
-    /// can be packaged without an entered runtime. Binding a new socket requires
-    /// an entered Tokio runtime and preserves that runtime's I/O registration.
-    pub async fn prepare(self) -> Result<PreparedUdpEndpoint> {
+    pub(crate) fn validate_config(&self) -> Result<(ReceiveLimits, Option<SocketAddr>)> {
         if self.config.max_inflight_requests == 0
             || self.config.max_inflight_requests > tokio::sync::Semaphore::MAX_PERMITS
         {
@@ -764,6 +761,23 @@ impl UdpEndpointBuilder {
             )
             .boxed());
         }
+        let bind_addr = if self.socket.is_some() {
+            None
+        } else {
+            let bind = self.bind_addr.as_deref().unwrap_or("0.0.0.0:0");
+            Some(
+                bind.parse()
+                    .map_err(|_| Error::Config(format!("invalid bind address: {bind}").into()))?,
+            )
+        };
+        Ok((receive_limits, bind_addr))
+    }
+
+    /// Prepare resources without starting any background task. Supplied sockets
+    /// can be packaged without an entered runtime. Binding a new socket requires
+    /// an entered Tokio runtime and preserves that runtime's I/O registration.
+    pub async fn prepare(self) -> Result<PreparedUdpEndpoint> {
+        let (receive_limits, bind_addr) = self.validate_config()?;
         let socket = match self.socket {
             Some(socket) => {
                 if socket.peer_addr().is_ok() {
@@ -775,10 +789,7 @@ impl UdpEndpointBuilder {
                 socket
             }
             None => {
-                let bind = self.bind_addr.as_deref().unwrap_or("0.0.0.0:0");
-                let bind_addr: SocketAddr = bind
-                    .parse()
-                    .map_err(|_| Error::Config(format!("invalid bind address: {bind}").into()))?;
+                let bind_addr = bind_addr.expect("validated UDP bind address");
                 bind_udp_socket(
                     bind_addr,
                     self.recv_buffer_size,
