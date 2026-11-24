@@ -286,7 +286,13 @@ impl NotificationReceiver {
     pub fn bound_addresses(&self) -> &[crate::transport::BoundListener] {
         &self.network.bound
     }
-    /// Select a shared endpoint prepared with client exchanges enabled.
+    /// Return the UDP endpoint with the matching ID, regardless of its client
+    /// exchange capability.
+    ///
+    /// To initiate requests on a standalone receiver's endpoint, configure
+    /// [`client_exchanges(true)`](NotificationReceiverBuilder::client_exchanges)
+    /// during preparation. An attached receiver uses the selected agent
+    /// endpoint's exchange capability.
     pub fn udp_endpoint(&self, id: crate::EndpointId) -> Option<crate::UdpEndpoint> {
         self.network
             .udp

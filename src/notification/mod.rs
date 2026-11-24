@@ -1830,7 +1830,9 @@ impl Notification {
 
 /// SNMP Notification Receiver.
 ///
-/// Listens for incoming SNMP notifications (traps and informs) on a UDP socket.
+/// Receives SNMP traps and informs on UDP endpoints, TCP listeners, and
+/// configured TCP sessions.
+///
 /// For accepted `InformRequest` notifications, automatic mode finalizes and
 /// attempts the ordinary Response-PDU before delivery. Application-controlled
 /// mode returns a pending acknowledgement for explicit completion. In either
