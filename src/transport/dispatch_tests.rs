@@ -614,6 +614,9 @@ async fn encrypted_collisions_select_commands_informs_and_remote_traps_without_c
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
 async fn failed_client_security_never_reenters_application_or_publishes_reports() {
+    const MSG_ID: i32 = 78;
+    const REMOTE_ENGINE: &[u8] = b"failure-remote-engine";
+
     let mut service = secured_agent(b"failure-local-engine")
         .spawn()
         .await
@@ -623,24 +626,31 @@ async fn failed_client_security_never_reenters_application_or_publishes_reports(
     for username in ["priv", "client-only"] {
         let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let handle = endpoint.handle(peer.local_addr().unwrap()).unwrap();
-        let config = security(username);
-        let registration =
-            RequestRegistration::v3(78, tokio::time::Instant::now() + Duration::from_secs(2))
-                .with_classification_usm(
-                    config.clone(),
-                    Some(bytes::Bytes::from_static(b"failure-remote-engine")),
-                );
+        // Prepare the fixtures before starting the exchange timeout.
+        let mut config = security(username);
+        config.validate_and_precompute().unwrap();
         let data = secured(
-            crate::Pdu::get_request(78, &[get_oid()]),
-            78,
-            b"failure-remote-engine",
+            crate::Pdu::get_request(MSG_ID, &[get_oid()]),
+            MSG_ID,
+            REMOTE_ENGINE,
             &config,
         );
+        let response = secured(
+            crate::Pdu::response(MSG_ID, 0, 0, vec![]),
+            MSG_ID,
+            REMOTE_ENGINE,
+            &config,
+        );
+        let mut corrupted = response.to_vec();
+        *corrupted.last_mut().unwrap() ^= 1;
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let registration =
+            RequestRegistration::v3(MSG_ID, tokio::time::Instant::now() + Duration::from_secs(2))
+                .with_classification_usm(config, Some(bytes::Bytes::from_static(REMOTE_ENGINE)));
         let pending = tokio::spawn(async move {
             handle
-                .request_with(data.clone(), registration, move |packet| {
+                .request_with(data, registration, move |packet| {
                     let (_, _) = packet.into_parts();
                     if count.fetch_add(1, Ordering::Relaxed) == 0 {
                         Ok(Candidate::Reject)
@@ -651,14 +661,6 @@ async fn failed_client_security_never_reenters_application_or_publishes_reports(
                 .await
         });
         let (_, source) = receive(&peer).await;
-        let response = secured(
-            crate::Pdu::response(78, 0, 0, vec![]),
-            78,
-            b"failure-remote-engine",
-            &config,
-        );
-        let mut corrupted = response.to_vec();
-        *corrupted.last_mut().unwrap() ^= 1;
         peer.send_to(&corrupted, source).await.unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
             while calls.load(Ordering::Relaxed) == 0 {
