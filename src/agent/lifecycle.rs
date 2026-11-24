@@ -80,7 +80,8 @@ impl AgentControl {
     pub fn status(&self) -> AgentStatus {
         self.agent.network.status.lock().unwrap().clone()
     }
-    /// UDP inputs dropped during dispatch or application admission because work or memory was full.
+    /// UDP overload drops charged to command application admission or shared
+    /// dispatch while the command role is active.
     pub fn overload_drops(&self) -> u64 {
         self.agent.network.drops.load(Ordering::Relaxed)
     }

@@ -273,8 +273,9 @@ impl NotificationControl {
     pub fn subscribe_health(&self) -> watch::Receiver<NotificationHealth> {
         self.inner.health.subscribe()
     }
-    /// Inputs dropped because delivery or protocol work was full. Disabled-role
-    /// drops are not overload and do not increment this counter.
+    /// Overload drops charged to notification processing, TCP admission or delivery.
+    /// Shared UDP dispatch charges its drops to active commands first. With
+    /// commands absent or disabled, an active notification role counts those drops.
     pub fn overload_drops(&self) -> u64 {
         self.inner.delivery.overloaded.load(Ordering::Relaxed)
     }
@@ -610,13 +611,14 @@ impl NotificationRole {
         self.inner.delivery.is_open()
     }
 
-    pub(crate) fn note_overload(&self) {
-        if self.is_enabled() {
-            self.inner
-                .delivery
-                .overloaded
-                .fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn note_overload(&self) -> bool {
+        let delivery = &self.inner.delivery;
+        let state = delivery.state.lock().unwrap();
+        if !state.open {
+            return false;
         }
+        delivery.overloaded.fetch_add(1, Ordering::Relaxed);
+        true
     }
     pub(crate) async fn drain(&self) {
         loop {
@@ -650,7 +652,6 @@ impl NotificationRole {
                 Ok(permit) => permit,
                 Err(mpsc::error::TrySendError::Closed(_)) => return Ok(None),
                 Err(mpsc::error::TrySendError::Full(_)) => {
-                    self.note_overload();
                     return Err(Error::Config("TCP notification delivery overload".into()).boxed());
                 }
             }

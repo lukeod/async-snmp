@@ -88,14 +88,15 @@ impl DispatchRoles {
         }
         Ok(())
     }
-    fn note_drop(&self) {
-        if let Some(commands) = &self.commands {
+    fn note_udp_overload(&self, message: &ReceivedMessage) {
+        if let Some(commands) = self.commands.as_ref().filter(|role| role.is_enabled()) {
             commands
                 .drops
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else if let Some(notifications) = &self.notifications {
             notifications.note_overload();
         }
+        message.observe(super::MessageDisposition::Overloaded);
     }
     fn peer_response_budget(&self, peer: SocketAddr) -> Option<Arc<Semaphore>> {
         let mut peers = self.peer_exchange_bytes.lock().unwrap();
@@ -160,27 +161,23 @@ impl DispatchRoles {
             &self.application_bytes
         };
         let Ok(slot) = slots.clone().try_acquire_owned() else {
-            message.observe(super::MessageDisposition::Overloaded);
-            self.note_drop();
+            self.note_udp_overload(&message);
             return;
         };
         let Ok(buffer) = budget
             .clone()
             .try_acquire_many_owned(message.bytes.len() as u32)
         else {
-            message.observe(super::MessageDisposition::Overloaded);
-            self.note_drop();
+            self.note_udp_overload(&message);
             return;
         };
         let peer_buffer = if candidate {
             let Some(budget) = self.peer_response_budget(message.info.peer_addr()) else {
-                message.observe(super::MessageDisposition::Overloaded);
-                self.note_drop();
+                self.note_udp_overload(&message);
                 return;
             };
             let Ok(permit) = budget.try_acquire_many_owned(message.bytes.len() as u32) else {
-                message.observe(super::MessageDisposition::Overloaded);
-                self.note_drop();
+                self.note_udp_overload(&message);
                 return;
             };
             Some(permit)
@@ -225,8 +222,7 @@ impl DispatchRoles {
             // must obtain its own admission before releasing that allowance.
             let (_slot, _buffer) = if candidate {
                 let Ok(app_slot) = roles.application.clone().try_acquire_owned() else {
-                    message.observe(super::MessageDisposition::Overloaded);
-                    roles.note_drop();
+                    roles.note_udp_overload(&message);
                     return;
                 };
                 let Ok(app_buffer) = roles
@@ -241,8 +237,7 @@ impl DispatchRoles {
                             .try_acquire_many_owned(message.bytes.len() as u32)
                     })
                 else {
-                    message.observe(super::MessageDisposition::Overloaded);
-                    roles.note_drop();
+                    roles.note_udp_overload(&message);
                     return;
                 };
                 drop(slot);
@@ -406,10 +401,12 @@ impl DispatchRoles {
             }
             .boxed()),
         };
-        if result.is_err() && notification.is_some() {
+        if let Some(processor) = notification
+            && result.is_err()
+        {
             // Admission errors race with consumer/role closure. An independently
             // disabled role does not make a shared session overloaded.
-            if notification.is_some_and(|processor| !processor.is_enabled()) {
+            if !processor.note_overload() {
                 observation.disposition(info, super::MessageDisposition::Disabled);
                 return Ok(());
             }

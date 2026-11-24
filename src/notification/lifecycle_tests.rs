@@ -1,5 +1,6 @@
 use super::tests::{build_v2c_inform, build_v2c_trap, build_v2c_trap_with_request_id};
 use super::*;
+use crate::{MessageDisposition, ObservationEvent, ObservationReceiver, TransportObserver};
 use std::sync::atomic::AtomicUsize;
 
 static_assertions::assert_not_impl_any!(NotificationReceiver: Clone);
@@ -35,6 +36,19 @@ async fn processing_started(receiver: &NotificationReceiver) {
     })
     .await
     .unwrap();
+}
+
+async fn next_disposition(events: &mut ObservationReceiver) -> MessageDisposition {
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let ObservationEvent::Disposition { disposition, .. } = events.recv().await.unwrap()
+            {
+                return disposition;
+            }
+        }
+    })
+    .await
+    .unwrap()
 }
 
 #[tokio::test]
@@ -251,6 +265,121 @@ async fn protocol_work_limit_drops_without_blocking_reader() {
     ));
     receiver.close();
     assert!(receiver.recv().await.is_none());
+}
+
+#[cfg(feature = "agent")]
+#[tokio::test]
+async fn shared_udp_overload_uses_active_role_attribution() {
+    let (observer, mut events) = TransportObserver::channel(16).unwrap();
+    let mut agent = crate::Agent::builder()
+        .listener(crate::ListenerSource::Udp(
+            crate::UdpEndpoint::builder()
+                .bind("127.0.0.1:0")
+                .observer(observer),
+        ))
+        .notifications(
+            NotificationReceiver::builder()
+                .max_processing(1)
+                .response_send_timeout(Duration::from_secs(5)),
+        )
+        .spawn()
+        .await
+        .unwrap();
+    let mut receiver = agent.take_notifications().unwrap();
+    let agent_control = agent.control();
+    let notification_control = receiver.control();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    *receiver.inner.response_send_gate.lock().unwrap() = Some(gate.clone());
+    let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let target = receiver.local_addr();
+    sender
+        .send_to(&build_v2c_inform(b"public"), target)
+        .await
+        .unwrap();
+    processing_started(&receiver).await;
+
+    let trap = build_v2c_trap(b"public");
+    sender.send_to(&trap, target).await.unwrap();
+    assert_eq!(
+        next_disposition(&mut events).await,
+        MessageDisposition::Overloaded
+    );
+    assert_eq!(agent_control.overload_drops(), 1);
+    assert_eq!(notification_control.overload_drops(), 0);
+
+    agent_control.close_commands();
+    sender.send_to(&trap, target).await.unwrap();
+    assert_eq!(
+        next_disposition(&mut events).await,
+        MessageDisposition::Overloaded
+    );
+    assert_eq!(agent_control.overload_drops(), 1);
+    assert_eq!(notification_control.overload_drops(), 1);
+
+    gate.add_permits(1);
+    await_ack(&sender).await;
+    assert_eq!(
+        next_disposition(&mut events).await,
+        MessageDisposition::NotificationDelivered
+    );
+    receiver.close();
+    sender.send_to(&trap, target).await.unwrap();
+    assert_eq!(
+        next_disposition(&mut events).await,
+        MessageDisposition::Disabled
+    );
+    assert_eq!(agent_control.overload_drops(), 1);
+    assert_eq!(notification_control.overload_drops(), 1);
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn tcp_notification_admission_overload_is_counted_once() {
+    use tokio::io::AsyncWriteExt;
+    use tokio::net::TcpStream;
+
+    for client_exchanges in [false, true] {
+        let (observer, mut events) = TransportObserver::channel(16).unwrap();
+        let mut receiver = NotificationReceiver::builder()
+            .listener(crate::ListenerSource::Tcp(
+                crate::TcpListenerSource::bind("127.0.0.1:0").observer(observer),
+            ))
+            .queue_capacity(1)
+            .client_exchanges(client_exchanges)
+            .overload_timeout(Duration::from_millis(20))
+            .spawn()
+            .await
+            .unwrap();
+        let mut peer = TcpStream::connect(receiver.bound_addresses()[0].local_addr)
+            .await
+            .unwrap();
+        let trap = build_v2c_trap(b"public");
+        peer.write_all(&trap).await.unwrap();
+        assert_eq!(
+            next_disposition(&mut events).await,
+            MessageDisposition::NotificationDelivered
+        );
+        let session = receiver.tcp_sessions()[0].control();
+
+        peer.write_all(&trap).await.unwrap();
+        assert_eq!(
+            next_disposition(&mut events).await,
+            MessageDisposition::Overloaded
+        );
+        assert_eq!(receiver.control().overload_drops(), 1);
+        let error = tokio::time::timeout(Duration::from_secs(1), session.join())
+            .await
+            .unwrap()
+            .unwrap_err();
+        let reason = if client_exchanges {
+            "TCP notification delivery overload"
+        } else {
+            "admission overload deadline"
+        };
+        assert!(error.to_string().contains(reason), "{error}");
+        assert!(receiver.recv().await.is_some());
+        receiver.shutdown().await.unwrap();
+    }
 }
 
 #[tokio::test]
