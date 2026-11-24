@@ -400,7 +400,7 @@ impl CommandControl {
     }
     /// Registered requests, including work not yet classified as retrieval or SET.
     pub fn outstanding_requests(&self) -> usize {
-        self.inner.live_request_tasks.lock().unwrap().len()
+        self.inner.request_registry.lock().unwrap().tasks.len()
     }
     /// Positively classified SET work; unclassified requests are also included
     /// by drain methods even though this statistic does not count them.
@@ -440,9 +440,14 @@ fn close_application(inner: &AgentInner) {
 }
 
 pub(super) fn outstanding_mutations(inner: &AgentInner) -> usize {
-    inner.live_request_tasks.lock().unwrap().values().filter(|task| {
-        matches!(task.phase.load(Ordering::Acquire), phase if phase == RequestTaskPhase::SetPreCommit as u8 || phase == RequestTaskPhase::SetProtected as u8)
-    }).count()
+    inner
+        .request_registry
+        .lock()
+        .unwrap()
+        .tasks
+        .values()
+        .filter(|task| task.is_mutation())
+        .count()
 }
 
 pub(super) async fn drain_retained(
@@ -454,16 +459,18 @@ pub(super) async fn drain_retained(
         let notified = inner.task_changed.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        let outstanding = inner
-            .live_request_tasks
-            .lock()
-            .unwrap()
-            .values()
-            .any(|task| {
-                all || task.phase.load(Ordering::Acquire) != RequestTaskPhase::Retrieval as u8
-            });
+        let (outstanding, mutation_failed) = {
+            let registry = inner.request_registry.lock().unwrap();
+            (
+                registry
+                    .tasks
+                    .values()
+                    .any(|task| all || !task.is_retrieval()),
+                registry.mutation_failed,
+            )
+        };
         if !outstanding {
-            if inner.mutation_failures.load(Ordering::Acquire) != 0 {
+            if mutation_failed {
                 return Err(Error::Config("retained mutation cleanup failed".into()).boxed());
             }
             return Ok(());
@@ -592,7 +599,6 @@ pub(super) fn prepare_application(mut config: ApplicationConfig) -> Arc<AgentInn
         command_stop: config.command_stop,
         command_admission_gate: std::sync::Mutex::new(()),
         task_changed: Arc::new(tokio::sync::Notify::new()),
-        mutation_failures: AtomicU64::new(0),
         communities: config.communities,
         security_context,
         security_context_required: config.security_context_required,
@@ -610,7 +616,7 @@ pub(super) fn prepare_application(mut config: ApplicationConfig) -> Arc<AgentInn
         run_orphaned: AtomicBool::new(false),
         active_request_tasks: AtomicUsize::new(0),
         next_request_task_id: AtomicU64::new(1),
-        live_request_tasks: std::sync::Mutex::new(HashMap::new()),
+        request_registry: std::sync::Mutex::new(RequestRegistry::default()),
         response_send_timeout: config.response_send_timeout,
         request_deadline: config.request_deadline,
         shutdown_policy: config.shutdown_policy,

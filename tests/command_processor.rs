@@ -661,32 +661,76 @@ async fn queued_admission_rechecks_endpoint_capacity_atomically() {
     processor.control().shutdown(WAIT).await.unwrap();
 }
 
-#[tokio::test]
-async fn retained_mutation_panics_are_reported_by_drain() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retained_mutation_panics_are_reported_by_concurrent_drains() {
     let state = Arc::new(State::default());
     state.panic_commit.store(true, Ordering::SeqCst);
-    let processor = builder(state).build().unwrap();
+    state.block_commit.store(true, Ordering::SeqCst);
+    let processor = builder(state.clone()).build().unwrap();
     let _registration = processor
         .local_engine()
         .register_receive_capacity(limits().receive().advertised());
-    assert!(
+    let control = processor.control();
+    let request = tokio::spawn(async move {
         processor
             .process(community(
                 Version::V2c,
                 set(Version::V2c, Value::Integer(9)),
-                limits()
+                limits(),
             ))
             .await
-            .is_err()
-    );
+    });
+    entered(&state.started).await;
+    assert_eq!(control.outstanding_mutations(), 1);
+    control.request_shutdown();
+    let mut mutations = Box::pin(control.drain_mutations(WAIT));
+    let mut requests = Box::pin(control.drain_requests(WAIT));
+    assert!(futures_util::poll!(&mut mutations).is_pending());
+    assert!(futures_util::poll!(&mut requests).is_pending());
+
+    state.release.add_permits(1);
+    let (mutations, requests) = tokio::join!(mutations, requests);
+    for result in [mutations, requests] {
+        assert!(matches!(
+            *result.unwrap_err(),
+            Error::Config(reason) if &*reason == "retained mutation cleanup failed"
+        ));
+    }
+    assert_eq!(control.outstanding_requests(), 0);
+    assert!(request.await.unwrap().is_err());
+}
+
+#[tokio::test]
+async fn spawning_on_a_stopped_runtime_leaves_no_retained_request() {
+    let state = Arc::new(State::default());
+    let processor = builder(state.clone()).build().unwrap();
+    let _registration = processor
+        .local_engine()
+        .register_receive_capacity(limits().receive().advertised());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let stopped = runtime.handle().clone();
+    runtime.shutdown_background();
+
+    let mut request =
+        Box::pin(processor.process(community(Version::V2c, get(Version::V2c), limits())));
+    let first_poll = {
+        let _enter = stopped.enter();
+        futures_util::poll!(&mut request)
+    };
+    let result = match first_poll {
+        std::task::Poll::Ready(result) => result,
+        std::task::Poll::Pending => request.await,
+    };
+    assert!(result.is_err());
+    assert_eq!(state.gets.load(Ordering::SeqCst), 0);
+
     let control = processor.control();
     control.request_shutdown();
-    let error = control.drain_mutations(WAIT).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("retained mutation cleanup failed")
-    );
+    control.drain_mutations(Duration::ZERO).await.unwrap();
+    control.drain_requests(Duration::ZERO).await.unwrap();
+    assert_eq!(control.outstanding_requests(), 0);
 }
 
 #[tokio::test]

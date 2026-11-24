@@ -279,22 +279,16 @@ struct ActiveRequestGuard {
 
 impl Drop for ActiveRequestGuard {
     fn drop(&mut self) {
-        let removed = self
-            .inner
-            .live_request_tasks
-            .lock()
-            .unwrap()
-            .remove(&self.task_id);
+        let mut registry = self.inner.request_registry.lock().unwrap();
         if std::thread::panicking()
-            && removed.is_some_and(|task| {
-                let phase = task.phase.load(Ordering::Acquire);
-                phase == RequestTaskPhase::SetPreCommit as u8
-                    || phase == RequestTaskPhase::SetProtected as u8
-            })
+            && registry
+                .tasks
+                .get(&self.task_id)
+                .is_some_and(RequestTaskControl::is_mutation)
         {
-            self.inner.mutation_failures.fetch_add(1, Ordering::Relaxed);
+            registry.mutation_failed = true;
         }
-        self.inner.task_changed.notify_waiters();
+        registry.tasks.remove(&self.task_id);
         if self
             .inner
             .active_request_tasks
@@ -304,12 +298,32 @@ impl Drop for ActiveRequestGuard {
         {
             self.inner.run_active.store(false, Ordering::Release);
         }
+        drop(registry);
+        self.inner.task_changed.notify_waiters();
     }
+}
+
+#[derive(Default)]
+struct RequestRegistry {
+    tasks: HashMap<u64, RequestTaskControl>,
+    mutation_failed: bool,
 }
 
 struct RequestTaskControl {
     phase: Arc<AtomicU8>,
-    abort: AbortHandle,
+    abort: Option<AbortHandle>,
+}
+
+impl RequestTaskControl {
+    fn is_mutation(&self) -> bool {
+        let phase = self.phase.load(Ordering::Acquire);
+        phase == RequestTaskPhase::SetPreCommit as u8
+            || phase == RequestTaskPhase::SetProtected as u8
+    }
+
+    fn is_retrieval(&self) -> bool {
+        self.phase.load(Ordering::Acquire) == RequestTaskPhase::Retrieval as u8
+    }
 }
 
 /// Request tasks owned by one [`AgentRunner::run`] invocation.
@@ -345,28 +359,46 @@ impl RequestTasks {
     }
 
     fn spawn(&mut self, phase: Arc<AtomicU8>, task: impl Future<Output = ()> + Send + 'static) {
+        debug_assert_eq!(
+            phase.load(Ordering::Relaxed),
+            RequestTaskPhase::Unclassified as u8
+        );
         let task_id = self
             .inner
             .next_request_task_id
             .fetch_add(1, Ordering::Relaxed);
-        let activity = ActiveRequestGuard {
-            inner: Arc::clone(&self.inner),
-            task_id,
-        };
         let (start_tx, start_rx) = tokio::sync::oneshot::channel();
-        self.inner
-            .active_request_tasks
-            .fetch_add(1, Ordering::AcqRel);
+        let activity = {
+            let mut registry = self.inner.request_registry.lock().unwrap();
+            registry
+                .tasks
+                .insert(task_id, RequestTaskControl { phase, abort: None });
+            self.inner
+                .active_request_tasks
+                .fetch_add(1, Ordering::AcqRel);
+            ActiveRequestGuard {
+                inner: Arc::clone(&self.inner),
+                task_id,
+            }
+        };
+        // Tokio can drop the future and its guard during spawn on a stopped runtime.
         let abort = self.tasks.spawn(async move {
             let _activity = activity;
-            let _ = start_rx.await;
-            task.await;
+            if start_rx.await.is_ok() {
+                task.await;
+            }
         });
-        self.inner
-            .live_request_tasks
+        if let Some(control) = self
+            .inner
+            .request_registry
             .lock()
             .unwrap()
-            .insert(task_id, RequestTaskControl { phase, abort });
+            .tasks
+            .get_mut(&task_id)
+        {
+            control.abort = Some(abort);
+        }
+        // The task stays unclassified until its abort handle has been attached.
         let _ = start_tx.send(());
     }
 
@@ -374,12 +406,19 @@ impl RequestTasks {
         self.tasks.join_next().await
     }
 
-    fn abort_retrievals(&mut self) {
-        let tasks = self.inner.live_request_tasks.lock().unwrap();
-        for control in tasks.values() {
-            if control.phase.load(Ordering::Acquire) == RequestTaskPhase::Retrieval as u8 {
-                control.abort.abort();
-            }
+    fn abort_retrievals(&self) {
+        let aborts: Vec<_> = self
+            .inner
+            .request_registry
+            .lock()
+            .unwrap()
+            .tasks
+            .values()
+            .filter(|task| task.is_retrieval())
+            .filter_map(|task| task.abort.clone())
+            .collect();
+        for abort in aborts {
+            abort.abort();
         }
     }
 }
@@ -2051,7 +2090,6 @@ pub(crate) struct AgentInner {
     command_stop: CancellationToken,
     command_admission_gate: std::sync::Mutex<()>,
     task_changed: Arc<tokio::sync::Notify>,
-    mutation_failures: AtomicU64,
     pub(crate) communities: Vec<crate::Community>,
     pub(crate) security_context: crate::UsmSecurityContext,
     pub(crate) security_context_required: bool,
@@ -2077,7 +2115,7 @@ pub(crate) struct AgentInner {
     /// Dispatched request tasks, including work retained after `run` is dropped.
     active_request_tasks: AtomicUsize,
     next_request_task_id: AtomicU64,
-    live_request_tasks: std::sync::Mutex<HashMap<u64, RequestTaskControl>>,
+    request_registry: std::sync::Mutex<RequestRegistry>,
     pub(crate) response_send_timeout: Duration,
     request_deadline: Option<Duration>,
     shutdown_policy: AgentShutdownPolicy,
@@ -3403,7 +3441,7 @@ mod tests {
         tokio::time::sleep(grace + Duration::from_millis(20)).await;
         assert!(!run.is_finished());
         assert_eq!(agent.active_request_count(), 1);
-        assert_eq!(agent.inner.live_request_tasks.lock().unwrap().len(), 1);
+        assert_eq!(agent.inner.request_registry.lock().unwrap().tasks.len(), 1);
 
         release_cleanup.add_permits(1);
         let mut response = [0_u8; 2048];
@@ -3425,7 +3463,15 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(agent.active_request_count(), 0);
-        assert!(agent.inner.live_request_tasks.lock().unwrap().is_empty());
+        assert!(
+            agent
+                .inner
+                .request_registry
+                .lock()
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
         wait_for_run_state(&agent, false).await;
 
         let calls = calls.lock().unwrap().clone();
