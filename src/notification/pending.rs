@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use tokio::time::Instant;
@@ -45,6 +46,7 @@ pub struct PendingInformAck {
     registry: Weak<PendingRegistry>,
     key: Key,
     source: SocketAddr,
+    accepted_at: Instant,
     submitted: bool,
 }
 
@@ -75,31 +77,22 @@ impl PendingInformAck {
     /// attempts at shutdown.
     /// Stream writes retain their existing finish-frame-or-close semantics.
     /// Encoding uses the original validated credentials and current engine time.
+    /// Expired attempts report [`Error::Timeout`]. A capability invalidated
+    /// by shutdown reports [`Error::Closed`].
     pub async fn acknowledge(mut self) -> InformAckOutcome {
-        let submitted = match self.registry.upgrade() {
-            Some(registry) => registry.request(self.key),
-            None => Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "notification service closed",
-            )),
-        };
+        let submitted = self
+            .registry
+            .upgrade()
+            .ok_or(PendingFailure::Closed)
+            .and_then(|registry| registry.request(self.key));
         self.submitted = true;
-        match submitted {
-            Ok(result) => result.await.unwrap_or_else(|_| {
-                failed(
-                    self.source,
-                    std::io::ErrorKind::NotConnected,
-                    "notification completion stopped",
-                )
-            }),
-            Err(error) => InformAckOutcome::Failed(
-                Error::Network {
-                    target: self.source,
-                    source: error,
-                }
-                .boxed(),
-            ),
-        }
+        let outcome = match submitted {
+            Ok(result) => result.await.map_err(|_| PendingFailure::Closed),
+            Err(failure) => Err(failure),
+        };
+        outcome.unwrap_or_else(|failure| {
+            InformAckOutcome::Failed(failure.error(self.source, self.accepted_at))
+        })
     }
 }
 
@@ -118,8 +111,28 @@ type Key = (Instant, u64);
 struct Payload {
     response: InformResponse,
     route: crate::transport::ReplyRoute,
-    source: SocketAddr,
+    accepted_at: Instant,
     _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Clone, Copy)]
+enum PendingFailure {
+    Expired,
+    Closed,
+}
+
+impl PendingFailure {
+    fn error(self, target: SocketAddr, accepted_at: Instant) -> Box<Error> {
+        match self {
+            Self::Expired => Error::Timeout {
+                target,
+                elapsed: accepted_at.elapsed(),
+                retries: 0,
+            },
+            Self::Closed => Error::Closed { target },
+        }
+        .boxed()
+    }
 }
 
 enum Entry {
@@ -163,16 +176,16 @@ impl PendingRegistry {
         self: &Arc<Self>,
         response: InformResponse,
         route: crate::transport::ReplyRoute,
-        source: SocketAddr,
         permit: OwnedSemaphorePermit,
-        deadline: Instant,
+        timeout: Duration,
     ) -> std::result::Result<PendingInformAck, InformAckOutcome> {
+        let accepted_at = Instant::now();
+        let deadline = accepted_at + timeout;
+        let source = route.peer_addr();
         let mut state = self.state.lock().unwrap();
         if state.closed {
-            return Err(failed(
-                source,
-                std::io::ErrorKind::NotConnected,
-                "notification role closed",
+            return Err(InformAckOutcome::Failed(
+                Error::Closed { target: source }.boxed(),
             ));
         }
         state.next_id = state
@@ -186,7 +199,7 @@ impl PendingRegistry {
                 payload: Box::new(Payload {
                     response,
                     route,
-                    source,
+                    accepted_at,
                     _permit: permit,
                 }),
                 requested: None,
@@ -198,29 +211,24 @@ impl PendingRegistry {
             registry: Arc::downgrade(self),
             key,
             source,
+            accepted_at,
             submitted: false,
         })
     }
 
-    fn request(&self, key: Key) -> std::io::Result<oneshot::Receiver<InformAckOutcome>> {
+    fn request(
+        &self,
+        key: Key,
+    ) -> std::result::Result<oneshot::Receiver<InformAckOutcome>, PendingFailure> {
         let mut state = self.state.lock().unwrap();
         if state.closed {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "notification role closed",
-            ));
+            return Err(PendingFailure::Closed);
         }
         if Instant::now() >= key.0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "pending Inform expired",
-            ));
+            return Err(PendingFailure::Expired);
         }
         let Some(Entry::Waiting { requested, .. }) = state.entries.get_mut(&key) else {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "pending Inform no longer available",
-            ));
+            return Err(PendingFailure::Closed);
         };
         let (sender, receiver) = oneshot::channel();
         *requested = Some(sender);
@@ -252,11 +260,7 @@ impl PendingRegistry {
                 .collect::<Vec<_>>()
         };
         for entry in expired {
-            stop(
-                entry,
-                std::io::ErrorKind::TimedOut,
-                "pending Inform expired",
-            );
+            stop(entry, PendingFailure::Expired);
         }
     }
 
@@ -268,11 +272,7 @@ impl PendingRegistry {
         };
         self.slots.close();
         for (_, entry) in entries {
-            stop(
-                entry,
-                std::io::ErrorKind::NotConnected,
-                "notification role closed",
-            );
+            stop(entry, PendingFailure::Closed);
         }
         self.changed.notify_one();
     }
@@ -335,11 +335,12 @@ impl PendingRegistry {
     }
 }
 
-fn stop(entry: Entry, kind: std::io::ErrorKind, message: &'static str) {
+fn stop(entry: Entry, failure: PendingFailure) {
     match entry {
         Entry::Waiting { payload, requested } => {
             if let Some(result) = requested {
-                let _ = result.send(failed(payload.source, kind, message));
+                let error = failure.error(payload.route.peer_addr(), payload.accepted_at);
+                let _ = result.send(InformAckOutcome::Failed(error));
             }
         }
         Entry::Running(cancel) => cancel.cancel(),
@@ -372,20 +373,6 @@ impl Drop for WorkerCleanup {
     }
 }
 
-pub(super) fn failed(
-    source: SocketAddr,
-    kind: std::io::ErrorKind,
-    message: &'static str,
-) -> InformAckOutcome {
-    InformAckOutcome::Failed(
-        Error::Network {
-            target: source,
-            source: std::io::Error::new(kind, message),
-        }
-        .boxed(),
-    )
-}
-
 impl NotificationRole {
     /// One supervised expiry/completion worker for the notification role.
     pub(crate) async fn run_pending(self, shutdown: CancellationToken) -> crate::Result<()> {
@@ -408,15 +395,16 @@ impl NotificationRole {
                 let role = self.clone();
                 work.spawn(async move {
                     let Work { payload, result, cancel, guard } = item;
-                    let deadline = Instant::now().checked_add(role.inner.response_send_timeout).unwrap_or(guard.key.0).min(guard.key.0);
-                    let Payload { response, route, source, _permit } = *payload;
+                    let started = Instant::now();
+                    let deadline = started.checked_add(role.inner.response_send_timeout).unwrap_or(guard.key.0).min(guard.key.0);
+                    let Payload { response, route, _permit, .. } = *payload;
                     let outcome = tokio::select! {
                         biased;
                         () = cancel.cancelled() => if Instant::now() >= deadline {
-                            failed(source, std::io::ErrorKind::TimedOut, "pending Inform expired")
-                        } else { failed(source, std::io::ErrorKind::NotConnected, "notification completion cancelled") },
-                        () = tokio::time::sleep_until(deadline) => failed(source, std::io::ErrorKind::TimedOut, "pending Inform expired"),
-                        outcome = role.complete_response(response, route, source, Some(deadline), Some(cancel.clone())) => outcome,
+                            InformAckOutcome::Failed(route.timeout_error(started))
+                        } else { InformAckOutcome::Failed(Error::Closed { target: route.peer_addr() }.boxed()) },
+                        () = tokio::time::sleep_until(deadline) => InformAckOutcome::Failed(route.timeout_error(started)),
+                        outcome = role.complete_response(response, &route, Some(deadline), Some(cancel.clone())) => outcome,
                     };
                     let _ = result.send(outcome);
                     drop(_permit);
@@ -549,7 +537,10 @@ mod tests {
                     "unpolled future retained request bytes"
                 );
                 assert_eq!(role.inner.pending.slots.available_permits(), 1);
-                assert!(matches!(future.await, InformAckOutcome::Failed(_)));
+                assert!(matches!(
+                    future.await,
+                    InformAckOutcome::Failed(error) if error.kind() == crate::ErrorKind::Timeout
+                ));
             } else {
                 tokio::time::advance(deadline - Instant::now()).await;
                 tokio::task::yield_now().await;
@@ -560,7 +551,7 @@ mod tests {
                 assert_eq!(role.inner.pending.slots.available_permits(), 1);
                 assert!(matches!(
                     pending.acknowledge().await,
-                    InformAckOutcome::Failed(_)
+                    InformAckOutcome::Failed(error) if error.kind() == crate::ErrorKind::Timeout
                 ));
             }
             root.cancel();
@@ -584,7 +575,7 @@ mod tests {
         assert_eq!(receiver.inner.pending.slots.available_permits(), 1);
         assert!(matches!(
             pending.acknowledge().await,
-            InformAckOutcome::Failed(_)
+            InformAckOutcome::Failed(error) if error.kind() == crate::ErrorKind::Closed
         ));
     }
 
@@ -610,7 +601,10 @@ mod tests {
         tokio::time::advance(deadline - Instant::now()).await;
         role.inner.pending.drain().await;
         assert_eq!(role.inner.pending.slots.available_permits(), 1);
-        assert!(matches!(future.await, InformAckOutcome::Failed(_)));
+        assert!(matches!(
+            future.await,
+            InformAckOutcome::Failed(error) if error.kind() == crate::ErrorKind::Timeout
+        ));
         root.cancel();
         worker.await.unwrap().unwrap();
     }
@@ -668,7 +662,10 @@ mod tests {
         role.clone().run_pending(root).await.unwrap();
         assert_eq!(role.inner.response_sends_started.load(Ordering::Acquire), 0);
         assert_eq!(role.inner.pending.slots.available_permits(), 1);
-        assert!(matches!(future.await, InformAckOutcome::Failed(_)));
+        assert!(matches!(
+            future.await,
+            InformAckOutcome::Failed(error) if error.kind() == crate::ErrorKind::Closed
+        ));
     }
 
     #[tokio::test]
@@ -708,7 +705,10 @@ mod tests {
         task.await.unwrap().unwrap();
         assert_eq!(role.inner.pending.active.load(Ordering::Acquire), 0);
         assert_eq!(role.inner.pending.slots.available_permits(), 1);
-        assert!(matches!(future.await, InformAckOutcome::Failed(_)));
+        assert!(matches!(
+            future.await,
+            InformAckOutcome::Failed(error) if error.kind() == crate::ErrorKind::Closed
+        ));
     }
 
     #[tokio::test]
@@ -729,7 +729,7 @@ mod tests {
         assert_eq!(receiver.inner.pending.slots.available_permits(), 1);
         assert!(matches!(
             token.acknowledge().await,
-            InformAckOutcome::Failed(_)
+            InformAckOutcome::Failed(error) if error.kind() == crate::ErrorKind::Closed
         ));
     }
 

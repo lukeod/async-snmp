@@ -390,11 +390,11 @@ pub enum ConstructionStage {
 pub enum ErrorKind {
     /// Network I/O failure.
     Network,
-    /// Request or standalone-send timeout.
+    /// Request, send or acknowledgement timeout.
     Timeout,
     /// Bounded client-construction timeout.
     ConstructionTimeout,
-    /// Closed or poisoned transport.
+    /// Closed transport or acknowledgement capability.
     Closed,
     /// Duplicate live request identifier.
     RequestIdInUse,
@@ -546,7 +546,7 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// Request or standalone send exceeded its operation deadline.
+    /// Request, send or acknowledgement exceeded its operation deadline.
     #[error("timeout after {elapsed:?} waiting for {target} ({retries} retries)")]
     Timeout {
         target: SocketAddr,
@@ -583,11 +583,9 @@ pub enum Error {
         elapsed: Duration,
     },
 
-    /// Transport was shut down while a request was pending.
-    ///
-    /// Not retriable: the transport will never deliver a response again.
-    /// Recovery requires creating a new transport.
-    #[error("transport closed while waiting for {target}")]
+    /// The transport or acknowledgement capability closed before completion.
+    /// A closed transport or capability cannot be reused.
+    #[error("operation closed for {target}")]
     Closed { target: SocketAddr },
 
     /// A UDP request or alias ID is already reserved by another live exchange.

@@ -427,11 +427,23 @@ impl UdpResponder {
         data: &[u8],
         destination: SocketAddr,
         source: Option<DestinationMetadata>,
-    ) -> io::Result<()> {
+    ) -> crate::Result<()> {
+        let closed = || {
+            crate::Error::Closed {
+                target: destination,
+            }
+            .boxed()
+        };
         tokio::select! {
             biased;
-            () = self.shutdown.cancelled() => Err(closed_socket()),
-            result = self.send_datagram(data, destination, source) => result,
+            () = self.shutdown.cancelled() => Err(closed()),
+            result = self.send_datagram(data, destination, source) => result.map_err(|source| {
+                if source.get_ref().is_some_and(|error| error.is::<UdpEndpointClosed>()) {
+                    closed()
+                } else {
+                    crate::Error::Network { target: destination, source }.boxed()
+                }
+            }),
         }
     }
 
@@ -672,8 +684,12 @@ impl UdpResponder {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("UDP endpoint is closed")]
+struct UdpEndpointClosed;
+
 fn closed_socket() -> io::Error {
-    io::Error::new(io::ErrorKind::NotConnected, "UDP endpoint is closed")
+    io::Error::new(io::ErrorKind::NotConnected, UdpEndpointClosed)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2177,10 +2193,7 @@ mod tests {
 
         responder.close();
         let _rebound = UdpSocket::bind(local).await.unwrap();
-        assert_eq!(
-            pending.await.unwrap_err().kind(),
-            io::ErrorKind::NotConnected
-        );
+        assert_eq!(pending.await.unwrap_err().kind(), crate::ErrorKind::Closed);
         drop(writer);
     }
 

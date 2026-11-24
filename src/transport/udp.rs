@@ -1132,21 +1132,7 @@ impl UdpHandle {
         self.inner
             .responder
             .send_to(data, self.target, None)
-            .await
-            .map_err(|source| {
-                if self.inner.responder.shutdown_token().is_cancelled() {
-                    Error::Closed {
-                        target: self.target,
-                    }
-                    .boxed()
-                } else {
-                    Error::Network {
-                        target: self.target,
-                        source,
-                    }
-                    .boxed()
-                }
-            })?;
+            .await?;
         self.inner.observation.sent(super::SentMessageInfo {
             endpoint_id: self.inner.endpoint_id,
             session_id: None,

@@ -352,23 +352,32 @@ impl ReplyRoute {
         }
     }
 
+    pub(crate) fn peer_addr(&self) -> SocketAddr {
+        match &self.kind {
+            ReplyKind::Udp { received, .. } => received.source,
+            ReplyKind::Tcp(transport) => super::RequestTransport::peer_addr(transport),
+        }
+    }
+
+    pub(crate) fn timeout_error(&self, started: Instant) -> Box<crate::Error> {
+        crate::Error::Timeout {
+            target: self.peer_addr(),
+            elapsed: started.elapsed(),
+            retries: 0,
+        }
+        .boxed()
+    }
+
     pub(crate) async fn send_before(
         &self,
         data: bytes::Bytes,
         deadline: Instant,
-    ) -> std::io::Result<()> {
-        if Instant::now() >= deadline {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "reply deadline expired",
-            ));
+    ) -> crate::Result<()> {
+        let started = Instant::now();
+        if started >= deadline {
+            return Err(self.timeout_error(started));
         }
-        if data.len() > self.limits.send {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "response exceeds endpoint send capacity",
-            ));
-        }
+        crate::message_size::enforce_outbound_size(data.len(), self.limits.send)?;
         match &self.kind {
             ReplyKind::Udp {
                 responder,
@@ -378,7 +387,7 @@ impl ReplyRoute {
             } => {
                 let send = responder.send_to(&data, received.source, received.destination);
                 let result = tokio::select! { biased;
-                    () = tokio::time::sleep_until(deadline) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "reply deadline expired")),
+                    () = tokio::time::sleep_until(deadline) => Err(self.timeout_error(started)),
                     result = send => result,
                 };
                 if result.is_ok() {
@@ -394,10 +403,7 @@ impl ReplyRoute {
                 }
                 result
             }
-            ReplyKind::Tcp(transport) => transport
-                .write_before(data, deadline)
-                .await
-                .map_err(std::io::Error::other),
+            ReplyKind::Tcp(transport) => transport.write_before(data, deadline).await,
         }
     }
 }

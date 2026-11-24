@@ -428,7 +428,10 @@ pub enum InformAckOutcome {
     SentTooBig,
     /// Neither response fit at completion and the silent drop was counted.
     SuppressedBySize,
-    /// Failure to encode or send the reply for a deliverable Inform.
+    /// Failure to complete the acknowledgement.
+    ///
+    /// Reply attempts preserve their transport error and any TCP session
+    /// context. Use [`Error::kind`] to classify the failure.
     Failed(Box<Error>),
 }
 
@@ -2135,7 +2138,7 @@ impl NotificationRole {
         &self,
         data: bytes::Bytes,
         route: &crate::transport::ReplyRoute,
-    ) -> std::io::Result<()> {
+    ) -> Result<()> {
         let deadline = tokio::time::Instant::now()
             .checked_add(self.inner.response_send_timeout)
             .expect("response send timeout validated by builder");
@@ -2147,27 +2150,22 @@ impl NotificationRole {
         data: bytes::Bytes,
         route: &crate::transport::ReplyRoute,
         deadline: tokio::time::Instant,
-    ) -> std::io::Result<()> {
-        let timeout_error = || {
-            std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "notification response send timed out",
-            )
-        };
-        if tokio::time::Instant::now() >= deadline {
-            return Err(timeout_error());
+    ) -> Result<()> {
+        let started = tokio::time::Instant::now();
+        if started >= deadline {
+            return Err(route.timeout_error(started));
         }
         #[cfg(test)]
         let response_send_gate = self.inner.response_send_gate.lock().unwrap().clone();
         tokio::select! {
             biased;
-            () = tokio::time::sleep_until(deadline) => Err(timeout_error()),
+            () = tokio::time::sleep_until(deadline) => Err(route.timeout_error(started)),
             result = async {
                 #[cfg(test)]
                 self.inner.response_sends_started.fetch_add(1, Ordering::Relaxed);
                 #[cfg(test)]
-                if let Some(error) = self.inner.response_send_errors.lock().unwrap().pop_front() {
-                    return Err(error);
+                if let Some(source) = self.inner.response_send_errors.lock().unwrap().pop_front() {
+                    return Err(Error::Network { target: route.peer_addr(), source }.boxed());
                 }
                 #[cfg(test)]
                 if let Some(gate) = &response_send_gate {
@@ -5709,8 +5707,7 @@ mod tests {
         assert!(matches!(
             received.inform_ack,
             crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error))
-                if matches!(&*error, Error::Network { source, .. }
-                    if source.kind() == std::io::ErrorKind::TimedOut)
+                if error.kind() == crate::ErrorKind::Timeout
         ));
         let mut buf = [0u8; 16];
         assert!(
@@ -5821,11 +5818,7 @@ mod tests {
                 (
                     "timeout",
                     crate::NotificationAcknowledgement::Completed(InformAckOutcome::Failed(error)),
-                ) => assert!(matches!(
-                    &*error,
-                    Error::Network { source, .. }
-                        if source.kind() == std::io::ErrorKind::TimedOut
-                )),
+                ) => assert_eq!(error.kind(), crate::ErrorKind::Timeout),
                 other => panic!("unexpected acknowledgement result: {other:?}"),
             }
         }

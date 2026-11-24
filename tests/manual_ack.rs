@@ -14,13 +14,14 @@ use async_snmp::{AuthoritativeEngine, RequestTransport, TransportKind};
 ))]
 use async_snmp::{Client, Retry};
 use async_snmp::{
-    InformAckOutcome, InformAcknowledgementMode, ListenerSource, MessageDisposition,
-    NotificationAcknowledgement, NotificationPdu, NotificationReceiver, ObservationEvent,
-    PendingInformAck, TcpListenerSource, TransportObserver, Value, VarBind, Version, oid,
+    Error, ErrorKind, InformAckOutcome, InformAcknowledgementMode, ListenerSource,
+    MessageDisposition, NotificationAcknowledgement, NotificationPdu, NotificationReceiver,
+    ObservationEvent, PendingInformAck, TcpListenerSource, TcpTransport, TransportObserver, Value,
+    VarBind, Version, oid,
 };
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 
 const WAIT: Duration = Duration::from_secs(3);
 
@@ -332,6 +333,56 @@ async fn oversized_tcp_inform_gets_toobig_while_the_only_manual_slot_is_occupied
 }
 
 #[tokio::test]
+async fn tcp_manual_ack_retains_session_write_timeout() {
+    let peer = TcpSocket::new_v4().unwrap();
+    peer.set_recv_buffer_size(4096).unwrap();
+    peer.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let listener = peer.listen(1).unwrap();
+    let socket = TcpSocket::new_v4().unwrap();
+    socket.set_send_buffer_size(4096).unwrap();
+    let builder = manual()
+        .max_message_size(2 * 1024 * 1024)
+        .response_send_timeout(WAIT)
+        .session(
+            TcpTransport::builder()
+                .from_socket(socket)
+                .target(listener.local_addr().unwrap())
+                .write_timeout(Duration::from_millis(50)),
+        );
+    let (receiver, peer) = tokio::join!(builder.spawn(), listener.accept());
+    let mut receiver = receiver.unwrap();
+    let mut peer = peer.unwrap().0;
+    let inform = wire_with_varbinds(
+        17,
+        vec![VarBind::new(
+            oid!(1, 3, 6, 1, 4, 1, 9, 1),
+            Value::OctetString(Bytes::from(vec![0; 1024 * 1024])),
+        )],
+    );
+    // The peer sends a complete Inform and leaves the response unread. Its
+    // constrained receive window forces the writer to time out mid-frame.
+    tokio::time::timeout(WAIT, peer.write_all(&inform))
+        .await
+        .unwrap()
+        .unwrap();
+    let received = event(&mut receiver).await;
+    let session = received.receive_info.session_id().unwrap();
+    let target = peer.local_addr().unwrap();
+    let InformAckOutcome::Failed(error) = pending(received).acknowledge().await else {
+        panic!("expected the session write timeout");
+    };
+    assert_eq!(error.kind(), ErrorKind::Timeout);
+    assert!(matches!(
+        &*error,
+        Error::SharedOperation { source } if matches!(
+            &**source, Error::Session { session_id, peer_addr, .. }
+                if *session_id == session && *peer_addr == target
+        )
+    ));
+    receiver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn closing_original_tcp_session_never_retargets_pending_ack_to_a_replacement() {
     let mut receiver = manual()
         .listener(ListenerSource::tcp("127.0.0.1:0"))
@@ -366,7 +417,7 @@ async fn closing_original_tcp_session_never_retargets_pending_ack_to_a_replaceme
     // The outstanding first Inform still holds capacity until its completion.
     assert!(matches!(
         old_ack.acknowledge().await,
-        InformAckOutcome::Failed(_)
+        InformAckOutcome::Failed(error) if error.kind() == ErrorKind::Closed
     ));
     replacement.write_all(&wire(3)).await.unwrap();
     let new_event = event(&mut receiver).await;

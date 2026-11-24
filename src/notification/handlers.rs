@@ -71,12 +71,12 @@ impl NotificationRole {
                         .pending_permit
                         .take()
                         .expect("manual Inform admission reserved outstanding work");
-                    let deadline = tokio::time::Instant::now() + self.inner.pending_inform_timeout;
-                    let inform_ack = match self
-                        .inner
-                        .pending
-                        .install(response, route, source, permit, deadline)
-                    {
+                    let inform_ack = match self.inner.pending.install(
+                        response,
+                        route,
+                        permit,
+                        self.inner.pending_inform_timeout,
+                    ) {
                         Ok(pending) => NotificationAcknowledgement::Pending(pending),
                         Err(outcome) => NotificationAcknowledgement::Completed(outcome),
                     };
@@ -87,9 +87,7 @@ impl NotificationRole {
                         inform_ack,
                     }));
                 }
-                let outcome = self
-                    .complete_response(response, route, source, None, None)
-                    .await;
+                let outcome = self.complete_response(response, &route, None, None).await;
                 Ok(Some(ReceivedNotification::inform(
                     notification,
                     receive_info,
@@ -115,11 +113,11 @@ impl NotificationRole {
     pub(super) async fn complete_response(
         &self,
         response: InformResponse,
-        route: crate::transport::ReplyRoute,
-        source: std::net::SocketAddr,
+        route: &crate::transport::ReplyRoute,
         deadline: Option<tokio::time::Instant>,
         cancel: Option<tokio_util::sync::CancellationToken>,
     ) -> InformAckOutcome {
+        let started = tokio::time::Instant::now();
         #[cfg(test)]
         let injected = self
             .inner
@@ -134,18 +132,15 @@ impl NotificationRole {
             None => response.encode(),
         };
         if cancel.as_ref().is_some_and(|cancel| cancel.is_cancelled()) {
-            return super::pending::failed(
-                source,
-                std::io::ErrorKind::NotConnected,
-                "notification completion cancelled",
+            return InformAckOutcome::Failed(
+                Error::Closed {
+                    target: route.peer_addr(),
+                }
+                .boxed(),
             );
         }
         if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
-            return super::pending::failed(
-                source,
-                std::io::ErrorKind::TimedOut,
-                "pending Inform expired",
-            );
+            return InformAckOutcome::Failed(route.timeout_error(started));
         }
         let (bytes, outcome) = match encoded {
             Ok(EncodedInformResponse::Response(bytes)) => (bytes, InformAckOutcome::Sent),
@@ -154,18 +149,12 @@ impl NotificationRole {
             Err(error) => return InformAckOutcome::Failed(error),
         };
         let sent = match deadline {
-            Some(deadline) => self.send_response_before(bytes, &route, deadline).await,
-            None => self.send_response(bytes, &route).await,
+            Some(deadline) => self.send_response_before(bytes, route, deadline).await,
+            None => self.send_response(bytes, route).await,
         };
         match sent {
             Ok(()) => outcome,
-            Err(error) => InformAckOutcome::Failed(
-                Error::Network {
-                    target: source,
-                    source: error,
-                }
-                .boxed(),
-            ),
+            Err(error) => InformAckOutcome::Failed(error),
         }
     }
 

@@ -2511,20 +2511,19 @@ impl AgentProcessor {
         &self,
         data: bytes::Bytes,
         route: &crate::transport::ReplyRoute,
-    ) -> std::io::Result<()> {
-        let deadline = tokio::time::Instant::now()
+    ) -> Result<()> {
+        let started = tokio::time::Instant::now();
+        let deadline = started
             .checked_add(self.inner.response_send_timeout)
             .expect("response send timeout validated by builder");
-        let timeout_error =
-            || std::io::Error::new(std::io::ErrorKind::TimedOut, "response send timed out");
         if tokio::time::Instant::now() >= deadline {
-            return Err(timeout_error());
+            return Err(route.timeout_error(started));
         }
         #[cfg(test)]
         let response_send_gate = self.inner.response_send_gate.lock().unwrap().clone();
         tokio::select! {
             biased;
-            () = tokio::time::sleep_until(deadline) => Err(timeout_error()),
+            () = tokio::time::sleep_until(deadline) => Err(route.timeout_error(started)),
             result = async {
                 #[cfg(test)]
                 self.inner.response_sends_started.fetch_add(1, Ordering::Relaxed);
