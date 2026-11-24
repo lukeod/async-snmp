@@ -309,7 +309,7 @@ async fn dropping_unstarted_runners_unregisters_capacity_with_live_handles() {
         .unwrap(),
     )
     .unwrap();
-    let (agent, agent_runner) = Agent::builder()
+    let (agent, agent_runner, _) = Agent::builder()
         .local_engine(engine.clone())
         .listener(tcp_source(32768))
         .prepare()

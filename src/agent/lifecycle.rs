@@ -120,7 +120,8 @@ impl AgentControl {
     }
 }
 
-/// Prepared public handle and one unstarted runner. No task is spawned by preparation.
+/// Prepared public handle, unstarted runner, and optional attached notification
+/// receiver. No task is spawned by preparation.
 #[must_use = "drive or drop the agent runner"]
 pub struct PreparedAgent {
     pub(super) agent: Agent,
@@ -128,23 +129,17 @@ pub struct PreparedAgent {
     pub(super) notifications: Option<crate::NotificationReceiver>,
 }
 impl PreparedAgent {
-    /// Take the unique attached consumer before splitting or spawning the runner.
-    pub fn take_notifications(&mut self) -> Option<crate::NotificationReceiver> {
-        self.notifications.take()
-    }
-    pub fn into_parts(self) -> (Agent, AgentRunner) {
-        (self.agent, self.runner)
+    /// Split into the public handle, the runner, and the unique notification
+    /// receiver if configured. Keep the receiver alive to admit notifications.
+    pub fn into_parts(self) -> (Agent, AgentRunner, Option<crate::NotificationReceiver>) {
+        (self.agent, self.runner, self.notifications)
     }
     pub fn spawn(self) -> RunningAgent {
         self.spawn_on(&tokio::runtime::Handle::current())
     }
     /// Existing listener/socket registrations remain on their original runtime.
     pub fn spawn_on(self, runtime: &tokio::runtime::Handle) -> RunningAgent {
-        let Self {
-            agent,
-            runner,
-            notifications,
-        } = self;
+        let (agent, runner, notifications) = self.into_parts();
         RunningAgent {
             agent,
             notifications,
@@ -153,7 +148,7 @@ impl PreparedAgent {
     }
     #[cfg(test)]
     fn into_test_agent(self) -> Agent {
-        let (agent, runner) = self.into_parts();
+        let (agent, runner, _) = self.into_parts();
         *agent.test_runner.lock().unwrap() = Some(runner);
         agent
     }
@@ -414,7 +409,7 @@ fn log_request_result(result: Option<std::result::Result<(), JoinError>>) {
 #[cfg(test)]
 impl AgentBuilder {
     // Existing protocol tests deliberately retain an unstarted runner. Public
-    // callers use the explicit prepared pair; this helper is test-only.
+    // callers split the prepared agent or spawn it directly.
     pub(super) async fn build(self) -> Result<Agent> {
         Ok(self
             .discard_notifications()

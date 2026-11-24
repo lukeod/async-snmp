@@ -174,6 +174,11 @@ Dropping the last public handle requests shutdown; controls also retain lifetime
 Dropping an unpolled runner closes its endpoints. Sends and exchanges use their
 ordinary deadlines before startup and fail after termination.
 
+`PreparedAgent::into_parts()` returns `(agent, runner, notifications)`, with an
+optional notification receiver. Keep the receiver alive to admit notifications.
+If you use `spawn()` or `spawn_on()`, call `RunningAgent::take_notifications()`
+to receive events.
+
 | API migration | Current API |
 | --- | --- |
 | Custom client transport contract | `RequestTransport` |

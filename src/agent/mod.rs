@@ -42,12 +42,11 @@
 //! Enable `client_exchanges(true)` before preparation, then select a listener
 //! with `udp_endpoint(id)` and derive its target handles. Attach a
 //! [`NotificationReceiverBuilder`](crate::notification::NotificationReceiverBuilder)
-//! with `notifications(...)`; take its unique consumer using
-//! [`PreparedAgent::take_notifications`] or [`RunningAgent::take_notifications`].
-//! Take the consumer before `into_parts()`, which otherwise drops it and closes
-//! notification admission. The notification role inherits the prepared engine,
-//! USM users, privacy sender state and message/security counters; configure
-//! engine identity and users only on the agent.
+//! with `notifications(...)`. [`PreparedAgent::into_parts`] returns the unique
+//! consumer alongside the handle and runner. For a spawned agent, use
+//! [`RunningAgent::take_notifications`]. The notification role inherits the
+//! prepared engine, USM users, privacy sender state and message/security counters.
+//! Configure engine identity and users only on the agent.
 //! The role keeps its own community, admission, decoding and delivery policies.
 //!
 //! Closing the notification consumer or its attached control disables that role.
@@ -645,8 +644,9 @@ impl AgentBuilder {
         self
     }
     /// Attach one notification consumer to every endpoint/session. Its engine, USM
-    /// users and privacy sender state are inherited from this agent. Take the
-    /// consumer from the prepared or running agent before receiving events.
+    /// users and privacy sender state are inherited from this agent. Obtain the
+    /// consumer through [`PreparedAgent::into_parts`] or
+    /// [`RunningAgent::take_notifications`].
     #[must_use]
     pub fn notifications(mut self, role: crate::notification::NotificationReceiverBuilder) -> Self {
         self.notifications = Some(role);

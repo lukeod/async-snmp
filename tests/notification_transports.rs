@@ -111,7 +111,8 @@ async fn dedicated_udp_and_tcp_are_prepared_and_mixed_fanout_preserves_order() {
         .prepare()
         .await
         .unwrap();
-    let (handle, runner) = prepared.into_parts();
+    let (handle, runner, notifications) = prepared.into_parts();
+    assert!(notifications.is_none());
     let summaries: Vec<_> = handle.notification_sinks().collect();
     assert_eq!(summaries[0].transport(), TransportKind::Tcp);
     assert!(summaries[0].session_id().is_some());
@@ -151,13 +152,16 @@ async fn dedicated_udp_and_tcp_are_prepared_and_mixed_fanout_preserves_order() {
 
 #[tokio::test]
 async fn accepted_and_connected_sessions_send_both_directions_and_never_reconnect() {
-    let mut server = Agent::builder()
+    let (server, runner, server_events) = Agent::builder()
         .listener(ListenerSource::tcp("127.0.0.1:0"))
         .client_exchanges(true)
         .notifications(NotificationReceiver::builder().admit_all_notifications())
-        .spawn()
+        .prepare()
         .await
-        .unwrap();
+        .unwrap()
+        .into_parts();
+    let mut server_events = server_events.unwrap();
+    let server_task = tokio::spawn(runner.run());
     let mut client = Agent::builder()
         .session(TcpTransport::builder().target(server.bound_addresses()[0].local_addr))
         .client_exchanges(true)
@@ -165,7 +169,6 @@ async fn accepted_and_connected_sessions_send_both_directions_and_never_reconnec
         .spawn()
         .await
         .unwrap();
-    let mut server_events = server.take_notifications().unwrap();
     let mut client_events = client.take_notifications().unwrap();
     let connected = client.tcp_sessions()[0].clone();
     let outbound = client
@@ -223,7 +226,8 @@ async fn accepted_and_connected_sessions_send_both_directions_and_never_reconnec
         assert_eq!(result.sink.session_id(), Some(accepted.session_id()));
     }
     assert_eq!(client.bound_addresses().len(), 1);
-    server.shutdown().await.unwrap();
+    server.control().request_shutdown();
+    server_task.await.unwrap().unwrap();
     client.shutdown().await.unwrap();
 }
 
@@ -250,7 +254,7 @@ async fn dropping_final_handle_stops_shared_sink_root_and_owned_child_drivers() 
         .prepare()
         .await
         .unwrap();
-    let (agent, runner) = prepared.into_parts();
+    let (agent, runner, _) = prepared.into_parts();
     let bound = agent.bound_addresses().to_vec();
     let task = tokio::spawn(runner.run());
     assert!(!agent.send_inform(&cold(), 0, vec![]).await.all_succeeded());
@@ -283,7 +287,7 @@ async fn unpolled_drop_closes_prepared_children_and_disables_notifications() {
         .prepare()
         .await
         .unwrap();
-    let (agent, runner) = prepared.into_parts();
+    let (agent, runner, _) = prepared.into_parts();
     let (mut stream, _) = listener.accept().await.unwrap();
     drop(runner);
     use tokio::io::AsyncReadExt;
@@ -361,7 +365,7 @@ async fn runner_abort_wakes_pending_informs_and_blocks_external_peer_traps() {
         .prepare()
         .await
         .unwrap();
-    let (agent, runner) = prepared.into_parts();
+    let (agent, runner, _) = prepared.into_parts();
     let engine = agent.local_engine();
     assert_eq!(
         engine.receive_capacity(),

@@ -79,6 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bound using `ProcessingLimits`. Managed command and notification processing
   use the same envelope, preserving receive identity, UDP tolerance and TCP limits.
 
+- **Breaking:** `PreparedAgent::into_parts()` returns
+  `(agent, runner, notifications)`. The optional attached receiver is the
+  third element. Use `RunningAgent::take_notifications()` after spawning.
+
 - **Breaking:** notification receivers use `prepare()` or explicit `spawn()` /
   `spawn_on()` and an independently driven runner. `recv(&mut self)` is a
   cancellation-safe single-consumer queue returning `Option`; receivers are no

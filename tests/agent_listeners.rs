@@ -260,7 +260,7 @@ async fn failed_preparation_releases_previously_prepared_listeners() {
 
 #[tokio::test]
 async fn unpolled_runner_drop_is_terminal_and_final_public_handle_stops_runner() {
-    let (agent, runner) = Agent::builder()
+    let (agent, runner, _) = Agent::builder()
         .bind("127.0.0.1:0")
         .prepare()
         .await
@@ -274,7 +274,7 @@ async fn unpolled_runner_drop_is_terminal_and_final_public_handle_stops_runner()
         .drain_mutations(Duration::from_millis(50))
         .await
         .unwrap();
-    let (agent, runner) = Agent::builder()
+    let (agent, runner, _) = Agent::builder()
         .listener(ListenerSource::tcp("127.0.0.1:0"))
         .prepare()
         .await

@@ -583,7 +583,7 @@ async fn selected_session_controls_retain_root_lifetime_without_driver_cycle() {
         .prepare()
         .await
         .unwrap();
-    let (agent, runner) = service.into_parts();
+    let (agent, runner, _) = service.into_parts();
     let root = agent.control();
     let task = tokio::spawn(runner.run());
     let mut stream = TcpStream::connect(agent.bound_addresses()[0].local_addr)

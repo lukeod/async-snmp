@@ -66,7 +66,7 @@ async fn start_agent_on(
         .prepare()
         .await
         .expect("agent should build");
-    let (agent, runner) = agent.into_parts();
+    let (agent, runner, _) = agent.into_parts();
     let control = agent.control();
     let addr = agent.bound_addresses()[0].local_addr;
     let run_task = tokio::spawn(runner.run());
@@ -545,7 +545,7 @@ async fn final_public_handle_drop_retains_tcp_mutation_until_commit_completes() 
     let started = Arc::new(Semaphore::new(0));
     let release = Arc::new(Semaphore::new(0));
     let committed = Arc::new(AtomicBool::new(false));
-    let (agent, runner) = Agent::builder()
+    let (agent, runner, _) = Agent::builder()
         .listener(async_snmp::ListenerSource::tcp("127.0.0.1:0"))
         .community(b"public")
         .allow_all_access()

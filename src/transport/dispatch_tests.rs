@@ -429,7 +429,7 @@ async fn role_closure_and_root_abort_propagate_to_their_own_scope() {
 #[tokio::test]
 async fn peer_and_endpoint_control_retain_service_after_root_handle_drop() {
     for retain_control in [false, true] {
-        let (agent, runner) = agent(b"retained-shared-endpoint")
+        let (agent, runner, _) = agent(b"retained-shared-endpoint")
             .prepare()
             .await
             .unwrap()
@@ -888,7 +888,7 @@ async fn command_only_proxy_uses_listener_endpoint_for_upstream_request() {
         .prepare()
         .await
         .unwrap();
-    let (agent, runner) = prepared.into_parts();
+    let (agent, runner, _) = prepared.into_parts();
     let upstream_client = client(
         &endpoint(&agent),
         upstream.bound_addresses()[0].local_addr,

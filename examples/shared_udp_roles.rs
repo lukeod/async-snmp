@@ -6,14 +6,17 @@ use async_snmp::{
 
 #[tokio::main]
 async fn main() -> async_snmp::Result<()> {
-    let mut collector = Agent::builder()
+    let (collector, runner, notifications) = Agent::builder()
         .bind("127.0.0.1:0")
         .community(b"public")
         .allow_all_access()
         .client_exchanges(true)
         .notifications(NotificationReceiver::builder().community("public"))
-        .spawn()
-        .await?;
+        .prepare()
+        .await?
+        .into_parts();
+    let mut notifications = notifications.unwrap();
+    let collector_task = tokio::spawn(runner.run());
     let collector_target = collector.bound_addresses()[0].local_addr;
     let device = Agent::builder()
         .bind("127.0.0.1:0")
@@ -26,7 +29,6 @@ async fn main() -> async_snmp::Result<()> {
         )
         .spawn()
         .await?;
-    let mut notifications = collector.take_notifications().unwrap();
     let collector_bound = collector.bound_addresses()[0];
     let device_bound = device.bound_addresses()[0];
     let collector_endpoint = collector.udp_endpoint(collector_bound.endpoint_id).unwrap();
@@ -50,7 +52,8 @@ async fn main() -> async_snmp::Result<()> {
     // Closing the consumer leaves commands and client exchanges active.
     notifications.close();
     poller.get(&engine_id).await?;
-    collector.shutdown().await?;
+    collector.control().request_shutdown();
+    collector_task.await.unwrap()?;
     device.shutdown().await?;
     Ok(())
 }
