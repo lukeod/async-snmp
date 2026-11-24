@@ -1408,18 +1408,17 @@ impl NotificationReceiverBuilder {
                 self.des_salt_state.take(),
             ),
         };
-        let capacity = listeners
-            .iter()
-            .map(|listener| listener.limits().receive.advertised())
-            .min()
-            .expect("at least one notification endpoint");
-        let capacity_registration = local_engine.register_receive_capacity(capacity);
+        let capacity_registration =
+            crate::transport::listener::PreparedListener::register_receive_capacities(
+                &listeners,
+                &local_engine,
+            );
         let enabled = self.client_exchanges;
         let engine = PreparedNotificationRole {
             local_engine,
             security_context,
             requires_policy: security_context_required,
-            capacity_registration: Some(capacity_registration),
+            capacity_registration,
         };
         let (receiver, processor, cleanup) = self.prepare_role(engine, network.clone())?;
         let roles = Arc::new(crate::transport::dispatch::DispatchRoles::new(
@@ -1479,7 +1478,6 @@ impl NotificationReceiverBuilder {
                 self.decode_config,
                 self.admission_policy,
             ),
-            _capacity_registration: engine.capacity_registration,
             #[cfg(test)]
             socket: network.udp.first().map(crate::UdpEndpoint::test_socket),
             #[cfg(test)]
@@ -1523,6 +1521,7 @@ impl NotificationReceiverBuilder {
                 delivery,
                 state,
                 pending,
+                capacity_registration: engine.capacity_registration,
             },
         ))
     }
@@ -1882,12 +1881,11 @@ struct PreparedNotificationRole {
     local_engine: crate::LocalEngine,
     security_context: crate::UsmSecurityContext,
     requires_policy: bool,
-    capacity_registration: Option<crate::v3::local::ReceiveCapacityRegistration>,
+    capacity_registration: Option<crate::ReceiveCapacityRegistration>,
 }
 
 struct ReceiverInner {
     protocol: NotificationProcessor,
-    _capacity_registration: Option<crate::v3::local::ReceiveCapacityRegistration>,
     max_processing: usize,
     active: std::sync::atomic::AtomicUsize,
     idle: tokio::sync::Notify,

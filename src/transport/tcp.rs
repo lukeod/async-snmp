@@ -319,7 +319,10 @@ impl TcpTransportBuilder {
             core: Arc::new(UdpCore::for_stream().with_observation(self.observation)),
             shutdown: CancellationToken::new(),
             complete: CancellationToken::new(),
-            admission: Mutex::new(true),
+            admission: Mutex::new(SessionAdmission {
+                open: true,
+                receive_capacity: None,
+            }),
             status: Mutex::new(TcpStatus::Prepared),
             terminal_error: Mutex::new(None),
             in_flight: Arc::new(Semaphore::new(self.options.max_in_flight)),
@@ -392,16 +395,26 @@ struct SessionState {
     core: Arc<UdpCore>,
     shutdown: CancellationToken,
     complete: CancellationToken,
-    admission: Mutex<bool>,
+    admission: Mutex<SessionAdmission>,
     status: Mutex<TcpStatus>,
     terminal_error: Mutex<Option<Arc<Error>>>,
     in_flight: Arc<Semaphore>,
     budget: Arc<BufferBudget>,
     ingress: Option<super::ingress::ApplicationIngress>,
 }
+
+struct SessionAdmission {
+    open: bool,
+    receive_capacity: Option<crate::ReceiveCapacityRegistration>,
+}
+
 impl SessionState {
     fn close(&self) {
-        *self.admission.lock().unwrap() = false;
+        {
+            let mut admission = self.admission.lock().unwrap();
+            admission.open = false;
+            drop(admission.receive_capacity.take());
+        }
         self.shutdown.cancel();
         self.core.close();
     }
@@ -423,9 +436,9 @@ impl SessionState {
     }
     fn fail(&self, error: Box<Error>) -> Box<Error> {
         let error: Arc<Error> = error.into();
-        *self.status.lock().unwrap() = TcpStatus::Failed(Arc::from(error.to_string()));
         *self.terminal_error.lock().unwrap() = Some(error.clone());
         self.close();
+        *self.status.lock().unwrap() = TcpStatus::Failed(Arc::from(error.to_string()));
         Error::SharedOperation { source: error }.boxed()
     }
 }
@@ -490,6 +503,13 @@ pub struct TcpRunner {
     transport: std::sync::Weak<TcpTransportInner>,
 }
 impl TcpRunner {
+    // A configured session can close independently of its supervising service.
+    pub(crate) fn register_receive_capacity(&self, engine: &crate::LocalEngine) {
+        let state = &self.cleanup.0;
+        state.admission.lock().unwrap().receive_capacity =
+            Some(engine.register_receive_capacity(state.receive_limits.advertised()));
+    }
+
     /// Drive complete-message reads and serialized writes until terminal shutdown.
     /// The runtime owning the socket registration must remain alive and driven.
     pub async fn run(self) -> Result<()> {
@@ -632,13 +652,6 @@ impl TcpTransport {
     pub(crate) fn configure_dispatch(&self, roles: Arc<super::dispatch::DispatchRoles>) {
         *self.inner.state.dispatch.lock().unwrap() = Some(roles);
     }
-    pub(crate) fn limits(&self) -> super::ProcessingLimits {
-        super::ProcessingLimits {
-            receive: self.receive_limits(),
-            send: self.send_capacity(),
-        }
-    }
-
     /// Configure a session from an outbound target or an owned stream.
     pub fn builder() -> TcpTransportBuilder {
         TcpTransportBuilder::new()
@@ -747,7 +760,7 @@ impl TcpTransport {
             let (complete, result) = oneshot::channel();
             {
                 let admission = state.admission.lock().unwrap();
-                if !*admission || state.shutdown.is_cancelled() {
+                if !admission.open || state.shutdown.is_cancelled() {
                     return Err(state.closed_error());
                 }
                 if Instant::now() >= deadline {
@@ -813,7 +826,7 @@ impl RequestTransport for TcpTransport {
                 .await?;
             let registration = {
                 let admission = state.admission.lock().unwrap();
-                if !*admission || state.shutdown.is_cancelled() {
+                if !admission.open || state.shutdown.is_cancelled() {
                     return Err(state.closed_error());
                 }
                 state.core.register(registration, state.target, true)?
@@ -1034,7 +1047,7 @@ async fn write_loop(
                 Err(_) => return Err(timeout_error(state.target, command.started.elapsed())),
             }
             let admission = state.admission.lock().unwrap();
-            if !*admission || state.shutdown.is_cancelled() {
+            if !admission.open || state.shutdown.is_cancelled() {
                 return Ok(());
             }
             if offset == 0 && command.cancelled.is_cancelled() {

@@ -326,9 +326,6 @@ mod tests {
         stats.unsupported_sec_levels.store(80, Ordering::Relaxed);
         stats.decryption_errors.store(90, Ordering::Relaxed);
         Arc::new(AgentState {
-            _capacity_registration: Some(
-                engine.register_receive_capacity(crate::UDP_RECEIVE_LIMITS.advertised()),
-            ),
             local_engine: engine,
             max_message_size: 1472,
             decode_config: crate::DecodeConfig::default(),
@@ -402,8 +399,6 @@ mod tests {
             None,
             None,
         );
-        state_mut._capacity_registration =
-            Some(engine.register_receive_capacity(crate::UDP_RECEIVE_LIMITS.advertised()));
         state_mut.local_engine = engine;
         let handler = SnmpEngineHandler { state };
 
@@ -421,6 +416,10 @@ mod tests {
         let handler = SnmpEngineHandler {
             state: test_state(),
         };
+        let _capacity = handler
+            .state
+            .local_engine
+            .register_receive_capacity(crate::UDP_RECEIVE_LIMITS.advertised());
         let ctx = test_ctx();
         let result = handler
             .get(&ctx, &oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0))
@@ -460,6 +459,10 @@ mod tests {
         let handler = SnmpEngineHandler {
             state: test_state(),
         };
+        let _capacity = handler
+            .state
+            .local_engine
+            .register_receive_capacity(crate::UDP_RECEIVE_LIMITS.advertised());
         let ctx = test_ctx();
         let prefix = oid!(1, 3, 6, 1, 6, 3, 10, 2, 1);
 

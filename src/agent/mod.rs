@@ -204,12 +204,14 @@ use crate::handler::{
     GetNextResult, GetResult, HandlerResult, MibHandler, RequestContext, RequestLifecycle,
     RequestTaskPhase,
 };
-use crate::message_size::{MessageSize, UDP_RECEIVE_LIMITS};
+#[cfg(test)]
+use crate::message_size::UDP_RECEIVE_LIMITS;
 use crate::oid;
 use crate::oid::Oid;
 #[cfg(test)]
 use crate::pdu::NotificationPdu;
 use crate::pdu::{Pdu, PduBody, PduType, ResponsePdu};
+use crate::transport::listener::PreparedListener;
 use crate::transport::normalize_udp_target;
 #[cfg(test)]
 use crate::transport::udp_error::UdpRecvErrorBackoff;
@@ -615,7 +617,6 @@ struct ValidatedAgentBuilder {
     local_engine: Option<crate::LocalEngine>,
     handlers: Vec<RegisteredHandler>,
     max_message_size: usize,
-    engine_receive_capacity: MessageSize,
     decode_config: crate::DecodeConfig,
     concurrency_limit: Arc<Semaphore>,
     recv_buffer_size: Option<usize>,
@@ -1472,9 +1473,7 @@ impl AgentBuilder {
         for (index, sink) in config.trap_sinks.into_iter().enumerate() {
             let peer = match sink.transport {
                 NotificationTarget::SharedUdp { listener, .. } => {
-                    let Some(crate::transport::listener::PreparedListener::Udp {
-                        endpoint, ..
-                    }) = listeners
+                    let Some(PreparedListener::Udp { endpoint, .. }) = listeners
                         .get(listener)
                         .filter(|_| listener < shared_listener_count)
                     else {
@@ -1515,7 +1514,7 @@ impl AgentBuilder {
                     )
                     .await?;
                     let peer = endpoint.handle(dest)?;
-                    listeners.push(crate::transport::listener::PreparedListener::Udp {
+                    listeners.push(PreparedListener::Udp {
                         bound: crate::BoundListener {
                             endpoint_id: endpoint.endpoint_id(),
                             transport: crate::TransportKind::Udp,
@@ -1537,7 +1536,7 @@ impl AgentBuilder {
                         .await?
                         .into_parts();
                     let peer = transport.clone();
-                    listeners.push(crate::transport::listener::PreparedListener::Session {
+                    listeners.push(PreparedListener::Session {
                         bound: crate::BoundListener {
                             endpoint_id: transport.endpoint_id(),
                             transport: crate::TransportKind::Tcp,
@@ -1560,16 +1559,6 @@ impl AgentBuilder {
                 config.inform_retry.clone(),
             ));
         }
-        config.engine_receive_capacity = listeners
-            .iter()
-            .map(|listener| listener.limits().receive.advertised())
-            .chain(
-                trap_sinks
-                    .iter()
-                    .map(|sink| sink.summary.receive_limits().advertised()),
-            )
-            .min()
-            .expect("at least one endpoint");
         let network = Arc::new(AgentNetwork::new(
             &listeners,
             config.max_connections,
@@ -1609,11 +1598,10 @@ impl AgentBuilder {
         };
         construction.check(ConstructionStage::Prepare, None, None)?;
         let capacity_registration =
-            local_engine.register_receive_capacity(config.engine_receive_capacity);
+            PreparedListener::register_receive_capacities(&listeners, &local_engine);
         let inner = command::prepare_application(command::ApplicationConfig {
             local_engine,
             security_context,
-            capacity_registration: Some(capacity_registration),
             communities: config.communities,
             handlers: config.handlers,
             security_context_required: config.security_context_required,
@@ -1679,7 +1667,8 @@ impl AgentBuilder {
                 listener.configure_dispatch(listener_roles.clone());
             }
         }
-        let mut runner = AgentRunner::new(inner, network, listeners, receiver);
+        let mut runner =
+            AgentRunner::new(inner, network, listeners, receiver, capacity_registration);
         runner.notification_role = notification_role;
         Ok(PreparedAgent {
             agent,
@@ -1761,7 +1750,6 @@ impl AgentBuilder {
             return Err(Error::Config("overload timeout must be nonzero".into()).boxed());
         }
         crate::transport::checked_deadline(self.overload_timeout, "listener overload timeout")?;
-        let engine_receive_capacity = UDP_RECEIVE_LIMITS.advertised();
         if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
             return Err(Error::Config(
                 "max_message_size exceeds the SNMP size range"
@@ -1902,7 +1890,6 @@ impl AgentBuilder {
             local_engine: self.local_engine,
             handlers: self.handlers,
             max_message_size: self.max_message_size,
-            engine_receive_capacity,
             decode_config: self.decode_config,
             concurrency_limit,
             recv_buffer_size: self.recv_buffer_size,
@@ -2071,7 +2058,6 @@ impl Default for AgentBuilder {
 /// Engine state and counters shared across agent clones and (future) built-in handlers.
 pub(crate) struct AgentState {
     pub(crate) local_engine: crate::LocalEngine,
-    _capacity_registration: Option<crate::v3::ReceiveCapacityRegistration>,
     pub(crate) max_message_size: usize,
     pub(crate) decode_config: crate::DecodeConfig,
 }

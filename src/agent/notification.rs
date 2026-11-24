@@ -46,7 +46,8 @@ pub enum NotificationTarget {
     },
     /// Prepare an originator-initiated or supplied connected TCP session.
     Tcp(crate::TcpTransportBuilder),
-    /// Select this exact existing peer. Its service remains independently owned.
+    /// Select this exact existing peer. Its owner accounts for receive capacity
+    /// when the peer serves the Agent's engine.
     Peer(BuiltinTransport),
 }
 impl NotificationTarget {
@@ -78,6 +79,8 @@ impl NotificationTarget {
     /// Select an existing UDP peer or exact TCP session without opening a connection.
     /// The peer retains its own service lifetime and requires its runner to be driven.
     /// Shared application services must have client exchanges enabled for Informs.
+    /// When using the Agent's [`crate::LocalEngine`], the endpoint owner declares
+    /// the endpoint's receive capacity on that engine.
     /// Closed peers fail delivery without reconnection or transport fallback.
     pub fn peer(peer: impl Into<BuiltinTransport>) -> Self {
         Self::Peer(peer.into())
@@ -416,7 +419,7 @@ impl TrapSink {
             ..ClientConfig::default()
         };
 
-        let client = Client::new(self.peer.clone(), config)?;
+        let client = Client::for_notification_sink(self.peer.clone(), config)?;
         *guard = Some(client.clone());
         Ok(client)
     }
@@ -1043,9 +1046,11 @@ impl super::Agent {
     /// the selected peer's service lifetime. Its sink index is zero.
     ///
     /// Enable `client_exchanges(true)` when preparing a shared service used for
-    /// Inform acknowledgements. SNMPv3 requires this Agent's prepared authoritative
-    /// engine. AES privacy additionally requires an AES user or configured sink
-    /// during preparation, and DES/3DES requires durable `des_salt_state`.
+    /// Inform acknowledgements. The endpoint owner declares its receive capacity
+    /// when it shares the Agent's [`crate::LocalEngine`]. SNMPv3 requires this
+    /// Agent's prepared authoritative engine. AES privacy additionally requires an
+    /// AES user or configured sink during preparation, and DES/3DES requires
+    /// durable `des_salt_state`.
     /// Credentials are validated here; no transport I/O or background task starts.
     pub fn notification_peer(
         &self,

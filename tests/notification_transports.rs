@@ -343,14 +343,17 @@ async fn runner_abort_wakes_pending_informs_and_blocks_external_peer_traps() {
     let target = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let external = UdpEndpoint::builder()
         .bind("127.0.0.1:0")
+        .receive_capacity(8192)
         .spawn()
         .await
         .unwrap();
+    let peer = external.handle(target.local_addr().unwrap()).unwrap();
+    let receive_capacity = peer.receive_limits().advertised();
     let prepared = Agent::builder()
         .bind("127.0.0.1:0")
         .notification_sink(
             id("external"),
-            NotificationTarget::peer(external.handle(target.local_addr().unwrap()).unwrap()),
+            NotificationTarget::peer(peer),
             Auth::v2c("public"),
         )
         .inform_timeout(Duration::from_secs(60))
@@ -359,6 +362,11 @@ async fn runner_abort_wakes_pending_informs_and_blocks_external_peer_traps() {
         .await
         .unwrap();
     let (agent, runner) = prepared.into_parts();
+    let engine = agent.local_engine();
+    assert_eq!(
+        engine.receive_capacity(),
+        Some(async_snmp::UDP_RECEIVE_LIMITS.advertised())
+    );
     let task = tokio::spawn(runner.run());
     let cloned = agent.clone();
     let pending = tokio::spawn(async move { cloned.send_inform(&cold(), 0, vec![]).await });
@@ -366,8 +374,16 @@ async fn runner_abort_wakes_pending_informs_and_blocks_external_peer_traps() {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        engine.receive_capacity(),
+        Some(async_snmp::UDP_RECEIVE_LIMITS.advertised())
+    );
+    let registration = engine.register_receive_capacity(receive_capacity);
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(engine.receive_capacity(), Some(receive_capacity));
+    drop(registration);
+    assert_eq!(engine.receive_capacity(), None);
     let result = tokio::time::timeout(WAIT, pending).await.unwrap().unwrap();
     assert!(!result.all_succeeded());
     assert!(!agent.send_trap(&cold(), 0, vec![]).await.all_succeeded());

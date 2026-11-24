@@ -166,6 +166,7 @@ pub(crate) struct RunnerCleanup {
     pub(super) delivery: Arc<Delivery>,
     pub(super) state: Arc<ServiceState>,
     pub(super) pending: Arc<pending::PendingRegistry>,
+    pub(super) capacity_registration: Option<crate::ReceiveCapacityRegistration>,
 }
 impl RunnerCleanup {
     pub(crate) fn stop_admission(&self) {
@@ -177,9 +178,10 @@ impl RunnerCleanup {
             *self.state.status.lock().unwrap() = NotificationStatus::Running;
         }
     }
-    pub(crate) fn finished(&self, result: &Result<()>) {
+    pub(crate) fn finished(&mut self, result: &Result<()>) {
         self.pending.shutdown();
         self.delivery.finish();
+        drop(self.capacity_registration.take());
         *self.state.status.lock().unwrap() = match result {
             Ok(()) => NotificationStatus::Stopped,
             Err(error) => NotificationStatus::Failed(error.to_string().into()),
@@ -192,6 +194,7 @@ impl Drop for RunnerCleanup {
         self.pending.shutdown();
         self.delivery.finish();
         self.state.shutdown.cancel();
+        drop(self.capacity_registration.take());
         let mut status = self.state.status.lock().unwrap();
         if !matches!(
             *status,
@@ -486,11 +489,12 @@ impl NotificationRunner {
     /// acknowledgements and drains admitted automatic response attempts before
     /// closing session writers. Queued events remain available after shutdown.
     pub async fn run(self) -> Result<()> {
+        // On cancellation, drop the network before publishing runner completion.
         let Self {
+            mut cleanup,
             network,
             listeners,
             processor,
-            cleanup,
         } = self;
         cleanup.started();
         let mut children = tokio::task::JoinSet::new();

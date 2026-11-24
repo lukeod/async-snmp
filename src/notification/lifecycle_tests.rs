@@ -658,9 +658,12 @@ async fn tcp_shutdown_drains_reserved_acknowledgement_and_abort_terminates_route
         let inform =
             tokio::spawn(async move { client.send_inform(&oids::cold_start(), 1, vec![]).await });
         processing_started(&receiver).await;
+        let engine = receiver.local_engine();
+        let capacity = engine.receive_capacity().unwrap();
         if abort {
             driver.abort();
             assert!(driver.await.is_err());
+            assert_eq!(engine.receive_capacity(), None);
             gate.add_permits(1);
             assert!(inform.await.unwrap().is_err());
             assert!(receiver.recv().await.is_none());
@@ -670,9 +673,11 @@ async fn tcp_shutdown_drains_reserved_acknowledgement_and_abort_terminates_route
             receiver.close();
             tokio::task::yield_now().await;
             assert!(!driver.is_finished());
+            assert_eq!(engine.receive_capacity(), Some(capacity));
             gate.add_permits(1);
             inform.await.unwrap().unwrap();
             driver.await.unwrap().unwrap();
+            assert_eq!(engine.receive_capacity(), None);
             assert!(matches!(
                 receiver.recv().await.unwrap().inform_ack,
                 crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)

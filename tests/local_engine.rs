@@ -8,12 +8,13 @@ use std::time::Duration;
 use async_snmp::message::{MsgFlags, MsgGlobalData, ScopedPdu, V3Message};
 use async_snmp::v3::UsmSecurityParams;
 use async_snmp::{
-    Agent, Auth, AuthoritativeEngine, Client, Error, ListenerSource, LocalEngine, MessageSize,
-    NotificationReceiver, RequestPdu, Retry, SecurityLevel, TcpListenerSource, TcpOptions, Value,
-    Version, oid,
+    Agent, AgentStatus, Auth, AuthoritativeEngine, Client, Error, ListenerSource, LocalEngine,
+    MessageSize, NotificationReceiver, NotificationSinkId, NotificationStatus, NotificationTarget,
+    RequestPdu, Retry, SecurityLevel, TcpListenerSource, TcpOptions, TcpTransport, Value, Version,
+    oid,
 };
 use bytes::Bytes;
-use tokio::net::UdpSocket;
+use tokio::net::{TcpListener, UdpSocket};
 
 const WAIT: Duration = Duration::from_secs(3);
 
@@ -140,9 +141,196 @@ async fn shared_engine_mib_uses_minimum_across_independent_service_lifetimes() {
         clients.push(client);
     }
     drop(clients);
-    small.shutdown().await.unwrap();
+    let small_control = small.control();
+    small_control.shutdown().await;
+    assert_eq!(small_control.status(), AgentStatus::Stopped);
     assert_eq!(engine.receive_capacity().unwrap().as_usize(), 32768);
+    small.join().await.unwrap();
+    assert_eq!(small_control.status(), AgentStatus::Stopped);
     large.shutdown().await.unwrap();
+    assert_eq!(engine.receive_capacity(), None);
+}
+
+#[tokio::test]
+async fn receiver_shutdown_unregisters_capacity_with_queued_notification() {
+    let engine = LocalEngine::new(
+        AuthoritativeEngine::install(b"receiver-capacity-engine".as_slice(), |_| {
+            Ok::<_, Infallible>(())
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let agent = Agent::builder()
+        .local_engine(engine.clone())
+        .listener(tcp_source(32768))
+        .spawn()
+        .await
+        .unwrap();
+    let mut receiver = NotificationReceiver::builder()
+        .local_engine(engine.clone())
+        .listener(tcp_source(8192))
+        .spawn()
+        .await
+        .unwrap();
+    let control = receiver.control();
+    let client = Client::builder(
+        receiver.bound_addresses()[0].local_addr.to_string(),
+        Auth::v2c("public"),
+    )
+    .retry(Retry::none())
+    .request_timeout(WAIT)
+    .connect_tcp()
+    .await
+    .unwrap();
+    client
+        .send_inform(&async_snmp::notification::oids::cold_start(), 0, vec![])
+        .await
+        .unwrap();
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 8192);
+
+    control.shutdown().await;
+    assert_eq!(control.status(), NotificationStatus::Stopped);
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 32768);
+    receiver.join().await.unwrap();
+    assert!(receiver.recv().await.is_some());
+    assert!(receiver.recv().await.is_none());
+
+    agent.shutdown().await.unwrap();
+    assert_eq!(engine.receive_capacity(), None);
+}
+
+#[tokio::test]
+async fn closed_tcp_sink_unregisters_capacity_even_after_inform_exchange() {
+    let engine = LocalEngine::new(
+        AuthoritativeEngine::install(b"tcp-sink-capacity-engine".as_slice(), |_| {
+            Ok::<_, Infallible>(())
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let mut receiver = NotificationReceiver::builder()
+        .listener(tcp_source(32768))
+        .spawn()
+        .await
+        .unwrap();
+    let agent = Agent::builder()
+        .local_engine(engine.clone())
+        .community("public")
+        .allow_all_access()
+        .listener(tcp_source(32768))
+        .notification_sink(
+            NotificationSinkId::new("tcp").unwrap(),
+            NotificationTarget::tcp(
+                TcpTransport::builder()
+                    .target(receiver.bound_addresses()[0].local_addr)
+                    .max_message_size(8192),
+            ),
+            Auth::v2c("public"),
+        )
+        .inform_retry(Retry::none())
+        .inform_timeout(WAIT)
+        .spawn()
+        .await
+        .unwrap();
+    let session = agent.tcp_sessions().pop().unwrap();
+    let control = agent.control();
+    let inform = agent
+        .send_inform(&async_snmp::notification::oids::cold_start(), 0, vec![])
+        .await;
+    assert!(inform.all_succeeded(), "{inform:?}");
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 8192);
+
+    session.control().shutdown().await;
+    assert_eq!(control.status(), AgentStatus::Running);
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 32768);
+    let client = Client::builder(
+        agent.bound_addresses()[0].local_addr.to_string(),
+        Auth::v2c("public"),
+    )
+    .retry(Retry::none())
+    .request_timeout(WAIT)
+    .connect_tcp()
+    .await
+    .unwrap();
+    let response = client
+        .get(&oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 4, 0))
+        .await
+        .unwrap();
+    assert_eq!(response.varbinds[0].value, Value::Integer(32768));
+
+    agent.shutdown().await.unwrap();
+    assert_eq!(control.status(), AgentStatus::Stopped);
+    assert_eq!(engine.receive_capacity(), None);
+    receiver.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn receiver_unregisters_configured_session_capacity_on_peer_eof() {
+    let engine = LocalEngine::new(
+        AuthoritativeEngine::install(b"receiver-session-capacity".as_slice(), |_| {
+            Ok::<_, Infallible>(())
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut receiver = NotificationReceiver::builder()
+        .local_engine(engine.clone())
+        .listener(tcp_source(32768))
+        .session(
+            TcpTransport::builder()
+                .target(peer.local_addr().unwrap())
+                .max_message_size(8192),
+        )
+        .spawn()
+        .await
+        .unwrap();
+    let session = receiver.tcp_sessions().pop().unwrap();
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 8192);
+
+    let (stream, _) = peer.accept().await.unwrap();
+    drop(stream);
+    tokio::time::timeout(WAIT, session.control().wait_closed())
+        .await
+        .unwrap();
+    assert_eq!(receiver.control().status(), NotificationStatus::Running);
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 32768);
+
+    receiver.shutdown().await.unwrap();
+    assert_eq!(engine.receive_capacity(), None);
+}
+
+#[tokio::test]
+async fn dropping_unstarted_runners_unregisters_capacity_with_live_handles() {
+    let engine = LocalEngine::new(
+        AuthoritativeEngine::install(b"prepared-capacity-engine".as_slice(), |_| {
+            Ok::<_, Infallible>(())
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    let (agent, agent_runner) = Agent::builder()
+        .local_engine(engine.clone())
+        .listener(tcp_source(32768))
+        .prepare()
+        .await
+        .unwrap()
+        .into_parts();
+    let (receiver, notification_runner) = NotificationReceiver::builder()
+        .local_engine(engine.clone())
+        .listener(tcp_source(8192))
+        .prepare()
+        .await
+        .unwrap()
+        .into_parts();
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 8192);
+
+    drop(notification_runner);
+    assert_eq!(receiver.control().status(), NotificationStatus::Interrupted);
+    assert_eq!(engine.receive_capacity().unwrap().as_usize(), 32768);
+
+    drop(agent_runner);
+    assert_eq!(agent.control().status(), AgentStatus::Interrupted);
     assert_eq!(engine.receive_capacity(), None);
 }
 

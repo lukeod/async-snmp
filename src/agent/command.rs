@@ -170,7 +170,6 @@ impl CommandProcessorBuilder {
             local_engine,
             security_context: self.security_context.unwrap_or_default(),
             security_context_required: has_security_context,
-            capacity_registration: None,
             communities: self.communities,
             handlers: self.handlers,
             authorization: self.authorization,
@@ -532,7 +531,6 @@ pub(super) struct ApplicationConfig {
     pub local_engine: crate::LocalEngine,
     pub security_context: crate::UsmSecurityContext,
     pub security_context_required: bool,
-    pub capacity_registration: Option<crate::ReceiveCapacityRegistration>,
     pub communities: Vec<crate::Community>,
     pub handlers: Vec<RegisteredHandler>,
     pub authorization: AgentAuthorization,
@@ -555,10 +553,8 @@ pub(super) struct ApplicationConfig {
 pub(super) fn prepare_application(mut config: ApplicationConfig) -> Arc<AgentInner> {
     let local_engine = config.local_engine;
     let security_context = config.security_context;
-    let capacity_registration = config.capacity_registration;
     let state = Arc::new(AgentState {
         local_engine,
-        _capacity_registration: capacity_registration,
         max_message_size: config.max_message_size,
         decode_config: config.decode_config,
     });

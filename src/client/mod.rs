@@ -633,7 +633,7 @@ impl<T: RequestTransport> Client<T> {
     /// [`Error::RandomSource`] when an `authPriv` client cannot initialize its
     /// privacy salt.
     pub fn new(transport: T, config: ClientConfig) -> Result<Self> {
-        Self::with_optional_engine_cache(transport, config, None)
+        Self::with_optional_engine_cache(transport, config, None, true)
     }
 
     /// Create an SNMPv3 client with a shared engine cache.
@@ -650,13 +650,20 @@ impl<T: RequestTransport> Client<T> {
         config: ClientConfig,
         engine_cache: Arc<EngineCache>,
     ) -> Result<Self> {
-        Self::with_optional_engine_cache(transport, config, Some(engine_cache))
+        Self::with_optional_engine_cache(transport, config, Some(engine_cache), true)
+    }
+
+    #[cfg(feature = "agent")]
+    pub(crate) fn for_notification_sink(transport: T, config: ClientConfig) -> Result<Self> {
+        // The endpoint owner accounts for receive capacity independently of this client.
+        Self::with_optional_engine_cache(transport, config, None, false)
     }
 
     fn with_optional_engine_cache(
         transport: T,
         mut config: ClientConfig,
         engine_cache: Option<Arc<EngineCache>>,
+        register_receive_capacity: bool,
     ) -> Result<Self> {
         config.validate_and_precompute()?;
         if let Some(authoritative) = config.local_authoritative_engine.take() {
@@ -688,9 +695,13 @@ impl<T: RequestTransport> Client<T> {
             || Arc::new(DiscoveryCoordinator::new()),
             |cache| Arc::clone(&cache.discovery_coordinator),
         );
-        let capacity_registration = config.local_engine.as_ref().map(|engine| {
-            engine.register_receive_capacity(transport.receive_limits().advertised())
-        });
+        let capacity_registration = if register_receive_capacity {
+            config.local_engine.as_ref().map(|engine| {
+                engine.register_receive_capacity(transport.receive_limits().advertised())
+            })
+        } else {
+            None
+        };
         Ok(Self {
             inner: Arc::new(ClientInner {
                 transport,

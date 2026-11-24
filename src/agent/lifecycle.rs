@@ -1,7 +1,6 @@
 //! Agent execution and network ownership, separate from retained mutation work.
 use super::*;
 use crate::transport::ingress::InboundWork;
-use crate::transport::listener::PreparedListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::DropGuard;
@@ -205,21 +204,23 @@ impl RunningAgent {
 struct AgentRunCleanup {
     inner: Arc<AgentInner>,
     network: Arc<AgentNetwork>,
-    completed: bool,
+    capacity_registration: Option<crate::ReceiveCapacityRegistration>,
+    terminal_status: Option<AgentStatus>,
 }
 impl Drop for AgentRunCleanup {
     fn drop(&mut self) {
         self.inner.cancel.cancel();
         self.network.close_endpoints();
-        self.inner
-            .run_orphaned
-            .store(!self.completed, Ordering::Release);
-        if self.inner.active_request_tasks.load(Ordering::Acquire) == 0 {
+        drop(self.capacity_registration.take());
+        let completed = self.terminal_status.is_some();
+        self.inner.run_orphaned.store(!completed, Ordering::Release);
+        if completed || self.inner.active_request_tasks.load(Ordering::Acquire) == 0 {
             self.inner.run_active.store(false, Ordering::Release);
         }
-        if !self.completed {
-            *self.network.status.lock().unwrap() = AgentStatus::Interrupted;
-        }
+        *self.network.status.lock().unwrap() = self
+            .terminal_status
+            .take()
+            .unwrap_or(AgentStatus::Interrupted);
         self.network.complete.cancel();
         self.inner.task_changed.notify_waiters();
     }
@@ -244,6 +245,7 @@ impl AgentRunner {
         network: Arc<AgentNetwork>,
         listeners: Vec<PreparedListener>,
         incoming: mpsc::Receiver<InboundWork>,
+        capacity_registration: Option<crate::ReceiveCapacityRegistration>,
     ) -> Self {
         Self {
             notification_role: None,
@@ -255,7 +257,8 @@ impl AgentRunner {
             cleanup: AgentRunCleanup {
                 inner,
                 network,
-                completed: false,
+                capacity_registration,
+                terminal_status: None,
             },
         }
     }
@@ -339,22 +342,17 @@ impl AgentRunner {
         while let Some(joined) = requests.join_next().await {
             log_request_result(Some(joined));
         }
-        if let Some((processor, role)) = &self.notification_role {
+        if let Some((processor, role)) = &mut self.notification_role {
             processor.drain().await;
             role.finished(&result);
         }
         self.cleanup.network.close_endpoints();
         children.abort_all();
         while children.join_next().await.is_some() {}
-        self.cleanup.completed = true;
-        self.processor
-            .inner
-            .run_active
-            .store(false, Ordering::Release);
-        *self.cleanup.network.status.lock().unwrap() = match &result {
+        self.cleanup.terminal_status = Some(match &result {
             Ok(()) => AgentStatus::Stopped,
             Err(error) => AgentStatus::Failed(error.to_string().into()),
-        };
+        });
         result
     }
     fn dispatch(&self, requests: &mut RequestTasks, work: InboundWork) {

@@ -376,11 +376,12 @@ impl LocalEngine {
     }
 
     /// Minimum advertised receive capacity of declared endpoints and retained
-    /// processing inputs. Client registrations remain until their last clone
-    /// is dropped; admitted commands retain their input capacity through cleanup.
-    /// Returns `None` while neither endpoints nor processing inputs remain.
-    /// Per-message v3
-    /// advertisement continues to use the receiving endpoint's own capacity.
+    /// processing inputs. Managed listener registrations remain through runner
+    /// drain. Configured TCP sessions unregister when they close. Client
+    /// registrations remain until their last clone is dropped.
+    /// Caller-owned command processing retains admitted input capacity through
+    /// cleanup. Returns `None` while no registrations remain. Per-message v3
+    /// advertisement uses the receiving endpoint's own capacity.
     pub fn receive_capacity(&self) -> Option<MessageSize> {
         self.inner
             .capacities

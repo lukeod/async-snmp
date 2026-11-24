@@ -1,7 +1,5 @@
 //! Concrete listener sources, with preparation independent of execution.
-use super::{
-    ProcessingLimits, TcpOptions, TransportKind, UdpEndpoint, UdpEndpointBuilder, UdpRunner,
-};
+use super::{TcpOptions, TransportKind, UdpEndpoint, UdpEndpointBuilder, UdpRunner};
 use crate::{EndpointId, Error, RequestTransport, Result};
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, UdpSocket};
@@ -217,14 +215,27 @@ impl PreparedListener {
             }
         }
     }
-    pub(crate) fn limits(&self) -> ProcessingLimits {
-        match self {
-            Self::Udp { endpoint, .. } => endpoint.limits(),
-            Self::Session { transport, .. } => transport.limits(),
-            Self::Tcp { options, .. } => ProcessingLimits {
-                receive: crate::ReceiveLimits::tcp(options.max_message_size).expect("validated"),
-                send: options.send_capacity,
-            },
-        }
+    /// Configured sessions unregister on close. Root runners retain their UDP
+    /// and TCP listener minimum through service drain.
+    pub(crate) fn register_receive_capacities(
+        listeners: &[Self],
+        engine: &crate::LocalEngine,
+    ) -> Option<crate::ReceiveCapacityRegistration> {
+        listeners
+            .iter()
+            .filter_map(|listener| match listener {
+                Self::Udp { endpoint, .. } => Some(endpoint.limits().receive.advertised()),
+                Self::Tcp { options, .. } => Some(
+                    crate::ReceiveLimits::tcp(options.max_message_size)
+                        .expect("validated")
+                        .advertised(),
+                ),
+                Self::Session { runner, .. } => {
+                    runner.register_receive_capacity(engine);
+                    None
+                }
+            })
+            .min()
+            .map(|capacity| engine.register_receive_capacity(capacity))
     }
 }
