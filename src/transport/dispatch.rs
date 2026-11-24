@@ -133,6 +133,7 @@ impl DispatchRoles {
                 community_pdu_class(&message, envelope),
                 Ok(Some(PduType::Response | PduType::Report))
             ) {
+                core.note_discarded();
                 message.observe(super::MessageDisposition::Unmatched);
             } else {
                 commands.deliver_udp(message);
@@ -215,6 +216,7 @@ impl DispatchRoles {
                 if let Some(registration) = registration {
                     core.deliver_candidate(registration, message.into_packet(), buffers);
                 } else {
+                    core.note_discarded();
                     message.observe(super::MessageDisposition::Unmatched);
                 }
                 return;

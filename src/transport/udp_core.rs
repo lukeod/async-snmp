@@ -826,6 +826,13 @@ impl UdpCore {
         })
     }
 
+    /// Record a response discarded by dispatch before delivery.
+    pub(crate) fn note_discarded(&self) {
+        self.stats
+            .discarded_datagrams
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Record a datagram from which no request ID could be extracted.
     pub(crate) fn note_malformed(&self) {
         self.stats

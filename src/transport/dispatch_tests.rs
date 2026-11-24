@@ -153,6 +153,7 @@ async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses
             core.clone(),
             &mut tasks,
         );
+        assert_eq!(core.stats().discarded_datagrams, 1);
         assert!(receiver.try_recv().is_err());
         disabled.cancel();
         drop(work);
@@ -304,12 +305,81 @@ async fn colliding_community_ids_deliver_each_role_for_same_and_distinct_peers()
             Some(41)
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(endpoint.stats().discarded_datagrams, 0);
         peer.send_to(&community(crate::Pdu::response(41, 0, 0, vec![])), source)
             .await
             .unwrap();
         request.await.unwrap().unwrap();
         assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_udp_counts_discarded_responses_without_consuming_request() {
+    let (observer, mut observations) = TransportObserver::channel(16).unwrap();
+    let service = Agent::builder()
+        .client_exchanges(true)
+        .listener(crate::ListenerSource::Udp(
+            UdpEndpoint::builder()
+                .bind("127.0.0.1:0")
+                .observer(observer),
+        ))
+        .spawn()
+        .await
+        .unwrap();
+    let endpoint = endpoint(&service);
+    let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let other = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let handle = endpoint
+        .handle(peer.local_addr().unwrap())
+        .unwrap()
+        .strict_source(true);
+    let pending = tokio::spawn(async move {
+        handle
+            .request_with(
+                community(crate::Pdu::get_request(41, &[get_oid()])),
+                registration(41),
+                |packet| Ok(Candidate::Accept(packet.into_parts().0)),
+            )
+            .await
+    });
+    let (_, source) = receive(&peer).await;
+    let response = community(crate::Pdu::response(41, 0, 0, vec![]));
+    let wrong_community = CommunityMessage::v2c("other", crate::Pdu::response(41, 0, 0, vec![]))
+        .unwrap()
+        .encode()
+        .unwrap();
+
+    for (index, (sender, bytes)) in [(&other, &response), (&peer, &wrong_community)]
+        .into_iter()
+        .enumerate()
+    {
+        sender.send_to(bytes, source).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(event) = observations.recv().await {
+                if matches!(event, ObservationEvent::Disposition {
+                    info,
+                    disposition: MessageDisposition::Unmatched,
+                    ..
+                } if info.peer_addr() == sender.local_addr().unwrap())
+                {
+                    return;
+                }
+            }
+            panic!("observation channel closed before response disposition");
+        })
+        .await
+        .unwrap();
+        assert_eq!(endpoint.stats().discarded_datagrams, index as u64 + 1);
+        assert_eq!(endpoint.stats().correlated_datagrams, 0);
+        assert!(!pending.is_finished());
+    }
+
+    peer.send_to(&response, source).await.unwrap();
+    assert_eq!(pending.await.unwrap().unwrap(), response);
+    assert_eq!(endpoint.stats().discarded_datagrams, 2);
+    assert_eq!(endpoint.stats().correlated_datagrams, 1);
     service.shutdown().await.unwrap();
 }
 
