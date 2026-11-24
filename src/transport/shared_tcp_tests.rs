@@ -369,6 +369,50 @@ async fn collision_rejection_and_identical_ids_are_session_scoped() {
 }
 
 #[tokio::test]
+async fn complete_shared_tcp_response_precedes_framing_failure() {
+    let service = agent(b"tcp-final-response")
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .spawn()
+        .await
+        .unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let session = accepted(&service).await;
+    let request = |id| {
+        let session = session.clone();
+        tokio::spawn(async move {
+            session
+                .request_with(
+                    community(crate::Pdu::get_request(id, &[oid()])),
+                    registration(id),
+                    |packet| Ok(Candidate::Accept(packet.into_parts().0)),
+                )
+                .await
+        })
+    };
+    let completed = request(41);
+    let unanswered = request(42);
+    read(&mut stream).await;
+    read(&mut stream).await;
+
+    let response = community(crate::Pdu::response(41, 0, 0, vec![]));
+    // Coalesce the invalid header with the complete response so the
+    // current-thread TCP reader can encounter it before dispatch runs.
+    let mut wire = response.to_vec();
+    wire.extend_from_slice(&[0x30, 0x80]);
+    stream.write_all(&wire).await.unwrap();
+
+    assert_eq!(completed.await.unwrap().unwrap(), response);
+    let error = unanswered.await.unwrap().unwrap_err();
+    assert!(
+        matches!(error.exchange_source(), crate::Error::Decode(error)
+        if error.offset == 1 && error.kind == crate::DecodeErrorKind::IndefiniteLength)
+    );
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn full_shared_notification_queue_closes_session_and_fails_pending_with_identity() {
     let mut service = NotificationReceiver::builder()
         .listener(ListenerSource::tcp("127.0.0.1:0"))

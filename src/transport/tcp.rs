@@ -820,7 +820,7 @@ impl RequestTransport for TcpTransport {
             };
             self.write_before(data, deadline).await?;
             // The core offers queued complete responses before closure, permitting a
-            // final response followed immediately by peer EOF to complete normally.
+            // final response followed immediately by EOF or a read failure to complete.
             let result = state
                 .core
                 .wait_for_response_with(&registration, state.target, validate)
@@ -919,17 +919,18 @@ async fn read_loop(
         });
         sender
     });
-    loop {
+    let read_result = loop {
         let frame = tokio::select! { biased;
             joined = workers.join_next(), if !workers.is_empty() => return dispatch_result(joined),
-            frame = framer.next(&mut read, state.target) => frame?,
+            frame = framer.next(&mut read, state.target) => frame,
         };
-        let Some(super::framing::ReceivedFrame {
+        let super::framing::ReceivedFrame {
             bytes: frame,
             permit,
-        }) = frame
-        else {
-            break;
+        } = match frame {
+            Ok(Some(frame)) => frame,
+            Ok(None) => break Ok(()),
+            Err(error) => break Err(error),
         };
         let info = crate::ReceivedMessageInfo::tcp(
             state.endpoint_id,
@@ -971,13 +972,14 @@ async fn read_loop(
                 .disposition(info, super::MessageDisposition::Malformed);
             state.core.note_malformed();
         }
-    }
+    };
+    // Let already-read responses enter their exchange queues before reporting
+    // EOF or a framing failure and closing those queues.
     drop(dispatch);
-    if !workers.is_empty() {
-        dispatch_result(workers.join_next().await)?;
+    if workers.is_empty() {
+        return read_result;
     }
-
-    Ok(())
+    read_result.and(dispatch_result(workers.join_next().await))
 }
 
 fn dispatch_result(
