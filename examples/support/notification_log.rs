@@ -1,4 +1,6 @@
 //! Append and sync a demonstration text record on a blocking worker.
+//! This requires a platform and filesystem that support opening and syncing
+//! the log's parent directory.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};

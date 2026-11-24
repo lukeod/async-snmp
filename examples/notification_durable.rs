@@ -3,6 +3,8 @@
 //! Receives one event on 127.0.0.1:1162, then shuts down. This v2c example
 //! needs no authoritative engine persistence; the log uses append + fsync.
 //! Retransmissions are independent records: this is not an exactly-once store.
+//! The platform and filesystem must support opening and syncing the log's
+//! parent directory.
 
 #[path = "support/notification_log.rs"]
 mod notification_log;
@@ -28,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("Waiting for one v1/v2c notification on 127.0.0.1:1162");
 
-    if let Some(received) = running.recv().await {
+    let persistence = if let Some(received) = running.recv().await {
         // The text format is a demonstration application record, not a journal
         // schema or deduplication key. Preserve the content before responding.
         let record = format!("{:?} {:?}", received.receive_info, received.notification);
@@ -36,17 +38,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match (persisted, received.inform_ack) {
             (Ok(()), NotificationAcknowledgement::Pending(pending)) => {
                 println!("Inform completion: {:?}", pending.acknowledge().await);
+                Ok(())
             }
             (Err(error), NotificationAcknowledgement::Pending(pending)) => {
                 pending.reject(); // No acknowledgement after a failed sync.
-                eprintln!("Persistence failed: {error}");
+                Err(error)
             }
-            (result, acknowledgement) => {
-                result?;
+            (result, acknowledgement) => result.inspect(|_| {
                 println!("Acknowledgement state: {acknowledgement:?}");
-            }
+            }),
         }
-    }
-    running.shutdown().await?;
+    } else {
+        Ok(())
+    };
+    let shutdown = running.shutdown().await;
+    persistence?;
+    shutdown?;
     Ok(())
 }

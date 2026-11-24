@@ -1,5 +1,7 @@
 //! File-backed engine state for the socketless notification example.
 //! The lock must be respected by every writer of this state file.
+//! Persistence requires a platform and filesystem that support opening and
+//! syncing the state file's parent directory.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};

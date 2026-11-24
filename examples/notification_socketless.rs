@@ -7,6 +7,8 @@
 //! Both tenants use username "collector", SHA-256 and distinct demo passwords.
 //! Engine ID/boots are atomically persisted and locked; retain the state file
 //! between runs. The append-and-sync log precedes deferred Inform encoding.
+//! The platform and filesystem must support opening and syncing the parent
+//! directories of the engine state and log files.
 
 #[path = "support/engine.rs"]
 mod engine;
