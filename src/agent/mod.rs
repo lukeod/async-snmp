@@ -2352,10 +2352,8 @@ impl Agent {
 
     /// Returns the snmpUnknownContexts counter value.
     ///
-    /// This counter tracks requests whose scopedPDU contextEngineID did not
-    /// name a context served by this engine (RFC 3413 Section 3.2). Such
-    /// requests are answered with a Report PDU rather than dispatched against
-    /// the local MIB.
+    /// This counter tracks command-role requests whose scopedPDU contextEngineID
+    /// names an unsupported context engine. Those requests receive a Report PDU.
     ///
     /// OID: 1.3.6.1.6.3.12.1.5
     #[must_use]
@@ -2624,7 +2622,7 @@ impl AgentProcessor {
         )
     }
 
-    /// Dispatch a request to the appropriate handler.
+    /// Dispatch a request accepted by the command role.
     async fn dispatch_request(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Option<Pdu>> {
         match pdu.pdu_type() {
             PduType::GetRequest => self.handle_get(ctx, pdu).await,
@@ -2641,10 +2639,7 @@ impl AgentProcessor {
                 self.handle_get_bulk(ctx, pdu).await
             }
             PduType::SetRequest => self.handle_set(ctx, pdu).await.map(Some),
-            PduType::InformRequest if self.inner.discard_notifications => {
-                self.handle_inform(ctx, pdu).map(Some)
-            }
-            PduType::InformRequest => Ok(None),
+            PduType::InformRequest => self.handle_inform(ctx, pdu).map(Some),
             _ => {
                 // Should not happen - filtered earlier
                 pdu.to_error_response(ctx.version(), ErrorStatus::GenErr, 0)
@@ -2659,10 +2654,9 @@ impl AgentProcessor {
     /// that the receiver acknowledges by returning a Response with the same
     /// request-id and varbind list.
     ///
-    /// The agent only acknowledges the inform; its contents are discarded. In
-    /// the RFC 3413 architecture informs are addressed to notification
-    /// receivers, not command responders; applications that want to consume
-    /// informs should use [`crate::notification::NotificationReceiver`].
+    /// The command application acknowledges and discards the Inform when the
+    /// agent opts in. Use [`crate::notification::NotificationReceiver`] to
+    /// consume the notification.
     fn handle_inform(&self, ctx: &RequestContext, pdu: &Pdu) -> Result<Pdu> {
         // Exact sizing and the empty-varbind tooBig fallback are applied at the
         // shared message-envelope finalizer after the response is encoded.

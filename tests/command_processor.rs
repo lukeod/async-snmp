@@ -11,8 +11,8 @@ use async_snmp::message::{
 use async_snmp::v3::UsmSecurityParams;
 use async_snmp::{
     AuthoritativeEngine, BoxFuture, CommandProcessor, CommandProcessorBuilder, Error, GetBulkPdu,
-    GetNextResult, GetResult, HandlerResult, LocalEngine, MessageSize, MibHandler, Oid, Pdu,
-    PreparedSet, ProcessingInput, ProcessingLimits, ReceiveLimits, ReceivedMessageInfo,
+    GetNextResult, GetResult, HandlerResult, LocalEngine, MessageSize, MibHandler, NotificationPdu,
+    Oid, Pdu, PreparedSet, ProcessingInput, ProcessingLimits, ReceiveLimits, ReceivedMessageInfo,
     ReceivedPacket, RequestContext, RequestPdu, SecurityLevel, SetCommitResult, SetTestResult,
     SetUndoResult, UsmSecurityContext, UsmUser, UsmUserEntry, Value, VarBind, Version, oid,
 };
@@ -63,6 +63,17 @@ fn set(version: Version, value: Value) -> Pdu {
     RequestPdu::set(version, 11, vec![VarBind::new(object(), value)])
         .unwrap()
         .into_raw()
+}
+fn inform(version: Version) -> Pdu {
+    NotificationPdu::inform(
+        version,
+        12,
+        0,
+        &async_snmp::notification::oids::cold_start(),
+        vec![],
+    )
+    .unwrap()
+    .into_raw()
 }
 fn decoded(bytes: Bytes) -> Pdu {
     CommunityMessage::decode(bytes, async_snmp::DecodeConfig::DEFAULT)
@@ -326,7 +337,55 @@ async fn community_operations_share_handlers_and_original_input_metadata() {
     }
 }
 
+#[tokio::test]
+async fn v2c_command_role_ignores_informs_with_read_only_vacm() {
+    use async_snmp::agent::SecurityModel;
+
+    let processor = CommandProcessor::builder()
+        .community("public")
+        .handler(prefix(), Arc::new(Handler(Arc::new(State::default()))))
+        .vacm(|vacm| {
+            vacm.group("public", SecurityModel::V2c, "readers")
+                .access(
+                    "readers",
+                    SecurityModel::V2c,
+                    SecurityLevel::NoAuthNoPriv,
+                    |access| access.read_view("read"),
+                )
+                .view("read", |view| view.include(prefix()))
+        })
+        .build()
+        .unwrap();
+    let _registration = processor
+        .local_engine()
+        .register_receive_capacity(limits().receive().advertised());
+    let response = processor
+        .process(community(Version::V2c, get(Version::V2c), limits()))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        decoded(response.bytes).varbinds()[0].value,
+        Value::Integer(42)
+    );
+    assert!(
+        processor
+            .process(community(Version::V2c, inform(Version::V2c), limits()))
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 fn v3_input(local: &LocalEngine, username: &str, request: Pdu) -> ProcessingInput {
+    v3_input_with_context(local, username, local.engine_id(), request)
+}
+fn v3_input_with_context(
+    local: &LocalEngine,
+    username: &str,
+    context_engine: &[u8],
+    request: Pdu,
+) -> ProcessingInput {
     let (boots, time) = local.current_boots_time().unwrap();
     let usm = UsmSecurityParams::new(
         Bytes::copy_from_slice(local.engine_id()),
@@ -344,7 +403,7 @@ fn v3_input(local: &LocalEngine, username: &str, request: Pdu) -> ProcessingInpu
         .unwrap(),
         usm.encode().unwrap(),
         ScopedPdu::new(
-            Bytes::copy_from_slice(local.engine_id()),
+            Bytes::copy_from_slice(context_engine),
             Bytes::new(),
             request,
         ),
@@ -363,6 +422,43 @@ fn v3_pdu(bytes: Bytes) -> Pdu {
     };
     scoped.pdu.clone()
 }
+
+#[tokio::test]
+async fn v3_command_role_ignores_informs_before_scoped_context_checks() {
+    let local = local_engine();
+    let context = UsmSecurityContext::new([UsmUserEntry::new(UsmUser::new("user"))]).unwrap();
+    let processor = CommandProcessor::builder()
+        .local_engine(local.clone())
+        .security_context(context)
+        .allow_all_access()
+        .build()
+        .unwrap();
+    let _registration = local.register_receive_capacity(limits().receive().advertised());
+    let foreign_context = b"foreign-context-engine";
+    for context_engine in [local.engine_id(), foreign_context] {
+        let input = v3_input_with_context(&local, "user", context_engine, inform(Version::V3));
+        assert!(processor.process(input).await.unwrap().is_none());
+    }
+
+    let unknown_user =
+        v3_input_with_context(&local, "unknown", foreign_context, inform(Version::V3));
+    let response = processor.process(unknown_user).await.unwrap().unwrap();
+    assert_eq!(
+        async_snmp::v3::classify_report(&v3_pdu(response.bytes)).unwrap(),
+        async_snmp::v3::ReportStatus::UnknownUserName { counter: 1 }
+    );
+
+    let query = v3_input_with_context(&local, "user", foreign_context, get(Version::V3));
+    let response = processor.process(query).await.unwrap().unwrap();
+    assert_eq!(
+        async_snmp::v3::classify_report(&v3_pdu(response.bytes)).unwrap(),
+        async_snmp::v3::ReportStatus::Other {
+            oid: oid!(1, 3, 6, 1, 6, 3, 12, 1, 5, 0),
+            value: Value::Counter32(1),
+        }
+    );
+}
+
 #[tokio::test]
 async fn v3_commands_and_reports_use_selected_runtime_credentials() {
     let state = Arc::new(State::default());

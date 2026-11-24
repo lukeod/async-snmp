@@ -83,10 +83,12 @@ impl AgentProcessor {
             return Ok(None);
         }
 
-        // Skip non-request PDUs (TrapV1 and other non-request types are ignored)
-        let pdu = match msg.pdu().standard() {
-            Some(p) if is_request_pdu(p.pdu_type()) => p,
-            _ => return Ok(None),
+        let Some(pdu) = msg
+            .pdu()
+            .standard()
+            .filter(|pdu| accepts_request_pdu(pdu.pdu_type(), self.inner.discard_notifications))
+        else {
+            return Ok(None);
         };
 
         // Counter64 is not part of the SNMPv1 data types. Decode it so the
@@ -240,22 +242,13 @@ impl AgentProcessor {
 
         let pdu = &scoped_pdu.pdu;
 
-        // Skip non-request PDUs
-        if !is_request_pdu(pdu.pdu_type()) {
+        if !accepts_request_pdu(pdu.pdu_type(), self.inner.discard_notifications) {
             return Ok(None);
         }
 
-        // RFC 3413 Section 3.2: the scopedPDU contextEngineID selects the
-        // context (SNMP entity) that services the request. This engine serves
-        // only its own (single, default) context, so the contextEngineID must
-        // either be empty (the default context) or match the local engine ID.
-        // A request naming any other engine is answered with an
-        // snmpUnknownContexts Report rather than being dispatched blindly
-        // against the local MIB and echoed back.
-        //
-        // Multi-context support (an agent proxying for several contextEngineIDs
-        // via a context table) is not implemented; only the local engine's
-        // context is recognised.
+        // The command role serves the local engine's default context and
+        // accepts an empty contextEngineID for that context. A request naming
+        // another context engine receives a snmpUnknownContexts Report.
         let ctx_engine_id = &scoped_pdu.context_engine_id;
         if !ctx_engine_id.is_empty() && ctx_engine_id.as_ref() != state.engine_id.as_ref() {
             tracing::debug!(
@@ -420,27 +413,23 @@ impl AgentProcessor {
 }
 
 /// The snmpUnknownContexts counter object (RFC 3413, SNMP-TARGET-MIB).
-///
-/// `1.3.6.1.6.3.12.1.5.0` - reported when a request names a contextEngineID
-/// this engine does not serve.
 fn snmp_unknown_contexts_oid() -> crate::Oid {
     crate::oid!(1, 3, 6, 1, 6, 3, 12, 1, 5, 0)
 }
 
-/// Returns whether a PDU type is a request that the agent handles.
+/// Returns whether the command application handles this PDU type.
 ///
-/// `InformRequest` is a confirmed-class PDU (RFC 3416) that requires a Response.
-/// Notification receivers typically handle Informs, but RFC 3413 Section 4 also
-/// requires agents to respond to them.
-pub(super) fn is_request_pdu(pdu_type: PduType) -> bool {
-    matches!(
-        pdu_type,
+/// RFC 3413 Section 3.4 assigns Informs to notification receivers.
+/// The command application accepts them through the `discard_notifications` opt-in.
+fn accepts_request_pdu(pdu_type: PduType, acknowledge_informs: bool) -> bool {
+    match pdu_type {
         PduType::GetRequest
-            | PduType::GetNextRequest
-            | PduType::GetBulkRequest
-            | PduType::SetRequest
-            | PduType::InformRequest
-    )
+        | PduType::GetNextRequest
+        | PduType::GetBulkRequest
+        | PduType::SetRequest => true,
+        PduType::InformRequest => acknowledge_informs,
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -816,14 +805,23 @@ mod tests {
     }
 
     #[test]
-    fn test_is_request_pdu() {
-        assert!(is_request_pdu(PduType::GetRequest));
-        assert!(is_request_pdu(PduType::GetNextRequest));
-        assert!(is_request_pdu(PduType::GetBulkRequest));
-        assert!(is_request_pdu(PduType::SetRequest));
-        assert!(is_request_pdu(PduType::InformRequest));
-        assert!(!is_request_pdu(PduType::Response));
-        assert!(!is_request_pdu(PduType::TrapV2));
+    fn command_pdu_selection_accepts_informs_only_on_opt_in() {
+        for acknowledge_informs in [false, true] {
+            for pdu in [
+                PduType::GetRequest,
+                PduType::GetNextRequest,
+                PduType::GetBulkRequest,
+                PduType::SetRequest,
+            ] {
+                assert!(accepts_request_pdu(pdu, acknowledge_informs));
+            }
+            assert!(!accepts_request_pdu(PduType::Response, acknowledge_informs));
+            assert!(!accepts_request_pdu(PduType::TrapV2, acknowledge_informs));
+            assert_eq!(
+                accepts_request_pdu(PduType::InformRequest, acknowledge_informs),
+                acknowledge_informs
+            );
+        }
     }
 
     #[tokio::test]
