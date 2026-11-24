@@ -265,18 +265,26 @@ impl NotificationControl {
 }
 
 impl NotificationReceiver {
-    /// Identified addresses used by this notification role.
+    /// Identified addresses of the listeners and configured sessions that serve
+    /// this notification role.
     pub fn bound_addresses(&self) -> &[crate::transport::BoundListener] {
-        &self.network.bound
+        &self.network.bound[..self.listener_count]
     }
-    /// Return the UDP endpoint with the matching ID, regardless of its client
-    /// exchange capability.
+    fn serves_endpoint(&self, id: crate::EndpointId) -> bool {
+        self.bound_addresses()
+            .iter()
+            .any(|bound| bound.endpoint_id == id)
+    }
+    /// Return the UDP endpoint with the matching ID in this role's bound addresses.
     ///
     /// To initiate requests on a standalone receiver's endpoint, configure
     /// [`client_exchanges(true)`](NotificationReceiverBuilder::client_exchanges)
     /// during preparation. An attached receiver uses the selected agent
     /// endpoint's exchange capability.
     pub fn udp_endpoint(&self, id: crate::EndpointId) -> Option<crate::UdpEndpoint> {
+        if !self.serves_endpoint(id) {
+            return None;
+        }
         self.network
             .udp
             .iter()
@@ -284,13 +292,15 @@ impl NotificationReceiver {
             .cloned()
             .map(|endpoint| endpoint.with_service_lease(self.lease.clone()))
     }
-    /// Snapshot exact accepted or configured TCP sessions, retaining service lifetime.
+    /// Snapshot exact accepted or configured TCP sessions serving this role.
+    /// The returned handles retain the service lifetime.
     pub fn tcp_sessions(&self) -> Vec<crate::TcpTransport> {
         self.network
             .sessions
             .lock()
             .unwrap()
             .values()
+            .filter(|session| self.serves_endpoint(session.endpoint_id()))
             .cloned()
             .map(|session| session.with_service_lease(self.lease.clone()))
             .collect()

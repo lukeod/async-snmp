@@ -642,9 +642,9 @@ impl AgentBuilder {
         self.client_exchanges = enabled;
         self
     }
-    /// Attach one notification consumer to every endpoint/session. Its engine, USM
-    /// users and privacy sender state are inherited from this agent. Obtain the
-    /// consumer through [`PreparedAgent::into_parts`] or
+    /// Attach one notification consumer to the agent's command listeners and
+    /// configured command sessions. The consumer inherits the agent's engine,
+    /// USM users and privacy sender state. Obtain it through [`PreparedAgent::into_parts`] or
     /// [`RunningAgent::take_notifications`].
     #[must_use]
     pub fn notifications(mut self, role: crate::notification::NotificationReceiverBuilder) -> Self {
@@ -1478,6 +1478,8 @@ impl AgentBuilder {
                 );
             }
         }
+        // The command and notification roles share the sources prepared above.
+        // Dedicated notification sinks are appended as exchange-only sources.
         let shared_listener_count = listeners.len();
         let mut shared_sink_listeners = HashSet::new();
         let mut trap_sinks = Vec::with_capacity(config.trap_sinks.len());
@@ -1639,7 +1641,7 @@ impl AgentBuilder {
         };
         let (notifications, notification_role) = if let Some(role) = config.notifications {
             let (mut consumer, processor, cleanup) =
-                role.prepare_attached(&processor, &network.io)?;
+                role.prepare_attached(&processor, &network.io, shared_listener_count)?;
             consumer.attach_lifetime(agent.lease.clone());
             (Some(consumer), Some((processor, cleanup)))
         } else {
@@ -2233,7 +2235,8 @@ impl Agent {
         AgentBuilder::new()
     }
 
-    /// Identified addresses of every prepared UDP endpoint and TCP listener.
+    /// Identified addresses of the agent's prepared UDP endpoints, TCP listeners,
+    /// and configured TCP sessions, including dedicated notification sinks.
     pub fn bound_addresses(&self) -> &[crate::transport::BoundListener] {
         &self.network.bound
     }

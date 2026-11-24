@@ -1,12 +1,15 @@
 #![cfg(feature = "agent")]
+use async_snmp::message::CommunityMessage;
 use async_snmp::{
-    Agent, Auth, ClientBuilder, ListenerSource, Notification, NotificationReceiver,
-    NotificationSinkId, NotificationTarget, RequestTransport, Retry, SinkStatus, TcpTransport,
-    TransportKind, UdpEndpoint, Value, VarBind, oid,
+    Agent, Auth, ClientBuilder, ListenerSource, Notification, NotificationPdu,
+    NotificationReceiver, NotificationSinkId, NotificationTarget, RequestTransport, Retry,
+    SinkStatus, TcpTransport, TransportKind, UdpEndpoint, Value, VarBind, Version, oid,
 };
+use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 const WAIT: Duration = Duration::from_secs(3);
 fn id(value: &str) -> NotificationSinkId {
     NotificationSinkId::new(value).unwrap()
@@ -16,6 +19,90 @@ fn cold() -> async_snmp::Oid {
 }
 fn engine_oid() -> async_snmp::Oid {
     oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0)
+}
+
+#[tokio::test]
+async fn attached_receiver_exposes_only_sources_that_serve_its_role() {
+    let udp_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let configured_peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_peer = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mut agent = Agent::builder()
+        .listener(ListenerSource::udp("127.0.0.1:0"))
+        .listener(ListenerSource::tcp("127.0.0.1:0"))
+        .session(TcpTransport::builder().target(configured_peer.local_addr().unwrap()))
+        .notification_sink(
+            id("dedicated-udp"),
+            NotificationTarget::udp(
+                UdpEndpoint::builder().bind("127.0.0.1:0"),
+                udp_peer.local_addr().unwrap().to_string(),
+            ),
+            Auth::v2c("public"),
+        )
+        .notification_sink(
+            id("dedicated-tcp"),
+            NotificationTarget::tcp(
+                TcpTransport::builder().target(sink_peer.local_addr().unwrap()),
+            ),
+            Auth::v2c("public"),
+        )
+        .notifications(NotificationReceiver::builder())
+        .spawn()
+        .await
+        .unwrap();
+    let mut receiver = agent.take_notifications().unwrap();
+    let [udp, tcp, configured, dedicated_udp, dedicated_tcp] = agent.bound_addresses() else {
+        panic!("expected three receiving sources and two dedicated sinks");
+    };
+
+    assert_eq!(receiver.bound_addresses(), &[*udp, *tcp, *configured]);
+    assert!(receiver.udp_endpoint(udp.endpoint_id).is_some());
+    assert!(receiver.udp_endpoint(dedicated_udp.endpoint_id).is_none());
+    assert!(agent.udp_endpoint(dedicated_udp.endpoint_id).is_some());
+
+    let (mut configured_peer, _) = configured_peer.accept().await.unwrap();
+    let (_sink_connection, _) = sink_peer.accept().await.unwrap();
+    let mut accepted_peer = TcpStream::connect(tcp.local_addr).await.unwrap();
+    let trap = CommunityMessage::v2c(
+        "public",
+        NotificationPdu::trap_v2(Version::V2c, 1, 0, &cold(), vec![])
+            .unwrap()
+            .into_raw(),
+    )
+    .unwrap()
+    .encode()
+    .unwrap();
+    udp_peer.send_to(&trap, udp.local_addr).await.unwrap();
+    accepted_peer.write_all(&trap).await.unwrap();
+    configured_peer.write_all(&trap).await.unwrap();
+
+    let mut received_endpoints = HashSet::new();
+    for _ in 0..3 {
+        let event = tokio::time::timeout(WAIT, receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        received_endpoints.insert(event.receive_info.endpoint_id());
+    }
+    assert_eq!(
+        received_endpoints,
+        [udp.endpoint_id, tcp.endpoint_id, configured.endpoint_id].into()
+    );
+    let receiver_sessions: HashSet<_> = receiver
+        .tcp_sessions()
+        .iter()
+        .map(TcpTransport::endpoint_id)
+        .collect();
+    assert_eq!(
+        receiver_sessions,
+        [tcp.endpoint_id, configured.endpoint_id].into()
+    );
+    assert!(
+        agent
+            .tcp_sessions()
+            .iter()
+            .any(|session| session.endpoint_id() == dedicated_tcp.endpoint_id)
+    );
+    agent.shutdown().await.unwrap();
 }
 
 #[tokio::test]

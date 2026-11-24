@@ -160,8 +160,10 @@
 //! admission uses the exchange deadline and is cancelled by endpoint shutdown.
 //!
 //! With the agent feature, `AgentBuilder::notifications` attaches this consumer
-//! to all of the agent's configured endpoints and sessions. Configure engine/users/client capability on the
-//! agent; attached notification configuration must omit those independent fields.
+//! to the agent's command listeners and configured command sessions. These are
+//! the sources the receiver exposes. The agent's own endpoint view also includes
+//! dedicated notification sinks. Configure the shared engine, users, and client
+//! capability on the agent.
 //! Attached control shutdown closes only notifications; standalone control
 //! shutdown stops its endpoint service. Consumer closure never enables itself
 //! again through a retained control or client handle.
@@ -1425,7 +1427,8 @@ impl NotificationReceiverBuilder {
             requires_policy: security_context_required,
             capacity_registration,
         };
-        let (receiver, processor, cleanup) = self.prepare_role(engine, network.clone())?;
+        let (receiver, processor, cleanup) =
+            self.prepare_role(engine, network.clone(), listeners.len())?;
         let roles = Arc::new(crate::transport::dispatch::DispatchRoles::new(
             None,
             Some(processor.clone()),
@@ -1443,6 +1446,7 @@ impl NotificationReceiverBuilder {
         self,
         engine: PreparedNotificationRole,
         network: Arc<crate::transport::network::NetworkState>,
+        listener_count: usize,
     ) -> Result<(NotificationReceiver, NotificationRole, RunnerCleanup)> {
         self.validate_acknowledgement()?;
         if self.queue_capacity == 0
@@ -1473,6 +1477,12 @@ impl NotificationReceiverBuilder {
         let (sender, events) = mpsc::channel(self.queue_capacity);
         let delivery = Arc::new(Delivery::new(sender));
         let pending = pending::PendingRegistry::new(self.max_pending_informs);
+        #[cfg(test)]
+        let udp = network.udp.first().filter(|endpoint| {
+            network.bound[..listener_count]
+                .iter()
+                .any(|bound| bound.endpoint_id == endpoint.endpoint_id())
+        });
         let inner = Arc::new(ReceiverInner {
             protocol: NotificationProcessor::configured(
                 engine.local_engine,
@@ -1484,9 +1494,12 @@ impl NotificationReceiverBuilder {
                 self.admission_policy,
             ),
             #[cfg(test)]
-            udp_responder: network.udp.first().map(crate::UdpEndpoint::test_responder),
+            udp_responder: udp.map(crate::UdpEndpoint::test_responder),
             #[cfg(test)]
-            endpoint_id: network.bound[0].endpoint_id,
+            endpoint_id: udp.map_or(
+                network.bound[0].endpoint_id,
+                crate::UdpEndpoint::endpoint_id,
+            ),
             delivery: delivery.clone(),
             pending: pending.clone(),
             acknowledgement_mode: self.acknowledgement_mode,
@@ -1512,6 +1525,7 @@ impl NotificationReceiverBuilder {
         let lease = Arc::new(NotificationLease::new(state.shutdown.clone()));
         let receiver = NotificationReceiver {
             network,
+            listener_count,
             inner: inner.clone(),
             events,
             state: state.clone(),
@@ -1579,6 +1593,7 @@ impl NotificationReceiverBuilder {
         self,
         agent: &crate::agent::AgentProcessor,
         network: &Arc<crate::transport::network::NetworkState>,
+        listener_count: usize,
     ) -> Result<(NotificationReceiver, NotificationRole, RunnerCleanup)> {
         self.validate_attached(agent.inner.security_context_required)?;
         let engine = PreparedNotificationRole {
@@ -1587,7 +1602,7 @@ impl NotificationReceiverBuilder {
             requires_policy: agent.inner.security_context_required,
             capacity_registration: None,
         };
-        self.prepare_role(engine, network.clone())
+        self.prepare_role(engine, network.clone(), listener_count)
     }
 
     /// Prepare and spawn the same runner on the current runtime.
@@ -1878,6 +1893,7 @@ impl Notification {
 /// ```
 pub struct NotificationReceiver {
     network: Arc<crate::transport::network::NetworkState>,
+    listener_count: usize,
     inner: Arc<ReceiverInner>,
     events: mpsc::Receiver<ReceivedNotification>,
     state: Arc<lifecycle::ServiceState>,
