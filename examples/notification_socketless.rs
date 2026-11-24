@@ -1,12 +1,30 @@
 //! One caller-owned socket, two explicitly selected logical USM contexts.
+//!
 //! Run `cargo run --example notification_socketless -- ./receiver.state ./received.log`.
-//! Receives one accepted notification on 127.0.0.1:1162 and answers engine discovery.
-//! Peer 127.0.0.2 selects tenant A and 127.0.0.3 selects tenant B. Each selected
-//! processor handles notifications, discovery, and stale Inform engine IDs in one
-//! call. Other peers use the shared local engine for discovery.
-//! Both tenants use username "collector", SHA-256 and distinct demo passwords.
-//! Engine ID/boots are atomically persisted and locked; retain the state file
-//! between runs. The append-and-sync log precedes deferred Inform encoding.
+//! Once the receiver is listening, send an Inform from a second shell using
+//! Net-SNMP. This command uses the loopback source and demo password for tenant A.
+//!
+//! ```sh
+//! (
+//!     set -e
+//!     snmp_config=$(mktemp -d)
+//!     trap 'rm -rf -- "$snmp_config"' EXIT
+//!     printf 'clientaddr 127.0.0.2\n' > "$snmp_config/snmp.conf"
+//!     SNMPCONFPATH="$snmp_config" MIBS='' snmpinform -v3 -l authNoPriv \
+//!         -u collector -a SHA-256 -A tenant-a-password \
+//!         127.0.0.1:1162 '' .1.3.6.1.6.3.1.1.5.1
+//! )
+//! ```
+//!
+//! The receiver exits after one accepted notification. To try tenant B, restart
+//! it with the same state and log paths, then use `127.0.0.3` in `clientaddr`
+//! and `tenant-b-password` with `-A`. Both loopback source addresses must be
+//! available on the host.
+//!
+//! Each tenant's processor handles notifications, discovery, and stale Inform
+//! engine IDs. Other peers use the shared local engine for discovery. The
+//! receiver atomically persists the engine ID and boots counter under a lock.
+//! It appends and syncs the log before encoding the deferred Inform response.
 //! The platform and filesystem must support opening and syncing the parent
 //! directories of the engine state and log files.
 
