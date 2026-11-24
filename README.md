@@ -171,8 +171,10 @@ configuration without starting tasks. Drive `runner.run()` or use the explicit
 `spawn()`/`spawn_on()` conveniences; retain the running owner to observe shutdown
 and failures. Supplied Tokio sockets keep their original runtime registration.
 Dropping the last public handle requests shutdown; controls also retain lifetime.
-Dropping an unpolled runner closes its endpoints. Sends and exchanges use their
-ordinary deadlines before startup and fail after termination.
+Dropping an unpolled runner closes its endpoints. Timed sends and exchanges use
+their ordinary deadlines before startup. Direct TCP sends use the session's
+write timeout. Direct `UdpHandle::send` can transmit before startup, with any
+timeout supplied by the caller. Sends and exchanges fail after termination.
 
 `PreparedAgent::into_parts()` returns `(agent, runner, notifications)`, with an
 optional notification receiver. Keep the receiver alive to admit notifications.
