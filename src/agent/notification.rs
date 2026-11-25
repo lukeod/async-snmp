@@ -1257,7 +1257,7 @@ mod tests {
                 b"priv-password",
             )
             .unwrap();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .authoritative_engine(engine)
             .des_salt_state(des_state.clone())
@@ -1267,9 +1267,10 @@ mod tests {
                 auth,
             )
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let outcome = agent
             .send_trap(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
@@ -1511,7 +1512,7 @@ mod tests {
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn notify_view_uses_each_sink_identity_context_and_security_level() {
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .vacm(|v| {
                 v.group("v1-community", SecurityModel::V1, "v1")
@@ -1555,9 +1556,10 @@ mod tests {
                     .view("all", |view| view.include(oid!(1, 3, 6)))
                     .view("empty", |view| view)
             })
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
 
         assert!(agent.notification_allowed(
@@ -1618,7 +1620,7 @@ mod tests {
         let denied_trap = oid!(1, 3, 6, 1, 4, 1, 9999, 1);
         let allowed_trap = oid!(1, 3, 6, 1, 4, 1, 9999, 2);
         let denied_extra = oid!(1, 3, 6, 1, 4, 1, 9999, 3);
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .vacm(|v| {
                 v.group("trap-denied", SecurityModel::V2c, "trap-denied")
@@ -1657,9 +1659,10 @@ mod tests {
                         view.include(oid!(1, 3, 6)).exclude(denied_extra.clone())
                     })
             })
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let extra = VarBind::new(denied_extra, Value::Integer(1));
 
         assert!(!agent.notification_allowed(
@@ -1698,7 +1701,7 @@ mod tests {
     async fn notify_view_checks_v2_mandatory_varbind_names_but_not_v1_fields() {
         let trap_oid = oid!(1, 3, 6, 1, 4, 1, 9999, 1);
         let extra_oid = oid!(1, 3, 6, 1, 4, 1, 9999, 2);
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .vacm(|v| {
                 v.group("v1", SecurityModel::V1, "group")
@@ -1713,9 +1716,10 @@ mod tests {
                         view.include(trap_oid.clone()).include(extra_oid.clone())
                     })
             })
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let extra = VarBind::new(extra_oid, Value::Integer(1));
 
         assert!(agent.notification_allowed(
@@ -1733,14 +1737,19 @@ mod tests {
     #[tokio::test]
     async fn notification_vacm_is_permissive_when_unconfigured_and_mixed_per_sink() {
         let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
-        let permissive = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
+        let (permissive, _runner, _) = Agent::builder()
+            .bind("127.0.0.1:0")
+            .prepare()
+            .await
+            .unwrap()
+            .into_parts();
         assert!(permissive.notification_allowed(
             &test_sink(Auth::v2c("unmapped")).await,
             &trap_oid,
             &[VarBind::new(oid!(9, 9), Value::Integer(1))]
         ));
 
-        let mixed = Agent::builder()
+        let (mixed, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .notification_sink(
                 NotificationSinkId::new("allowed").unwrap(),
@@ -1770,9 +1779,10 @@ mod tests {
                     .view("all", |view| view.include(oid!(1, 3, 6)))
                     .view("empty", |view| view)
             })
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let outcome = mixed.send_trap(&trap_oid, 0, vec![]).await;
         assert!(matches!(outcome.sinks()[0].status, SinkStatus::Succeeded));
         assert!(matches!(
@@ -1780,7 +1790,7 @@ mod tests {
             SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
         ));
 
-        let denied_inform = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .notification_sink(
                 NotificationSinkId::new("denied").unwrap(),
@@ -1797,17 +1807,17 @@ mod tests {
                     )
                     .view("empty", |view| view)
             })
-            .build()
+            .prepare()
             .await
             .unwrap()
-            .send_inform(&trap_oid, 0, vec![])
-            .await;
+            .into_parts();
+        let denied_inform = agent.send_inform(&trap_oid, 0, vec![]).await;
         assert!(matches!(
             denied_inform.sinks()[0].status,
             SinkStatus::Skipped(SinkSkipReason::NotInNotifyView)
         ));
 
-        let denied_v1_inform = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .notification_sink(
                 NotificationSinkId::new("denied-v1").unwrap(),
@@ -1815,11 +1825,11 @@ mod tests {
                 Auth::v1("denied"),
             )
             .vacm(|v| v)
-            .build()
+            .prepare()
             .await
             .unwrap()
-            .send_inform(&trap_oid, 0, vec![])
-            .await;
+            .into_parts();
+        let denied_v1_inform = agent.send_inform(&trap_oid, 0, vec![]).await;
         assert!(matches!(
             denied_v1_inform.sinks()[0].status,
             SinkStatus::Skipped(SinkSkipReason::InformUnsupportedForV1)
@@ -1828,7 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn public_agent_notification_path_rejects_receive_only_values() {
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .notification_sink(
@@ -1837,9 +1847,10 @@ mod tests {
                 Auth::v2c("public"),
             )
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let malformed = VarBind::new(
             oid!(1, 3, 6, 1, 4, 1, 9999, 1),
             Value::Unknown {
@@ -1862,16 +1873,17 @@ mod tests {
 
     #[tokio::test]
     async fn unpolled_trap_stream_does_not_allocate_request_id() {
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .notification_sink(
                 NotificationSinkId::new("lazy").unwrap(),
                 crate::NotificationTarget::shared_udp(0, "127.0.0.1:9"),
                 Auth::v1("public"),
             )
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
 
         let stream = agent.send_trap_stream(&trap_oid, 0, vec![]);
@@ -1897,7 +1909,7 @@ mod tests {
                 Auth::v2c("public"),
             );
         }
-        let agent = builder.build().await.unwrap();
+        let (agent, _runner, _) = builder.prepare().await.unwrap().into_parts();
         let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
         let mut stream = agent.send_trap_stream(&trap_oid, 0, vec![]);
 
@@ -1920,7 +1932,12 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn notification_stream_yields_admitted_futures_in_completion_order() {
-        let agent = Agent::builder().bind("127.0.0.1:0").build().await.unwrap();
+        let (agent, _runner, _) = Agent::builder()
+            .bind("127.0.0.1:0")
+            .prepare()
+            .await
+            .unwrap()
+            .into_parts();
         let pending = FuturesUnordered::new();
         for (index, delay) in [(0, 20), (1, 1)] {
             let mut sink = test_sink(Auth::v2c("public")).await.summary;
@@ -1955,20 +1972,22 @@ mod tests {
     async fn test_notification_ids_are_per_agent() {
         // Each Agent must own its own notification id sequence; two independent
         // agents must not share a process-global counter.
-        let agent_a = Agent::builder()
+        let (agent_a, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
-        let agent_b = Agent::builder()
+            .unwrap()
+            .into_parts();
+        let (agent_b, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         // Advance agent_a's sequence a few times.
         let a1 = agent_a.next_notification_id();

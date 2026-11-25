@@ -55,8 +55,8 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
 - **Breaking.** `NotificationReceiver::spawn()` replaces `bind()`. The receiver
   is single-consumer and `recv(&mut self)` returns `Option<ReceivedNotification>`.
   Use its control for shutdown, terminal status, and persistence health. A
-  command-only Agent ignores Informs by default. Use an attached receiver
-  for delivery or `discard_notifications()` to acknowledge and discard them.
+  command-only Agent ignores Informs. Attach a notification receiver to deliver
+  and acknowledge Informs on the command listeners.
 - **Breaking.** Replace `trap_sink(id, destination, auth)` with
   `notification_sink(id, NotificationTarget, auth)`. Targets select a shared UDP
   listener, dedicated UDP endpoint, TCP session, or existing peer. Sink

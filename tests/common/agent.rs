@@ -72,7 +72,6 @@ impl TestAgent {
             .handler(oid!(1, 3, 6), handler.clone())
             .without_builtin_handlers()
             .allow_all_access()
-            .discard_notifications()
             .spawn()
             .await
             .expect("failed to build test agent");
@@ -299,7 +298,6 @@ impl TestAgentBuilder {
 
         let agent = builder
             .allow_all_access()
-            .discard_notifications()
             .spawn()
             .await
             .expect("failed to build test agent");

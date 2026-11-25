@@ -576,49 +576,117 @@ async fn closing_the_only_udp_endpoint_leaves_agent_under_service_control() {
 }
 
 #[tokio::test]
-async fn commands_do_not_acknowledge_informs_without_discard_opt_in() {
-    use async_snmp::message::CommunityMessage;
-    use async_snmp::{NotificationPdu, Version};
-    let inform = NotificationPdu::inform(
-        Version::V2c,
-        42,
-        0,
-        &oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1),
-        vec![],
-    )
-    .unwrap();
-    let message = CommunityMessage::new(
-        async_snmp::CommunityVersion::V2c,
-        b"public".as_slice(),
-        inform.into_raw(),
-    )
-    .unwrap()
-    .encode()
-    .unwrap();
-    for discard in [false, true] {
-        let builder = Agent::builder()
-            .bind("127.0.0.1:0")
-            .community(b"public")
-            .allow_all_access();
-        let agent = if discard {
-            builder.discard_notifications()
-        } else {
-            builder
-        }
+async fn command_only_agent_ignores_informs() {
+    let agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .allow_all_access()
         .spawn()
         .await
         .unwrap();
-        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        socket
-            .send_to(&message, agent.bound_addresses()[0].local_addr)
-            .await
+    let client = Client::builder(agent.bound_addresses()[0].local_addr, Auth::v2c("public"))
+        .request_timeout(Duration::from_millis(100))
+        .retry(Retry::none())
+        .connect()
+        .await
+        .unwrap();
+    let error = client
+        .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 0, vec![])
+        .await
+        .unwrap_err();
+    assert!(matches!(error.exchange_source(), Error::Timeout { .. }));
+    client
+        .get(&oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0))
+        .await
+        .unwrap();
+    agent.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn attached_receiver_acknowledges_informs_and_returns_too_big() {
+    use async_snmp::message::CommunityMessage;
+    use async_snmp::{
+        DecodeConfig, ErrorStatus, InformAckOutcome, NotificationAcknowledgement, NotificationPdu,
+        NotificationReceiver, PduType, VarBind, Version,
+    };
+
+    let mut agent = Agent::builder()
+        .bind("127.0.0.1:0")
+        .community(b"public")
+        .allow_all_access()
+        .notifications(
+            NotificationReceiver::builder()
+                .community(b"public")
+                .max_message_size(150)
+                .queue_capacity(1),
+        )
+        .spawn()
+        .await
+        .unwrap();
+    let mut receiver = agent.take_notifications().unwrap();
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    socket
+        .connect(agent.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let trap_oid = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+
+    for (request_id, value, status) in [
+        (1, Value::Integer(42), ErrorStatus::NoError),
+        (
+            2,
+            Value::OctetString(vec![0xab; 256].into()),
+            ErrorStatus::TooBig,
+        ),
+        (3, Value::Integer(43), ErrorStatus::NoError),
+    ] {
+        let payload = VarBind::new(oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0), value);
+        let inform = NotificationPdu::inform(
+            Version::V2c,
+            request_id,
+            0,
+            &trap_oid,
+            vec![payload.clone()],
+        )
+        .unwrap()
+        .into_raw();
+        let wire = CommunityMessage::v2c("public", inform.clone())
+            .unwrap()
+            .encode()
             .unwrap();
-        let mut bytes = [0; 2048];
-        let reply =
-            tokio::time::timeout(Duration::from_millis(100), socket.recv_from(&mut bytes)).await;
-        assert_eq!(reply.is_ok(), discard);
-        agent.shutdown().await.unwrap();
+        socket.send(&wire).await.unwrap();
+        let mut reply = [0; 2048];
+        let len = tokio::time::timeout(Duration::from_secs(1), socket.recv(&mut reply))
+            .await
+            .expect("Inform did not receive a response")
+            .unwrap();
+        let reply = CommunityMessage::decode(
+            bytes::Bytes::copy_from_slice(&reply[..len]),
+            DecodeConfig::DEFAULT,
+        )
+        .unwrap()
+        .value;
+        let response = reply.pdu().standard().unwrap();
+        assert_eq!(response.pdu_type(), PduType::Response);
+        assert_eq!(response.request_id(), request_id);
+        assert_eq!(response.error_fields(), Some((status.as_i32(), 0)));
+        if status == ErrorStatus::TooBig {
+            assert!(response.varbinds().is_empty());
+        } else {
+            assert_eq!(response.varbinds(), inform.varbinds());
+            let delivered = tokio::time::timeout(Duration::from_secs(1), receiver.recv())
+                .await
+                .expect("acknowledged Inform was not delivered")
+                .unwrap();
+            assert_eq!(delivered.wire_identity.request_id, Some(request_id));
+            assert_eq!(delivered.notification.varbinds(), &[payload]);
+            assert!(matches!(
+                delivered.inform_ack,
+                NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
+            ));
+        }
     }
+    agent.shutdown().await.unwrap();
 }
 
 #[tokio::test]

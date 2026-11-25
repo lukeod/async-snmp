@@ -449,7 +449,7 @@ mod tests {
 
     #[tokio::test]
     async fn general_test_failure_maps_to_gen_err_and_failed_index_for_all_versions() {
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(
@@ -457,9 +457,10 @@ mod tests {
                 Arc::new(GeneralFailureHandler),
             )
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
             1,
@@ -496,14 +497,15 @@ mod tests {
             free_count: free_count.clone(),
         });
 
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let ctx = test_ctx();
 
@@ -540,14 +542,15 @@ mod tests {
             free_count: free_count.clone(),
         });
 
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let ctx = test_ctx();
 
@@ -654,16 +657,17 @@ mod tests {
             commit_count: commit_count.clone(),
         });
 
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .max_message_size(80)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         // The echoed Response for five varbinds exceeds the 80-byte limit.
         // RFC 3416 Section 4.2.5 requires returning tooBig before any commit.
@@ -704,16 +708,17 @@ mod tests {
             commit_count: commit_count.clone(),
         });
 
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .max_message_size(150)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let ctx = test_ctx();
 
@@ -746,14 +751,15 @@ mod tests {
             free_count: free_count.clone(),
         });
 
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let ctx = test_ctx();
 
@@ -959,14 +965,15 @@ mod tests {
             values: values.clone(),
         });
 
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
@@ -1149,15 +1156,16 @@ mod tests {
             calls: calls.clone(),
             values: Arc::new(Mutex::new(vec![10, 20, 30])),
         });
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
             1,
@@ -1260,7 +1268,7 @@ mod tests {
     #[tokio::test]
     async fn heterogeneous_handlers_keep_prepared_state_and_context_per_varbind() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(
@@ -1277,9 +1285,10 @@ mod tests {
             )
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
             17,
@@ -1450,15 +1459,16 @@ mod tests {
             release_undo: release_undo.clone(),
             second_test_started: second_test_started.clone(),
         });
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let first_pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
@@ -1698,7 +1708,7 @@ mod tests {
         let callback_started = Arc::new(Semaphore::new(0));
         let release_callback = Arc::new(Semaphore::new(0));
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(
@@ -1712,9 +1722,10 @@ mod tests {
             )
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
             1,
@@ -1998,15 +2009,16 @@ mod tests {
             callback_started: callback_started.clone(),
             release_callback,
         });
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler)
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let pdu = Pdu::standard(
             crate::pdu::StandardPduType::SetRequest,
             1,

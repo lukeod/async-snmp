@@ -117,7 +117,7 @@ impl AgentProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::Agent;
+    use crate::agent::{Agent, PreparedAgent};
     use crate::message::{MsgFlags, SecurityLevel, V3Message};
     use crate::oid;
     use crate::oid::Oid;
@@ -146,19 +146,19 @@ mod tests {
         }
     }
 
-    async fn test_agent_with_boots(engine_boots: u32) -> Agent {
+    async fn test_agent_with_boots(engine_boots: u32) -> PreparedAgent {
         Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .engine_boots(engine_boots)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(DummyHandler))
             .allow_all_access()
-            .build()
+            .prepare()
             .await
             .unwrap()
     }
 
-    async fn test_agent() -> Agent {
+    async fn test_agent() -> PreparedAgent {
         test_agent_with_boots(1).await
     }
 
@@ -187,7 +187,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_response_path_rejects_invalid_response_fields() {
-        let agent = test_agent().await;
+        let (agent, _runner, _) = test_agent().await.into_parts();
         let response = Pdu::response(1, 0, 1, vec![crate::VarBind::null(oid!(1, 3, 6, 1))]);
 
         let error = agent
@@ -212,7 +212,7 @@ mod tests {
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
         let des_state =
             crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .authoritative_engine(engine)
             .des_salt_state(des_state.clone())
@@ -226,9 +226,10 @@ mod tests {
             })
             .unwrap()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let users = agent.inner.security_context.snapshot();
         let user = users
             .lookup(&agent.inner.state.engine_id, b"testuser")
@@ -259,7 +260,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boots_latched_drops_auth_nopriv_response() {
-        let agent = test_agent_with_boots(MAX_ENGINE_TIME).await;
+        let (agent, _runner, _) = test_agent_with_boots(MAX_ENGINE_TIME).await.into_parts();
 
         let msg = dummy_v3_msg(SecurityLevel::AuthNoPriv);
         let usm = dummy_usm();
@@ -289,7 +290,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boots_latched_drops_auth_priv_response() {
-        let agent = test_agent_with_boots(MAX_ENGINE_TIME).await;
+        let (agent, _runner, _) = test_agent_with_boots(MAX_ENGINE_TIME).await.into_parts();
 
         let msg = dummy_v3_msg(SecurityLevel::AuthPriv);
         let usm = dummy_usm();
@@ -314,7 +315,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_boots_latched_allows_noauth_response() {
-        let agent = test_agent_with_boots(MAX_ENGINE_TIME).await;
+        let (agent, _runner, _) = test_agent_with_boots(MAX_ENGINE_TIME).await.into_parts();
 
         let msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
         let usm = dummy_usm();
@@ -339,7 +340,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_boots_below_max_allows_auth_response() {
-        let agent = test_agent_with_boots(MAX_ENGINE_TIME - 1).await;
+        let (agent, _runner, _) = test_agent_with_boots(MAX_ENGINE_TIME - 1)
+            .await
+            .into_parts();
 
         let msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);
         let usm = dummy_usm();
@@ -365,7 +368,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_response_uses_current_coherent_authoritative_time() {
-        let agent = test_agent().await;
+        let (agent, _runner, _) = test_agent().await.into_parts();
         agent.inner.state.set_authoritative_elapsed_for_test(123);
 
         let earliest = agent.inner.state.authoritative_boots_time().unwrap();
@@ -401,15 +404,16 @@ mod tests {
     // receive capacity, not the requester's echoed value.
     #[tokio::test]
     async fn test_response_advertises_local_max_size() {
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .max_message_size(1400)
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), Arc::new(DummyHandler))
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         // Keep the incoming value, local capacity, and response cap distinct.
         let mut msg = dummy_v3_msg(SecurityLevel::NoAuthNoPriv);

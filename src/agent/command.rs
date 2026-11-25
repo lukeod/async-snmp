@@ -180,7 +180,6 @@ impl CommandProcessorBuilder {
             cancel: CancellationToken::new(),
             request_deadline: self.request_deadline,
             disabled_builtins: self.disabled_builtins,
-            discard_notifications: false,
             trap_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
             inform_timeout: crate::client::DEFAULT_REQUEST_TIMEOUT,
             inform_retry: crate::Retry::default(),
@@ -545,7 +544,6 @@ pub(super) struct ApplicationConfig {
     pub cancel: CancellationToken,
     pub request_deadline: Option<Duration>,
     pub disabled_builtins: HashSet<BuiltinMib>,
-    pub discard_notifications: bool,
     pub trap_send_timeout: Duration,
     pub inform_timeout: Duration,
     pub inform_retry: crate::Retry,
@@ -595,7 +593,6 @@ pub(super) fn prepare_application(mut config: ApplicationConfig) -> Arc<AgentInn
         .sort_by_key(|h| std::cmp::Reverse(h.prefix.len()));
 
     Arc::new(AgentInner {
-        discard_notifications: config.discard_notifications,
         command_stop: config.command_stop,
         command_admission_gate: std::sync::Mutex::new(()),
         task_changed: Arc::new(tokio::sync::Notify::new()),

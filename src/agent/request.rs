@@ -86,7 +86,7 @@ impl AgentProcessor {
         let Some(pdu) = msg
             .pdu()
             .standard()
-            .filter(|pdu| accepts_request_pdu(pdu.pdu_type(), self.inner.discard_notifications))
+            .filter(|pdu| accepts_request_pdu(pdu.pdu_type()))
         else {
             return Ok(None);
         };
@@ -242,7 +242,7 @@ impl AgentProcessor {
 
         let pdu = &scoped_pdu.pdu;
 
-        if !accepts_request_pdu(pdu.pdu_type(), self.inner.discard_notifications) {
+        if !accepts_request_pdu(pdu.pdu_type()) {
             return Ok(None);
         }
 
@@ -396,7 +396,6 @@ impl AgentProcessor {
                 &access.read_view
             }
             PduType::SetRequest => &access.write_view,
-            PduType::InformRequest => &access.notify_view,
             _ => return false,
         };
         if required_view.is_empty() || !vacm.has_view(required_view) {
@@ -420,22 +419,21 @@ fn snmp_unknown_contexts_oid() -> crate::Oid {
 /// Returns whether the command application handles this PDU type.
 ///
 /// RFC 3413 Section 3.4 assigns Informs to notification receivers.
-/// The command application accepts them through the `discard_notifications` opt-in.
-fn accepts_request_pdu(pdu_type: PduType, acknowledge_informs: bool) -> bool {
-    match pdu_type {
+fn accepts_request_pdu(pdu_type: PduType) -> bool {
+    matches!(
+        pdu_type,
         PduType::GetRequest
-        | PduType::GetNextRequest
-        | PduType::GetBulkRequest
-        | PduType::SetRequest => true,
-        PduType::InformRequest => acknowledge_informs,
-        _ => false,
-    }
+            | PduType::GetNextRequest
+            | PduType::GetBulkRequest
+            | PduType::SetRequest
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Agent;
+    use crate::agent::PreparedAgent;
     use crate::handler::{
         BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler, PreparedSet,
         RequestContext, SecurityModel, SetCommitResult, SetTestResult, SetUndoResult,
@@ -605,13 +603,13 @@ mod tests {
         buf.finish()
     }
 
-    async fn community_test_agent(callbacks: Arc<CallbackCounts>) -> Agent {
+    async fn community_test_agent(callbacks: Arc<CallbackCounts>) -> PreparedAgent {
         Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks)
             .allow_all_access()
-            .build()
+            .prepare()
             .await
             .unwrap()
     }
@@ -621,15 +619,16 @@ mod tests {
         let source = "127.0.0.1:9999".parse().unwrap();
         for version in [Version::V1, Version::V2c] {
             let callbacks = Arc::new(CallbackCounts::default());
-            let strict = Agent::builder()
+            let (strict, _runner, _) = Agent::builder()
                 .bind("127.0.0.1:0")
                 .community(b"public")
                 .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks)
                 .allow_all_access()
                 .decode_config(crate::DecodeConfig::STRICT)
-                .build()
+                .prepare()
                 .await
-                .unwrap();
+                .unwrap()
+                .into_parts();
             let mut request =
                 community_request(version, PduType::GetRequest, b"public", Value::Null).to_vec();
             request.extend_from_slice(&[0x05, 0]);
@@ -657,15 +656,16 @@ mod tests {
         let source = "127.0.0.1:9999".parse().unwrap();
         for version in [Version::V1, Version::V2c] {
             let strict_callbacks = Arc::new(CallbackCounts::default());
-            let strict = Agent::builder()
+            let (strict, _runner, _) = Agent::builder()
                 .bind("127.0.0.1:0")
                 .community(b"public")
                 .handler(oid!(1, 3, 6, 1, 4, 1, 99999), strict_callbacks.clone())
                 .allow_all_access()
                 .decode_config(crate::DecodeConfig::STRICT)
-                .build()
+                .prepare()
                 .await
-                .unwrap();
+                .unwrap()
+                .into_parts();
             let request = community_set_with_integer_content(version, &[1, 0, 0, 0, 9]);
             let result = match version {
                 Version::V1 => strict.processor().handle_v1(request, source).await,
@@ -678,15 +678,16 @@ mod tests {
             let mut targeted = crate::DecodeConfig::STRICT;
             targeted.truncate_numeric_values = true;
             let callbacks = Arc::new(CallbackCounts::default());
-            let agent = Agent::builder()
+            let (agent, _runner, _) = Agent::builder()
                 .bind("127.0.0.1:0")
                 .community(b"public")
                 .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
                 .allow_all_access()
                 .decode_config(targeted)
-                .build()
+                .prepare()
                 .await
-                .unwrap();
+                .unwrap()
+                .into_parts();
             let request = community_set_with_integer_content(version, &[1, 0, 0, 0, 9]);
             let response = match version {
                 Version::V1 => agent.processor().handle_v1(request, source).await,
@@ -716,7 +717,10 @@ mod tests {
         View,
     }
 
-    async fn vacm_denial_agent(state: MissingVacmState, callbacks: Arc<CallbackCounts>) -> Agent {
+    async fn vacm_denial_agent(
+        state: MissingVacmState,
+        callbacks: Arc<CallbackCounts>,
+    ) -> PreparedAgent {
         let builder = Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
@@ -735,7 +739,7 @@ mod tests {
                 )
             }),
         };
-        builder.build().await.unwrap()
+        builder.prepare().await.unwrap()
     }
 
     #[tokio::test]
@@ -747,7 +751,9 @@ mod tests {
             MissingVacmState::View,
         ] {
             let callbacks = Arc::new(CallbackCounts::default());
-            let agent = vacm_denial_agent(state, Arc::clone(&callbacks)).await;
+            let (agent, _runner, _) = vacm_denial_agent(state, Arc::clone(&callbacks))
+                .await
+                .into_parts();
             let request =
                 community_request(Version::V2c, PduType::GetRequest, b"public", Value::Null);
             let response = agent
@@ -772,7 +778,10 @@ mod tests {
     #[tokio::test]
     async fn vacm_denied_set_never_reaches_callbacks() {
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = vacm_denial_agent(MissingVacmState::Group, Arc::clone(&callbacks)).await;
+        let (agent, _runner, _) =
+            vacm_denial_agent(MissingVacmState::Group, Arc::clone(&callbacks))
+                .await
+                .into_parts();
         let request = community_request(
             Version::V2c,
             PduType::SetRequest,
@@ -805,29 +814,26 @@ mod tests {
     }
 
     #[test]
-    fn command_pdu_selection_accepts_informs_only_on_opt_in() {
-        for acknowledge_informs in [false, true] {
-            for pdu in [
-                PduType::GetRequest,
-                PduType::GetNextRequest,
-                PduType::GetBulkRequest,
-                PduType::SetRequest,
-            ] {
-                assert!(accepts_request_pdu(pdu, acknowledge_informs));
-            }
-            assert!(!accepts_request_pdu(PduType::Response, acknowledge_informs));
-            assert!(!accepts_request_pdu(PduType::TrapV2, acknowledge_informs));
-            assert_eq!(
-                accepts_request_pdu(PduType::InformRequest, acknowledge_informs),
-                acknowledge_informs
-            );
+    fn command_pdu_selection_excludes_notifications() {
+        for pdu in [
+            PduType::GetRequest,
+            PduType::GetNextRequest,
+            PduType::GetBulkRequest,
+            PduType::SetRequest,
+        ] {
+            assert!(accepts_request_pdu(pdu));
         }
+        assert!(!accepts_request_pdu(PduType::Response));
+        assert!(!accepts_request_pdu(PduType::TrapV2));
+        assert!(!accepts_request_pdu(PduType::InformRequest));
     }
 
     #[tokio::test]
     async fn v1_counter64_is_a_version_semantic_drop_not_an_asn_parse_error() {
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = community_test_agent(Arc::clone(&callbacks)).await;
+        let (agent, _runner, _) = community_test_agent(Arc::clone(&callbacks))
+            .await
+            .into_parts();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         for pdu_type in [
@@ -884,7 +890,7 @@ mod tests {
     #[tokio::test]
     async fn agent_counts_wire_decode_failures_but_not_unknown_versions() {
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = community_test_agent(callbacks).await;
+        let (agent, _runner, _) = community_test_agent(callbacks).await.into_parts();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
 
         for malformed in [
@@ -926,15 +932,16 @@ mod tests {
     #[tokio::test]
     async fn agent_keeps_mpd_failures_out_of_asn_parse_errors() {
         let engine_id = b"\x80\x00\x00\x00\x01mpdstats".to_vec();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", Ok)
             .unwrap()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let source = "127.0.0.1:9999".parse().unwrap();
         let request = build_noauth_msg(&engine_id, b"noauthuser", &engine_id);
 
@@ -978,7 +985,9 @@ mod tests {
     #[tokio::test]
     async fn test_v1_non_counter64_request_is_dispatched() {
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = community_test_agent(Arc::clone(&callbacks)).await;
+        let (agent, _runner, _) = community_test_agent(Arc::clone(&callbacks))
+            .await
+            .into_parts();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let request = community_request(Version::V1, PduType::GetRequest, b"public", Value::Null);
 
@@ -999,7 +1008,7 @@ mod tests {
     async fn getbulk_call_path_agent(
         callbacks: Arc<CallbackCounts>,
         max_message_size: usize,
-    ) -> Agent {
+    ) -> PreparedAgent {
         Agent::builder()
             .bind("127.0.0.1:0")
             .community(b"public")
@@ -1007,7 +1016,7 @@ mod tests {
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks)
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
             .unwrap()
     }
@@ -1041,7 +1050,7 @@ mod tests {
                 .unwrap();
 
             let callbacks = Arc::new(CallbackCounts::default());
-            let agent = getbulk_call_path_agent(callbacks, exact).await;
+            let (agent, _runner, _) = getbulk_call_path_agent(callbacks, exact).await.into_parts();
             let response = agent
                 .processor()
                 .handle_v2c(request.clone(), source)
@@ -1052,7 +1061,9 @@ mod tests {
             assert_eq!(agent.snmp_silent_drops(), 0);
 
             let callbacks = Arc::new(CallbackCounts::default());
-            let agent = getbulk_call_path_agent(callbacks, exact - 1).await;
+            let (agent, _runner, _) = getbulk_call_path_agent(callbacks, exact - 1)
+                .await
+                .into_parts();
             let response = agent
                 .processor()
                 .handle_v2c(request.clone(), source)
@@ -1071,7 +1082,7 @@ mod tests {
             assert_eq!(agent.snmp_silent_drops(), 0);
 
             let callbacks = Arc::new(CallbackCounts::default());
-            let agent = getbulk_call_path_agent(callbacks, 1).await;
+            let (agent, _runner, _) = getbulk_call_path_agent(callbacks, 1).await.into_parts();
             assert!(
                 agent
                     .processor()
@@ -1087,7 +1098,9 @@ mod tests {
     #[tokio::test]
     async fn test_v2c_counter64_set_is_dispatched() {
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = community_test_agent(Arc::clone(&callbacks)).await;
+        let (agent, _runner, _) = community_test_agent(Arc::clone(&callbacks))
+            .await
+            .into_parts();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let request = community_request(
             Version::V2c,
@@ -1114,7 +1127,9 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_community_counter64_is_not_counted() {
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = community_test_agent(Arc::clone(&callbacks)).await;
+        let (agent, _runner, _) = community_test_agent(Arc::clone(&callbacks))
+            .await
+            .into_parts();
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let request = community_request(
             Version::V1,
@@ -1255,16 +1270,17 @@ mod tests {
     #[tokio::test]
     async fn strict_v3_agent_rejects_message_suffix() {
         let engine_id = b"\x80\x00\x00\x00\x01strictagt".to_vec();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", Ok)
             .unwrap()
             .allow_all_access()
             .decode_config(crate::DecodeConfig::STRICT)
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let mut request = build_noauth_msg(&engine_id, b"noauthuser", &engine_id).to_vec();
         request.extend_from_slice(&[0x05, 0]);
         assert!(
@@ -1280,16 +1296,17 @@ mod tests {
     async fn accepted_v3_anomalies_reach_request_context_after_usm_processing() {
         let engine_id = b"\x80\x00\x00\x00\x01contexta".to_vec();
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", Ok)
             .unwrap()
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let pdu = Pdu::get_request(77, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]);
         let mut request =
             build_noauth_pdu(&engine_id, b"noauthuser", &engine_id, 0, 0, pdu, 65507).to_vec();
@@ -1318,15 +1335,16 @@ mod tests {
     #[tokio::test]
     async fn test_v3_mismatched_context_engine_id_reports_unknown_context() {
         let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", Ok)
             .unwrap()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let msg = build_noauth_msg(&engine_id, b"noauthuser", b"\x80\x00\x00\x00\x01otherengn");
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -1356,15 +1374,16 @@ mod tests {
     #[tokio::test]
     async fn test_v3_matching_context_engine_id_dispatched() {
         let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", Ok)
             .unwrap()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let msg = build_noauth_msg(&engine_id, b"noauthuser", &engine_id);
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -1390,7 +1409,7 @@ mod tests {
 
         let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("keyed-user", |user| {
@@ -1399,9 +1418,10 @@ mod tests {
             .unwrap()
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), callbacks.clone())
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let pdu = Pdu::get_request(77, &[oid!(1, 3, 6, 1, 4, 1, 99999, 1, 0)]);
         let request = build_noauth_pdu(&engine_id, b"keyed-user", &engine_id, 0, 0, pdu, 65507);
         let response = agent
@@ -1429,7 +1449,7 @@ mod tests {
 
         let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
         let callbacks = Arc::new(CallbackCounts::default());
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("keyed-user", |user| {
@@ -1447,9 +1467,10 @@ mod tests {
                     )
                     .view("all", |view| view.include(oid!(1, 3, 6)))
             })
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let request = build_noauth_pdu(
             &engine_id,
             b"keyed-user",
@@ -1484,15 +1505,16 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_failure_precedes_agent_authorization() {
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(b"\x80\x00\x00\x00\x01agenteng".to_vec())
             .usm_user("user", Ok)
             .unwrap()
             .vacm(|vacm| vacm)
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let request = V3Message::discovery_request(9, crate::UDP_RECEIVE_LIMITS.advertised())
             .unwrap()
             .encode()
@@ -1625,7 +1647,7 @@ mod tests {
             state: Mutex::new(None),
             commits: Arc::new(AtomicU32::new(0)),
         });
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.to_vec())
             .usm_user(username.clone(), Ok)
@@ -1634,9 +1656,10 @@ mod tests {
             .handler(oid!(1, 3, 6, 1, 4, 1, 99999), handler.clone())
             .without_builtin_handlers()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         *handler.state.lock().unwrap() = Some(agent.inner.state.clone());
         agent.inner.state.set_authoritative_elapsed_for_test(127);
 
@@ -1676,15 +1699,16 @@ mod tests {
     #[tokio::test]
     async fn test_v3_empty_context_engine_id_dispatched() {
         let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", Ok)
             .unwrap()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let msg = build_noauth_msg(&engine_id, b"noauthuser", b"");
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -1711,15 +1735,16 @@ mod tests {
     #[tokio::test]
     async fn test_v3_authnopriv_for_noauth_user_reported_before_latched_boots() {
         let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("noauthuser", Ok)
             .unwrap()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         let cycle = u64::from(MAX_ENGINE_TIME) + 1;
         agent
             .inner
@@ -1755,7 +1780,7 @@ mod tests {
         use crate::v3::AuthProtocol;
 
         let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("trapuser", |u| {
@@ -1763,9 +1788,10 @@ mod tests {
             })
             .unwrap()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
 
         let msg = build_authpriv_bad_hmac(&engine_id, b"trapuser", b"wrong-password-1234");
         let source: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -1801,7 +1827,7 @@ mod tests {
         use crate::v3::AuthProtocol;
 
         let engine_id = b"\x80\x00\x00\x00\x01agenteng".to_vec();
-        let agent = Agent::builder()
+        let (agent, _runner, _) = Agent::builder()
             .bind("127.0.0.1:0")
             .engine_id(engine_id.clone())
             .usm_user("trapuser", |u| {
@@ -1809,9 +1835,10 @@ mod tests {
             })
             .unwrap()
             .allow_all_access()
-            .build()
+            .prepare()
             .await
-            .unwrap();
+            .unwrap()
+            .into_parts();
         // Latch engine boots so the Section 2.3 notInTimeWindows rejection
         // would fire first if Step 5 did not precede it.
         let cycle = u64::from(MAX_ENGINE_TIME) + 1;

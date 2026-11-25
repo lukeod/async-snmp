@@ -153,12 +153,6 @@ impl PreparedAgent {
             task: Some(runtime.spawn(runner.run())),
         }
     }
-    #[cfg(test)]
-    fn into_test_agent(self) -> Agent {
-        let (agent, runner, _) = self.into_parts();
-        *agent.test_runner.lock().unwrap() = Some(runner);
-        agent
-    }
 }
 /// Owner of a spawned service. Drop requests shutdown; retain it to observe the result.
 #[must_use = "dropping the running owner requests shutdown"]
@@ -426,50 +420,5 @@ impl AgentRunner {
 fn log_request_result(result: Option<std::result::Result<(), JoinError>>) {
     if let Some(Err(error)) = result {
         tracing::debug!(%error, "agent request task terminated");
-    }
-}
-
-#[cfg(test)]
-impl AgentBuilder {
-    // Existing protocol tests deliberately retain an unstarted runner. Public
-    // callers split the prepared agent or spawn it directly.
-    pub(super) async fn build(self) -> Result<Agent> {
-        Ok(self
-            .discard_notifications()
-            .prepare()
-            .await?
-            .into_test_agent())
-    }
-    pub(super) async fn build_with_dependencies<B, BFut, R, RFut, G, S>(
-        self,
-        bind: B,
-        resolve: R,
-        generate: G,
-        salt: S,
-    ) -> Result<Agent>
-    where
-        B: FnOnce(SocketAddr, Option<usize>) -> BFut,
-        BFut: Future<Output = std::io::Result<UdpSocket>>,
-        R: FnMut(String, u16) -> RFut,
-        RFut: Future<Output = Result<Vec<SocketAddr>>>,
-        G: FnOnce() -> Result<Bytes>,
-        S: FnOnce() -> Result<SaltCounter>,
-    {
-        Ok(self
-            .prepare_with_dependencies(bind, resolve, generate, salt)
-            .await?
-            .into_test_agent())
-    }
-}
-#[cfg(test)]
-impl Agent {
-    pub(super) async fn run(&self) -> Result<()> {
-        let runner = self
-            .test_runner
-            .lock()
-            .unwrap()
-            .take()
-            .ok_or_else(|| Error::Config("agent runner already consumed".into()).boxed())?;
-        runner.run().await
     }
 }
