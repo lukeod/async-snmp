@@ -7,7 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
+## [0.19.0] - 2026-11-25
+
+To upgrade from v0.18, see the [v0.19 migration guide].
+
+[v0.19 migration guide]: https://github.com/lukeod/async-snmp/blob/v0.19.0/docs/migrations/0.19.md
 
 ### Added
 
@@ -1166,7 +1170,8 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.18.1...HEAD
+[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/lukeod/async-snmp/compare/v0.18.1...v0.19.0
 [0.18.1]: https://github.com/lukeod/async-snmp/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/lukeod/async-snmp/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/lukeod/async-snmp/compare/v0.16.0...v0.17.0
