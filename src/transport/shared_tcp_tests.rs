@@ -789,6 +789,7 @@ async fn v3_bidirectional_commands_traps_and_informs_use_one_accepted_connected_
     let mut nb = b.take_notifications().unwrap();
     let sa = accepted(&a).await;
     let sb = b.tcp_sessions()[0].clone();
+    let trap_engine = crate::LocalEngine::new(engine(b"tcp-remote-trap-sender")).unwrap();
     for name in ["noauth", "auth", "priv"] {
         let ab = client(sa.clone(), security(name).into());
         let ba = client(sb.clone(), security(name).into());
@@ -806,7 +807,7 @@ async fn v3_bidirectional_commands_traps_and_informs_use_one_accepted_connected_
         na.recv().await.unwrap();
         nb.recv().await.unwrap();
         let sender = ClientBuilder::new(security(name))
-            .local_authoritative_engine(engine(b"tcp-remote-trap-sender"))
+            .local_engine(trap_engine.clone())
             .build_with_transport(sa.clone())
             .unwrap();
         sender.send_trap(&trap, 1, vec![]).await.unwrap();
@@ -903,10 +904,11 @@ async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_
         .spawn()
         .await
         .unwrap();
+    let trap_engine = crate::LocalEngine::new(engine(b"tcp-standalone-trapper")).unwrap();
     for bound in collector.bound_addresses().to_vec() {
         for name in ["noauth", "auth", "priv"] {
             let builder = Client::builder(bound.local_addr.to_string(), security(name))
-                .local_authoritative_engine(engine(b"tcp-standalone-trapper"))
+                .local_engine(trap_engine.clone())
                 .retry(Retry::none());
             if bound.transport == TransportKind::Tcp {
                 let sender = builder.connect_tcp().await.unwrap();

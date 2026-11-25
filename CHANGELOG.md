@@ -86,6 +86,9 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
   `source`, and agent handlers can read it through `RequestContext::receive_info()`.
 - **Breaking.** The `v3::parse_discovery_response` helpers are removed. Use
   `DiscoveredEngine::new` with the decoded engine ID and advertised `msgMaxSize`.
+- **Breaking.** SNMPv3 client trap senders configure `local_engine` with a
+  `LocalEngine` prepared from their persisted `AuthoritativeEngine`. Attach
+  durable DES/3DES sender state to the engine.
 - **Breaking.** `ResponseMetadata::received_messages` records each accepted PDU's
   kind, receive identity, original message length, and decode anomalies. The
   former `decode_anomalies` field becomes a flattened iterator method.

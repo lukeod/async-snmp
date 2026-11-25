@@ -1995,15 +1995,18 @@ mod tests {
             .unwrap();
         let des_state =
             crate::v3::DesSaltState::install(|_| Ok::<(), std::convert::Infallible>(())).unwrap();
-        let local_engine = crate::v3::AuthoritativeEngine::for_test(&b"local-engine"[..], 1);
-        local_engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
+        let authoritative = crate::v3::AuthoritativeEngine::for_test(&b"local-engine"[..], 1);
+        let local_engine = crate::LocalEngine::new(authoritative.clone()).unwrap();
+        local_engine
+            .set_des_salt_state(Some(des_state.clone()))
+            .unwrap();
         let config = ClientConfig {
             auth: crate::Auth::Usm(security.clone()),
-            local_authoritative_engine: Some(local_engine),
-            des_salt_state: Some(des_state.clone()),
+            local_engine: Some(local_engine),
             ..ClientConfig::default()
         };
         let client = Client::new(TestTransport::new(), config).unwrap();
+        authoritative.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
         let remote = EngineState::new(Bytes::from_static(b"remote-engine"), 77, 123);
         let remote_keys = security.derive_keys(remote.engine_id()).unwrap();
         *client.inner.engine.write().unwrap() = Some(ClientEngine::new(remote, remote_keys));

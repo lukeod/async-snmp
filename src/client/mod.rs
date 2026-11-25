@@ -81,7 +81,6 @@ use crate::v3::{DesSaltState, EngineCache, EngineState, PrivProtocol, SaltCounte
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
-use bytes::Bytes;
 use response_shape::{RequestShape, classify};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -459,19 +458,17 @@ pub struct ClientConfig {
     pub walk_options: WalkOptions,
     /// Shared local generating-engine state (default: None).
     ///
+    /// SNMPv3 traps require a [`crate::LocalEngine`] prepared from a persisted
+    /// [`crate::v3::AuthoritativeEngine`].
     /// Clients sharing this handle use one authoritative clock, persistence
     /// health, AES salt allocator and current DES sender state. Conflicts with
-    /// separate `local_authoritative_engine` or `des_salt_state` configuration.
+    /// separate [`Self::des_salt_state`] configuration.
     /// The transport's advertised receive capacity contributes to the engine
     /// minimum until the last clone of this client is dropped.
     pub local_engine: Option<crate::LocalEngine>,
-    /// Local authoritative engine state for V3 trap sending (default: None).
-    ///
-    /// Per RFC 3412 Section 6.4, the sender is authoritative for trap PDUs.
-    /// Construct this through the persistence-enforcing
-    /// [`AuthoritativeEngine`](crate::v3::AuthoritativeEngine) API.
-    pub local_authoritative_engine: Option<crate::v3::AuthoritativeEngine>,
-    /// Durable local generating-engine state required by DES and 3DES.
+    /// Durable DES/3DES sender state for polling or sending Informs without
+    /// a shared engine. With [`Self::local_engine`], install the state through
+    /// [`crate::LocalEngine::set_des_salt_state`].
     pub des_salt_state: Option<DesSaltState>,
 }
 
@@ -493,10 +490,6 @@ impl std::fmt::Debug for ClientConfig {
             )
             .field("walk_options", &self.walk_options)
             .field("local_engine", &self.local_engine)
-            .field(
-                "local_authoritative_engine",
-                &self.local_authoritative_engine,
-            )
             .field("des_salt_state", &self.des_salt_state)
             .finish()
     }
@@ -520,7 +513,6 @@ impl Default for ClientConfig {
             allow_unauthenticated_v3_time_correction: false,
             walk_options: WalkOptions::default(),
             local_engine: None,
-            local_authoritative_engine: None,
             des_salt_state: None,
         }
     }
@@ -549,13 +541,8 @@ impl ClientConfig {
     }
 
     pub(super) fn validate(&self) -> Result<()> {
-        if self.local_engine.is_some()
-            && (self.local_authoritative_engine.is_some() || self.des_salt_state.is_some())
-        {
-            return Err(Error::Config(
-                "local_engine conflicts with local_authoritative_engine or des_salt_state".into(),
-            )
-            .boxed());
+        if self.local_engine.is_some() && self.des_salt_state.is_some() {
+            return Err(Error::Config("local_engine conflicts with des_salt_state".into()).boxed());
         }
         crate::transport::checked_deadline(self.request_timeout, "request timeout")?;
         crate::transport::checked_deadline(self.send_timeout, "send timeout")?;
@@ -593,16 +580,6 @@ impl ClientConfig {
                 .validate_generating_engine_boots(engine.current_boots_time()?.0)
                 .map_err(|error| Error::Privacy(error).boxed())?;
         }
-        if uses_des
-            && let (Some(engine), Some(state)) = (&self.local_authoritative_engine, &des_state)
-            && engine.engine_boots() != state.engine_boots()
-        {
-            return Err(Error::Config(
-                "DES sender boots must match the local authoritative engine boots".into(),
-            )
-            .boxed());
-        }
-
         Ok(())
     }
 
@@ -629,9 +606,9 @@ impl<T: RequestTransport> Client<T> {
     ///
     /// Returns [`Error::Config`] when the configuration violates a client
     /// invariant, [`Error::Privacy`] for stale shared DES sender state, an
-    /// authoritative persistence error when its clock cannot be acquired, or
-    /// [`Error::RandomSource`] when an `authPriv` client cannot initialize its
-    /// privacy salt.
+    /// authoritative persistence error when validating shared DES state needs
+    /// to persist a clock rollover, or [`Error::RandomSource`] when AES salt
+    /// initialization fails.
     pub fn new(transport: T, config: ClientConfig) -> Result<Self> {
         Self::with_optional_engine_cache(transport, config, None, true)
     }
@@ -642,9 +619,9 @@ impl<T: RequestTransport> Client<T> {
     ///
     /// Returns [`Error::Config`] when the configuration violates a client
     /// invariant, [`Error::Privacy`] for stale shared DES sender state, an
-    /// authoritative persistence error when its clock cannot be acquired, or
-    /// [`Error::RandomSource`] when an `authPriv` client cannot initialize its
-    /// privacy salt.
+    /// authoritative persistence error when validating shared DES state needs
+    /// to persist a clock rollover, or [`Error::RandomSource`] when AES salt
+    /// initialization fails.
     pub fn with_engine_cache(
         transport: T,
         config: ClientConfig,
@@ -666,15 +643,6 @@ impl<T: RequestTransport> Client<T> {
         register_receive_capacity: bool,
     ) -> Result<Self> {
         config.validate_and_precompute()?;
-        if let Some(authoritative) = config.local_authoritative_engine.take() {
-            config.local_engine = Some(crate::LocalEngine::from_prepared(
-                Some(authoritative.clone()),
-                Bytes::copy_from_slice(authoritative.engine_id()),
-                authoritative.engine_boots(),
-                None,
-                config.des_salt_state.take(),
-            ));
-        }
         let salt_counter = config
             .usm_config()
             .filter(|security| {
@@ -728,8 +696,8 @@ impl<T: RequestTransport> Client<T> {
         self.inner.transport.peer_addr()
     }
 
-    /// Shared local engine, when configured directly or through
-    /// [`ClientBuilder::local_authoritative_engine`].
+    /// Shared local engine configured through [`ClientConfig::local_engine`]
+    /// or [`ClientBuilder::local_engine`].
     ///
     /// The returned clone observes current privacy-sender state and persistence
     /// health across every client and managed role using the same engine.
@@ -1276,8 +1244,7 @@ impl<T: RequestTransport> Client<T> {
     /// and snmpTrapOID.0 prefix.
     ///
     /// For V3: uses the persisted local authoritative engine state configured
-    /// through [`ClientBuilder::local_engine`] or
-    /// [`ClientBuilder::local_authoritative_engine`].
+    /// through [`ClientBuilder::local_engine`].
     ///
     /// # Arguments
     ///
@@ -2288,7 +2255,7 @@ mod tests {
             ClientConfig {
                 auth: crate::Auth::usm("trapuser"),
                 send_timeout,
-                local_authoritative_engine: Some(authoritative_engine),
+                local_engine: Some(crate::LocalEngine::new(authoritative_engine).unwrap()),
                 ..Default::default()
             },
         )

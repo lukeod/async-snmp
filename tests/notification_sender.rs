@@ -490,7 +490,7 @@ async fn v3_trap_send_receive() {
             .auth(AuthProtocol::Sha256, "authpass12345678")
             .unwrap(),
     )
-    .local_authoritative_engine(shared_engine)
+    .local_engine(async_snmp::LocalEngine::new(shared_engine).unwrap())
     .connect()
     .await
     .unwrap();
@@ -724,7 +724,7 @@ async fn v1_inform_returns_error() {
 
 #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
 #[tokio::test]
-async fn v3_trap_without_local_authoritative_engine_returns_error() {
+async fn v3_trap_without_local_engine_returns_error() {
     let engine = test_authoritative_engine(b"trap-receiver-engine".to_vec());
     let receiver = NotificationReceiver::builder()
         .bind("127.0.0.1:0")
@@ -745,7 +745,6 @@ async fn v3_trap_without_local_authoritative_engine_returns_error() {
             .auth(AuthProtocol::Sha256, "authpass12345678")
             .unwrap(),
     )
-    // No local authoritative engine state set.
     .connect()
     .await
     .unwrap();

@@ -15,7 +15,8 @@ use async_snmp::notification::{Notification, NotificationAdmissionDecision, Noti
 use async_snmp::v3::AuthoritativeEngine;
 use async_snmp::varbind::VarBind;
 use async_snmp::{
-    Auth, AuthProtocol, Client, NotificationSinkId, PrivProtocol, SecurityLevel, Value, oid,
+    Auth, AuthProtocol, Client, LocalEngine, NotificationSinkId, PrivProtocol, SecurityLevel,
+    Value, oid,
 };
 use std::time::Duration;
 
@@ -149,11 +150,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Send an SNMPv3 trap through a client with local authoritative state.
     println!("--- Client: sending SNMPv3 trap ---");
+    let sender_engine = LocalEngine::new(engine)?;
     let v3_client = Client::builder(
         recv_addr.to_string(),
         async_snmp::UsmConfig::new("v3user").auth(AuthProtocol::Sha256, "authpass12345678")?,
     )
-    .local_authoritative_engine(engine)
+    .local_engine(sender_engine)
     .connect()
     .await?;
     let link_up = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 4);
