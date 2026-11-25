@@ -4273,7 +4273,10 @@ mod tests {
                     );
                     assert_eq!(ack.security_level(), level);
                     if let Some(pdu) = ack.pdu() {
-                        assert_eq!(pdu.error_status_enum(), expected_status);
+                        assert_eq!(
+                            pdu.error_fields().map(|(status, _)| status),
+                            Some(expected_status.as_i32())
+                        );
                     }
                     assert_eq!(receiver.snmp_silent_drops(), 0);
                 } else {
@@ -5933,8 +5936,10 @@ mod tests {
         let pdu = response.pdu().standard().unwrap();
         assert_eq!(pdu.pdu_type(), crate::PduType::Response);
         assert_eq!(pdu.request_id(), request_id);
-        assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
-        assert_eq!(pdu.error_index(), 0);
+        assert_eq!(
+            pdu.error_fields(),
+            Some((crate::ErrorStatus::TooBig.as_i32(), 0))
+        );
         assert!(pdu.varbinds().is_empty());
         assert_eq!(receiver.snmp_silent_drops(), 0);
     }
@@ -5967,7 +5972,10 @@ mod tests {
         .unwrap()
         .value;
         let pdu = response.pdu().standard().unwrap();
-        assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
+        assert_eq!(
+            pdu.error_fields(),
+            Some((crate::ErrorStatus::TooBig.as_i32(), 0))
+        );
         assert!(pdu.varbinds.is_empty());
         assert_eq!(receiver.snmp_silent_drops(), 0);
     }

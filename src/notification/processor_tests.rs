@@ -365,8 +365,10 @@ fn deferred_response_width_growth_falls_back_to_too_big() {
     assert_eq!(decoded.global_data().msg_id(), 71);
     let reply = &decoded.scoped_pdu().unwrap().pdu;
     assert_eq!(reply.request_id(), 42);
-    assert_eq!(reply.error_status_enum(), crate::ErrorStatus::TooBig);
-    assert_eq!(reply.error_index(), 0);
+    assert_eq!(
+        reply.error_fields(),
+        Some((crate::ErrorStatus::TooBig.as_i32(), 0))
+    );
     assert!(reply.varbinds().is_empty());
     assert_eq!(local.inner.snmp_silent_drops.load(Ordering::Relaxed), 0);
 }

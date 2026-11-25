@@ -60,7 +60,7 @@ pub struct MalformedReport;
 /// USM report objects must carry a `Counter32`; unknown report objects preserve
 /// their value in [`ReportStatus::Other`].
 pub fn classify_report(pdu: &Pdu) -> Result<ReportStatus, MalformedReport> {
-    if pdu.pdu_type() != PduType::Report || pdu.error_status() != 0 || pdu.error_index() != 0 {
+    if pdu.pdu_type() != PduType::Report || pdu.error_fields() != Some((0, 0)) {
         return Err(MalformedReport);
     }
 

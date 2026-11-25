@@ -106,8 +106,10 @@ async fn assert_tcp_too_big(peer: &mut TcpStream, request_id: i32) {
     let reply = tcp_reply(peer).await;
     let pdu = reply.pdu().standard().unwrap();
     assert_eq!(pdu.request_id(), request_id);
-    assert_eq!(pdu.error_status_enum(), async_snmp::ErrorStatus::TooBig);
-    assert_eq!(pdu.error_index(), 0);
+    assert_eq!(
+        pdu.error_fields(),
+        Some((async_snmp::ErrorStatus::TooBig.as_i32(), 0))
+    );
     assert!(pdu.varbinds().is_empty());
 }
 

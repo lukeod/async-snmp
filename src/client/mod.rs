@@ -70,9 +70,7 @@ impl Client<UdpHandle> {
         self.inner.transport.stats()
     }
 }
-#[cfg(test)]
-use crate::error::ErrorStatus;
-use crate::error::{Error, Result};
+use crate::error::{Error, ErrorStatus, Result};
 use crate::message::{CommunityMessage, Message, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::{GetBulkPdu, NotificationPdu, Pdu, PduType, RequestPdu, TrapV1Notification};
@@ -111,15 +109,16 @@ pub(crate) fn pdu_to_snmp_error(
     metadata: ResponseMetadata,
 ) -> Box<Error> {
     debug_assert!(pdu.is_error());
-    let status = pdu.error_status_enum();
-    let oid = (pdu.error_index() as usize)
-        .checked_sub(1)
+    let (status, index) = pdu.error_fields().expect("SNMP error response PDU layout");
+    let oid = usize::try_from(index)
+        .ok()
+        .and_then(|idx| idx.checked_sub(1))
         .and_then(|idx| pdu.varbinds.get(idx))
         .map(|vb| Box::new(vb.oid.clone()));
     Error::Snmp {
         target,
-        status,
-        index: pdu.error_index().try_into().unwrap_or(0),
+        status: ErrorStatus::from_i32(status),
+        index: index.try_into().unwrap_or(0),
         oid,
         metadata: Box::new(metadata),
     }
@@ -985,7 +984,8 @@ impl<T: RequestTransport> Client<T> {
         let data = message.encode()?;
         let response = self.send_and_recv(request_id, data).await?;
 
-        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu.pdu_type(), snmp.varbind_count = response.pdu.varbinds.len(), snmp.error_status = response.pdu.error_status(), snmp.error_index = response.pdu.error_index() }, "received {} response", response.pdu.pdu_type());
+        let (error_status, error_index) = response.pdu.error_fields().expect("response PDU layout");
+        tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response.pdu.pdu_type(), snmp.varbind_count = response.pdu.varbinds.len(), snmp.error_status = error_status, snmp.error_index = error_index }, "received {} response", response.pdu.pdu_type());
 
         Ok(response)
     }

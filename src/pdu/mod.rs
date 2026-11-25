@@ -952,7 +952,8 @@ impl Pdu {
         self.request_id = request_id;
     }
 
-    /// Return standard response fields, if this is a standard-layout PDU.
+    /// Return the signed `(error_status, error_index)` fields of a
+    /// standard-layout PDU. GETBULK has [`Self::get_bulk_fields`] instead.
     #[must_use]
     pub fn error_fields(&self) -> Option<(i32, i32)> {
         match self.body {
@@ -975,18 +976,6 @@ impl Pdu {
             } => Some((non_repeaters, max_repetitions)),
             PduBody::Standard { .. } => None,
         }
-    }
-
-    /// Return the standard error status, or zero for GETBULK.
-    #[must_use]
-    pub fn error_status(&self) -> i32 {
-        self.error_fields().map_or(0, |fields| fields.0)
-    }
-
-    /// Return the standard error index, or zero for GETBULK.
-    #[must_use]
-    pub fn error_index(&self) -> i32 {
-        self.error_fields().map_or(0, |fields| fields.1)
     }
 
     /// Set the tag of a standard-layout PDU.
@@ -1034,13 +1023,8 @@ impl Pdu {
     /// Check if this is an error response.
     #[must_use]
     pub fn is_error(&self) -> bool {
-        self.pdu_type() == PduType::Response && self.error_status() != 0
-    }
-
-    /// Returns the error status as an enum.
-    #[must_use]
-    pub fn error_status_enum(&self) -> ErrorStatus {
-        ErrorStatus::from_i32(self.error_status())
+        self.pdu_type() == PduType::Response
+            && self.error_fields().is_some_and(|(status, _)| status != 0)
     }
 
     /// Create a validated successful Response PDU from this decoded/raw PDU.
@@ -1408,7 +1392,8 @@ impl ResponsePdu {
             return Err(invalid_outbound("PDU is not response-class"));
         }
         if pdu.pdu_type() == PduType::Response {
-            OutboundErrorStatus::try_from(pdu.error_status_enum()).map_err(|status| {
+            let (status, _) = pdu.error_fields().expect("response-class PDU layout");
+            OutboundErrorStatus::try_from(ErrorStatus::from_i32(status)).map_err(|status| {
                 invalid_outbound(format!(
                     "unknown error-status {} is receive-only",
                     status.as_i32()
@@ -1440,14 +1425,16 @@ impl ResponsePdu {
     /// Return the validated error status.
     #[must_use]
     pub fn status(&self) -> OutboundErrorStatus {
-        OutboundErrorStatus::try_from(self.pdu.error_status_enum())
+        let (status, _) = self.pdu.error_fields().expect("response-class PDU layout");
+        OutboundErrorStatus::try_from(ErrorStatus::from_i32(status))
             .expect("ResponsePdu never contains an unknown error status")
     }
 
     /// Return the checked one-based error index, if the status uses one.
     #[must_use]
     pub fn error_index(&self) -> Option<ErrorIndex> {
-        let index = u32::try_from(self.pdu.error_index()).ok()?;
+        let (_, index) = self.pdu.error_fields()?;
+        let index = u32::try_from(index).ok()?;
         let index = std::num::NonZeroU32::new(index)?;
         Some(ErrorIndex(index))
     }
@@ -2550,7 +2537,7 @@ mod tests {
             },
             vec![],
         );
-        assert_eq!(unknown.error_status_enum(), ErrorStatus::Unknown(99));
+        assert_eq!(unknown.error_fields(), Some((99, 0)));
         assert!(ResponsePdu::try_from_raw(Version::V2c, unknown).is_err());
     }
 
@@ -2726,6 +2713,7 @@ mod tests {
 
         assert_eq!(decoded.request_id, 12345);
         assert_eq!(decoded.get_bulk_fields(), Some((0, 10)));
+        assert_eq!(decoded.error_fields(), None);
     }
 
     #[test]
@@ -2963,8 +2951,7 @@ mod tests {
 
         assert_eq!(response.pdu_type(), PduType::Response);
         assert_eq!(response.request_id, 99999);
-        assert_eq!(response.error_status(), 0);
-        assert_eq!(response.error_index(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(response.varbinds.len(), 2);
     }
 
@@ -2999,7 +2986,7 @@ mod tests {
             "negative error_index must be accepted to match net-snmp behavior, got {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap().error_index(), -1);
+        assert_eq!(result.unwrap().error_fields(), Some((0, -1)));
     }
 
     #[test]
@@ -3020,7 +3007,7 @@ mod tests {
             "error_index beyond varbind count must be accepted to match net-snmp behavior, got {:?}",
             result.err()
         );
-        assert_eq!(result.unwrap().error_index(), 5);
+        assert_eq!(result.unwrap().error_fields(), Some((5, 5)));
     }
 
     #[test]
@@ -3045,8 +3032,10 @@ mod tests {
 
         let mut decoder = Decoder::new(raw.encode());
         let decoded = Pdu::decode(&mut decoder).expect("received PDUs remain permissive");
-        assert_eq!(decoded.error_status(), ErrorStatus::TooBig.as_i32());
-        assert_eq!(decoded.error_index(), 0);
+        assert_eq!(
+            decoded.error_fields(),
+            Some((ErrorStatus::TooBig.as_i32(), 0))
+        );
         assert_eq!(decoded.varbinds.len(), 1);
     }
 

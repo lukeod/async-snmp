@@ -3518,7 +3518,7 @@ mod tests {
         )
         .unwrap()
         .value;
-        let error_status = response.pdu().standard().unwrap().error_status();
+        let (error_status, _) = response.pdu().standard().unwrap().error_fields().unwrap();
         tokio::time::timeout(Duration::from_secs(1), run)
             .await
             .unwrap()
@@ -3595,7 +3595,7 @@ mod tests {
         .value;
         let response_pdu = decoded.pdu().standard().unwrap();
         assert_eq!(response_pdu.request_id, 7);
-        assert_eq!(response_pdu.error_status(), 0);
+        assert_eq!(response_pdu.error_fields(), Some((0, 0)));
 
         cloned.control().request_shutdown();
         run.await.unwrap().unwrap();
@@ -4539,8 +4539,10 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
-            assert_eq!(response.error_index(), 1);
+            assert_eq!(
+                response.error_fields(),
+                Some((ErrorStatus::GenErr.as_i32(), 1))
+            );
             assert_eq!(response.varbinds, request.varbinds);
         }
     }
@@ -4989,8 +4991,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index(), 2);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::GenErr.as_i32(), 2))
+        );
         assert_eq!(response.varbinds.len(), 2);
         assert_eq!(response.varbinds[0].oid, pdu.varbinds[0].oid);
     }
@@ -5020,8 +5024,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index(), 1);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::GenErr.as_i32(), 1))
+        );
     }
 
     #[tokio::test]
@@ -5046,8 +5052,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index(), 1);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::GenErr.as_i32(), 1))
+        );
     }
 
     #[tokio::test]
@@ -5075,8 +5083,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index(), 2);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::GenErr.as_i32(), 2))
+        );
     }
 
     struct DropBackendHandler;
@@ -5218,8 +5228,10 @@ mod tests {
                                     .clone()
                             }
                         };
-                        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
-                        assert_eq!(response.error_index(), *index);
+                        assert_eq!(
+                            response.error_fields(),
+                            Some((ErrorStatus::GenErr.as_i32(), *index))
+                        );
                         assert_eq!(response.varbinds, pdu.varbinds);
                     }
                 }
@@ -5846,8 +5858,10 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index(), 1);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::GenErr.as_i32(), 1))
+        );
 
         let total = calls.load(std::sync::atomic::Ordering::SeqCst);
         assert_eq!(total, MAX_GETNEXT_SKIP_ITERATIONS);
@@ -5924,8 +5938,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
-        assert_eq!(response.error_index(), 1);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::GenErr.as_i32(), 1))
+        );
         assert_eq!(calls.load(Ordering::SeqCst), MAX_GETNEXT_SKIP_ITERATIONS);
     }
 
@@ -5945,8 +5961,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::NoSuchName.as_i32());
-        assert_eq!(response.error_index(), 1);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::NoSuchName.as_i32(), 1))
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -6177,8 +6195,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            ErrorStatus::from_i32(response.error_status()),
-            ErrorStatus::GenErr,
+            response.error_fields().map(|(status, _)| status),
+            Some(ErrorStatus::GenErr.as_i32()),
             "v1 GETBULK should be rejected"
         );
     }
@@ -6266,8 +6284,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            ErrorStatus::from_i32(response.error_status()),
-            ErrorStatus::NoSuchName,
+            response.error_fields().map(|(status, _)| status),
+            Some(ErrorStatus::NoSuchName.as_i32()),
             "v1 GET of Counter64 should return noSuchName"
         );
     }
@@ -6296,7 +6314,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert!(matches!(response.varbinds[0].value, Value::Counter64(_)));
     }
 
@@ -6733,7 +6751,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(response.varbinds.len(), 1);
     }
 
@@ -6788,7 +6806,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(response.varbinds.len(), 1);
     }
 
@@ -6861,7 +6879,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), 0, "should succeed");
+        assert_eq!(response.error_fields(), Some((0, 0)), "should succeed");
         assert_eq!(
             response.varbinds[0].oid,
             oid!(1, 3, 6, 1, 4, 1, 99999, 2, 0),
@@ -8271,8 +8289,10 @@ mod tests {
         );
 
         let response = finalized_community_response(&agent, Version::V2c, pdu).await;
-        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index(), 0);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::TooBig.as_i32(), 0))
+        );
         assert!(response.varbinds.is_empty());
     }
 
@@ -8302,11 +8322,11 @@ mod tests {
         );
 
         let response = finalized_community_response(&agent, Version::V1, pdu.clone()).await;
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(response.varbinds.len(), request_varbinds.len());
 
         let v2c_response = finalized_community_response(&agent, Version::V2c, pdu).await;
-        assert_eq!(v2c_response.error_status(), 0);
+        assert_eq!(v2c_response.error_fields(), Some((0, 0)));
         assert_eq!(v2c_response.varbinds.len(), request_varbinds.len());
     }
 
@@ -8333,7 +8353,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(response.varbinds.len(), 1);
         assert!(matches!(response.varbinds[0].value, Value::Integer(1)));
     }
@@ -8351,8 +8371,10 @@ mod tests {
         );
 
         let response = finalized_community_response(&agent, Version::V2c, pdu).await;
-        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index(), 0);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::TooBig.as_i32(), 0))
+        );
         assert!(response.varbinds.is_empty());
     }
 
@@ -8378,7 +8400,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(response.varbinds.len(), 1);
         assert_eq!(
             response.varbinds[0].oid,

@@ -155,7 +155,8 @@ mod tests {
                 originator,
                 &counter,
                 |pdu| {
-                    let len = if pdu.error_status() == ErrorStatus::TooBig.as_i32() {
+                    let (status, _) = pdu.error_fields().unwrap();
+                    let len = if status == ErrorStatus::TooBig.as_i32() {
                         40
                     } else {
                         100
@@ -181,7 +182,8 @@ mod tests {
             None,
             &counter,
             |pdu| {
-                let len = if pdu.error_status() == ErrorStatus::TooBig.as_i32() {
+                let (status, _) = pdu.error_fields().unwrap();
+                let len = if status == ErrorStatus::TooBig.as_i32() {
                     40
                 } else {
                     100
@@ -209,7 +211,8 @@ mod tests {
             None,
             &counter,
             |pdu| {
-                if pdu.error_status() == ErrorStatus::TooBig.as_i32() {
+                let (status, _) = pdu.error_fields().unwrap();
+                if status == ErrorStatus::TooBig.as_i32() {
                     assert_eq!(pdu.varbinds, request.varbinds);
                     Ok(Bytes::from(vec![0; 50]))
                 } else {
@@ -248,9 +251,10 @@ mod tests {
                 None,
                 &counter,
                 |pdu| {
-                    if pdu.error_status() == ErrorStatus::TooBig.as_i32() {
+                    let (status, index) = pdu.error_fields().unwrap();
+                    if status == ErrorStatus::TooBig.as_i32() {
                         saw_alternate = true;
-                        assert_eq!(pdu.error_index(), 0);
+                        assert_eq!(index, 0);
                         if version == Version::V1 {
                             assert_eq!(pdu.varbinds, request.varbinds);
                         } else {

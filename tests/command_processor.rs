@@ -330,7 +330,7 @@ async fn community_operations_share_handlers_and_original_input_metadata() {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(decoded(response.bytes).error_status(), 0);
+        assert_eq!(decoded(response.bytes).error_fields(), Some((0, 0)));
         assert_eq!(state.value.load(Ordering::SeqCst), 77);
         assert_eq!(state.finalized.load(Ordering::SeqCst), 1);
         processor.control().shutdown(WAIT).await.unwrap();
@@ -554,7 +554,12 @@ async fn stream_sizes_and_set_preflight_use_exact_input_limits() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(decoded(response.bytes).error_status(), 1);
+    assert_eq!(
+        decoded(response.bytes)
+            .error_fields()
+            .map(|(status, _)| status),
+        Some(1)
+    );
     assert_eq!(state.tests.load(Ordering::SeqCst), 0);
     processor.control().shutdown(WAIT).await.unwrap();
 }

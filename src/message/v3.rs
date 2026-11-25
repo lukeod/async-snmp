@@ -1093,8 +1093,10 @@ mod tests {
                 .expect("receive path accepts the PDU")
                 .value;
         let pdu = decoded.pdu().unwrap();
-        assert_eq!(pdu.error_status(), crate::ErrorStatus::TooBig.as_i32());
-        assert_eq!(pdu.error_index(), 0);
+        assert_eq!(
+            pdu.error_fields(),
+            Some((crate::ErrorStatus::TooBig.as_i32(), 0))
+        );
         assert_eq!(pdu.varbinds.len(), 1);
         let error = decoded.encode().unwrap_err();
         assert!(matches!(error.as_ref(), Error::InvalidMessage(_)));

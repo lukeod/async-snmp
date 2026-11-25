@@ -1405,32 +1405,36 @@ proptest! {
 
         prop_assert_eq!(response.pdu_type(), PduType::Response);
         prop_assert_eq!(response.request_id(), pdu.request_id());
-        prop_assert_eq!(response.error_status(), 0);
-        prop_assert_eq!(response.error_index(), 0);
+        prop_assert_eq!(response.error_fields(), Some((0, 0)));
         prop_assert_eq!(response.varbinds(), pdu.varbinds());
     }
 
     #[test]
     fn pdu_is_error_consistent(pdu in arb_pdu_full_range()) {
-        prop_assert_eq!(
-            pdu.is_error(),
-            pdu.pdu_type() == PduType::Response && pdu.error_status() != 0
-        );
+        let is_error = pdu.is_error();
+        let (_, body, _) = pdu.into_raw_parts();
+        let expected = matches!(body, PduBody::Standard {
+            pdu_type: StandardPduType::Response,
+            error_status,
+            ..
+        } if error_status != 0);
+        prop_assert_eq!(is_error, expected);
     }
 
     #[test]
-    fn pdu_error_status_enum_no_panic(error_status in any::<i32>()) {
+    fn raw_pdu_preserves_signed_error_fields(error_status in any::<i32>(), error_index in any::<i32>()) {
         let pdu = Pdu::from_raw_parts(
             0,
             PduBody::Standard {
                 pdu_type: StandardPduType::Response,
                 error_status,
-                error_index: 0,
+                error_index,
             },
             vec![],
         );
 
-        let _status = pdu.error_status_enum();
+        prop_assert_eq!(pdu.error_fields(), Some((error_status, error_index)));
+        prop_assert_eq!(async_snmp::ErrorStatus::from_i32(error_status).as_i32(), error_status);
     }
 
     #[test]

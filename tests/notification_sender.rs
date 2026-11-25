@@ -66,8 +66,7 @@ fn pdu_trap_v2_has_correct_varbind_prefix() {
 
     assert_eq!(pdu.pdu_type(), async_snmp::PduType::TrapV2);
     assert_eq!(pdu.request_id(), 1);
-    assert_eq!(pdu.error_status(), 0);
-    assert_eq!(pdu.error_index(), 0);
+    assert_eq!(pdu.error_fields(), Some((0, 0)));
     assert_eq!(pdu.varbinds().len(), 3);
 
     // First varbind: sysUpTime.0

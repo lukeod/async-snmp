@@ -1524,7 +1524,9 @@ impl<T: RequestTransport> Client<T> {
                         .with_prior_response_metadata(&exchange_metadata));
                     }
 
-                    tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type(), snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = response_pdu.error_status(), snmp.error_index = response_pdu.error_index() }, "received V3 {} response", response_pdu.pdu_type());
+                    let (error_status, error_index) =
+                        response_pdu.error_fields().expect("response PDU layout");
+                    tracing::debug!(target: "async_snmp::client", { snmp.pdu_type = ?response_pdu.pdu_type(), snmp.varbind_count = response_pdu.varbinds.len(), snmp.error_status = error_status, snmp.error_index = error_index }, "received V3 {} response", response_pdu.pdu_type());
 
                     exchange_metadata.append(message_metadata);
 

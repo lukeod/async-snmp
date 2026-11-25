@@ -767,10 +767,9 @@ mod tests {
                 .value;
             let response = response.pdu().standard().unwrap();
             assert_eq!(
-                response.error_status(),
-                crate::ErrorStatus::AuthorizationError.as_i32()
+                response.error_fields(),
+                Some((crate::ErrorStatus::AuthorizationError.as_i32(), 0))
             );
-            assert_eq!(response.error_index(), 0);
             assert_no_callbacks(&callbacks);
         }
     }
@@ -799,10 +798,9 @@ mod tests {
             .value;
         let response = response.pdu().standard().unwrap();
         assert_eq!(
-            response.error_status(),
-            crate::ErrorStatus::AuthorizationError.as_i32()
+            response.error_fields(),
+            Some((crate::ErrorStatus::AuthorizationError.as_i32(), 0))
         );
-        assert_eq!(response.error_index(), 0);
         assert_no_callbacks(&callbacks);
     }
 
@@ -1075,8 +1073,8 @@ mod tests {
                 .value;
             let response_pdu = decoded.pdu().standard().unwrap();
             assert_eq!(
-                response_pdu.error_status(),
-                crate::ErrorStatus::TooBig.as_i32()
+                response_pdu.error_fields(),
+                Some((crate::ErrorStatus::TooBig.as_i32(), 0))
             );
             assert!(response_pdu.varbinds.is_empty());
             assert_eq!(agent.snmp_silent_drops(), 0);
@@ -1437,7 +1435,7 @@ mod tests {
             response.global_data.msg_flags.security_level,
             SecurityLevel::NoAuthNoPriv
         );
-        assert_eq!(response.pdu().unwrap().error_status(), 0);
+        assert_eq!(response.pdu().unwrap().error_fields(), Some((0, 0)));
         assert_eq!(callbacks.get.load(Ordering::Relaxed), 1);
         assert_eq!(agent.usm_unsupported_sec_levels(), 0);
     }
@@ -1495,10 +1493,9 @@ mod tests {
         );
         let pdu = response.pdu().unwrap();
         assert_eq!(
-            pdu.error_status(),
-            crate::ErrorStatus::AuthorizationError.as_i32()
+            pdu.error_fields(),
+            Some((crate::ErrorStatus::AuthorizationError.as_i32(), 0))
         );
-        assert_eq!(pdu.error_index(), 0);
         assert_no_callbacks(&callbacks);
         assert_eq!(agent.usm_unsupported_sec_levels(), 0);
     }
@@ -1685,7 +1682,7 @@ mod tests {
         let decoded = V3Message::decode(response, crate::DecodeConfig::default())
             .unwrap()
             .value;
-        assert_eq!(decoded.pdu().unwrap().error_status(), 0);
+        assert_eq!(decoded.pdu().unwrap().error_fields(), Some((0, 0)));
         let usm =
             UsmSecurityParams::decode(decoded.security_params, crate::DecodeConfig::default())
                 .unwrap()

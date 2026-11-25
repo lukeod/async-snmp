@@ -879,8 +879,10 @@ mod tests {
         .value;
         let reply = &response.scoped_pdu().unwrap().pdu;
         assert_eq!(reply.request_id(), 17);
-        assert_eq!(reply.error_status_enum(), crate::ErrorStatus::TooBig);
-        assert_eq!(reply.error_index(), 0);
+        assert_eq!(
+            reply.error_fields(),
+            Some((crate::ErrorStatus::TooBig.as_i32(), 0))
+        );
         assert!(reply.varbinds().is_empty());
         let usm = crate::v3::UsmSecurityParams::decode(
             response.security_params,

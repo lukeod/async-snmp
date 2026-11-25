@@ -93,6 +93,8 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
   `LocalEngineHealth` for agent and notification receiver health. Legacy
   client and agent type re-exports are removed. See the migration guide for
   the import paths.
+- **Breaking.** Read raw PDU error status and index with `Pdu::error_fields()`.
+  GETBULK PDUs return `None` and expose their parameters through `get_bulk_fields()`.
 - **Breaking.** `ResponseMetadata::received_messages` records each accepted PDU's
   kind, receive identity, original message length, and decode anomalies. The
   former `decode_anomalies` field becomes a flattened iterator method.

@@ -266,9 +266,11 @@ fn inform_response_fits_before_delivery_on_udp_and_tcp() {
                 .unwrap()
                 .value;
             let pdu = decoded.pdu().standard().unwrap();
-            assert_eq!(pdu.error_status_enum(), async_snmp::ErrorStatus::TooBig);
+            assert_eq!(
+                pdu.error_fields(),
+                Some((async_snmp::ErrorStatus::TooBig.as_i32(), 0))
+            );
             assert_eq!(pdu.request_id(), request.request_id());
-            assert_eq!(pdu.error_index(), 0);
             assert!(pdu.varbinds().is_empty());
         }
     }

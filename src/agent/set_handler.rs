@@ -482,11 +482,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(
-                response.error_status(),
-                ErrorStatus::GenErr.as_i32(),
-                "status for {version:?}"
+                response.error_fields(),
+                Some((ErrorStatus::GenErr.as_i32(), 2)),
+                "error fields for {version:?}"
             );
-            assert_eq!(response.error_index(), 2, "index for {version:?}");
         }
     }
 
@@ -530,7 +529,7 @@ mod tests {
             .unwrap();
 
         // Should have error on varbind 2
-        assert_eq!(response.error_index(), 2);
+        assert_eq!(response.error_fields().map(|(_, index)| index), Some(2));
         // PreparedSet::free should have been called once for the first varbind.
         assert_eq!(free_count.load(Ordering::Relaxed), 1);
     }
@@ -573,7 +572,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
     }
 
@@ -694,8 +693,10 @@ mod tests {
                 .unwrap()
                 .value;
         let response = response.pdu().standard().unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::TooBig.as_i32());
-        assert_eq!(response.error_index(), 0);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::TooBig.as_i32(), 0))
+        );
         assert!(response.varbinds.is_empty());
         // The commit phase must never run for an oversized SET.
         assert_eq!(commit_count.load(Ordering::Relaxed), 0);
@@ -740,7 +741,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(commit_count.load(Ordering::Relaxed), 1);
     }
 
@@ -783,7 +784,7 @@ mod tests {
             .unwrap()
             .unwrap();
 
-        assert_eq!(response.error_index(), 1);
+        assert_eq!(response.error_fields().map(|(_, index)| index), Some(1));
         assert_eq!(free_count.load(Ordering::Relaxed), 0);
     }
 
@@ -1002,8 +1003,10 @@ mod tests {
         expected_undos: &[u32],
         expected_frees: &[u32],
     ) {
-        assert_eq!(response.error_status(), ErrorStatus::CommitFailed.as_i32());
-        assert_eq!(response.error_index(), failed_index);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::CommitFailed.as_i32(), failed_index))
+        );
         assert_eq!(calls.test, set_oids(&[1, 2, 3]));
         assert_eq!(calls.commit, set_oids(expected_commits));
         assert_eq!(calls.undo, set_oids(expected_undos));
@@ -1062,11 +1065,10 @@ mod tests {
             };
 
             assert_eq!(
-                response.error_status(),
-                expected_status.as_i32(),
-                "status for {version:?}"
+                response.error_fields(),
+                Some((expected_status.as_i32(), 2)),
+                "error fields for {version:?}"
             );
-            assert_eq!(response.error_index(), 2, "index for {version:?}");
             assert_eq!(calls.commit, set_oids(&[1, 2]));
             assert_eq!(calls.undo, set_oids(&[2, 1]));
             assert_eq!(calls.free, set_oids(&[3]));
@@ -1087,14 +1089,9 @@ mod tests {
                 };
 
                 assert_eq!(
-                    response.error_status(),
-                    expected_status.as_i32(),
-                    "status for {version:?} with undo failure at {failed_undo}"
-                );
-                assert_eq!(
-                    response.error_index(),
-                    expected_index,
-                    "index for {version:?} with undo failure at {failed_undo}"
+                    response.error_fields(),
+                    Some((expected_status.as_i32(), expected_index)),
+                    "error fields for {version:?} with undo failure at {failed_undo}"
                 );
                 assert_eq!(calls.test, set_oids(&[1, 2, 3]));
                 assert_eq!(calls.commit, set_oids(&[1, 2]));
@@ -1119,14 +1116,9 @@ mod tests {
             };
 
             assert_eq!(
-                response.error_status(),
-                expected_status.as_i32(),
-                "status for {version:?}"
-            );
-            assert_eq!(
-                response.error_index(),
-                expected_index,
-                "index for {version:?}"
+                response.error_fields(),
+                Some((expected_status.as_i32(), expected_index)),
+                "error fields for {version:?}"
             );
             assert_eq!(calls.undo, set_oids(&[2, 1]));
         }
@@ -1136,7 +1128,7 @@ mod tests {
     async fn test_all_commits_succeed_finalize_in_reverse_order() {
         let (response, calls, values) = run_commit_scenario(Version::V2c, 99, &[]).await;
 
-        assert_eq!(response.error_status(), 0);
+        assert_eq!(response.error_fields(), Some((0, 0)));
         assert_eq!(calls.test, set_oids(&[1, 2, 3]));
         assert_eq!(calls.commit, set_oids(&[1, 2, 3]));
         assert!(calls.undo.is_empty());
@@ -1181,8 +1173,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let calls = calls.lock().unwrap().clone();
-        assert_eq!(response.error_status(), ErrorStatus::WrongValue.as_i32());
-        assert_eq!(response.error_index(), 2);
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::WrongValue.as_i32(), 2))
+        );
         assert_eq!(calls.test, set_oids(&[1, 2]));
         assert!(calls.commit.is_empty());
         assert!(calls.undo.is_empty());
@@ -1313,7 +1307,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(response.error_status(), ErrorStatus::NoError.as_i32());
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::NoError.as_i32(), 0))
+        );
         assert_eq!(
             *events.lock().unwrap(),
             vec![
@@ -1561,8 +1558,8 @@ mod tests {
         release_undo.add_permits(1);
         let first_response = first.await.unwrap().unwrap().unwrap();
         assert_eq!(
-            first_response.error_status(),
-            ErrorStatus::CommitFailed.as_i32()
+            first_response.error_fields().map(|(status, _)| status),
+            Some(ErrorStatus::CommitFailed.as_i32())
         );
         second_test_started
             .acquire()
@@ -1571,8 +1568,8 @@ mod tests {
             .forget();
         let second_response = second.await.unwrap().unwrap().unwrap();
         assert_eq!(
-            second_response.error_status(),
-            ErrorStatus::NoError.as_i32()
+            second_response.error_fields(),
+            Some((ErrorStatus::NoError.as_i32(), 0))
         );
         assert_eq!(value.load(Ordering::SeqCst), 20);
     }
@@ -1756,7 +1753,10 @@ mod tests {
         release.add_permits(1);
         let response = task.await.unwrap().unwrap();
 
-        assert_eq!(response.error_status(), ErrorStatus::GenErr.as_i32());
+        assert_eq!(
+            response.error_fields().map(|(status, _)| status),
+            Some(ErrorStatus::GenErr.as_i32())
+        );
         assert_eq!(
             *calls.lock().unwrap(),
             vec![("free", set_oid(2)), ("free", set_oid(1))]
@@ -1777,7 +1777,10 @@ mod tests {
         release.add_permits(1);
         let response = task.await.unwrap().unwrap();
 
-        assert_eq!(response.error_status(), ErrorStatus::CommitFailed.as_i32());
+        assert_eq!(
+            response.error_fields().map(|(status, _)| status),
+            Some(ErrorStatus::CommitFailed.as_i32())
+        );
         assert_eq!(
             *calls.lock().unwrap(),
             vec![
@@ -1803,7 +1806,10 @@ mod tests {
         release.add_permits(1);
         let response = task.await.unwrap().unwrap();
 
-        assert_eq!(response.error_status(), ErrorStatus::NoError.as_i32());
+        assert_eq!(
+            response.error_fields(),
+            Some((ErrorStatus::NoError.as_i32(), 0))
+        );
         assert_eq!(
             *calls.lock().unwrap(),
             vec![
