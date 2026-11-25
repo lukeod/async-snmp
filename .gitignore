@@ -21,7 +21,8 @@ target
 #.idea/
 
 # Project-specific
-/docs
+/docs/*
+!/docs/migrations/
 /fuzz/target
 /reference
 /tests/vendor/

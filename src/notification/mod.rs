@@ -31,7 +31,9 @@
 //! `spawn()` and `spawn_on()` provide an owner retaining both the consumer and
 //! task. Their owner requests shutdown on drop. Delivery is bounded (256 events
 //! by default), with at most 64 concurrent protocol tasks and bounded
-//! UDP input. A full queue drops deliverable Informs before acknowledgement.
+//! UDP input. A full UDP delivery queue drops deliverable Informs before
+//! acknowledgement. On TCP, [session admission](#shared-endpoint-client-exchanges)
+//! determines whether the session waits for capacity or closes.
 //! In application-controlled mode, events carry [`PendingInformAck`]. Persist or
 //! process the event, then call its `acknowledge()` method. At most 256 Informs
 //! remain outstanding by default, including dequeued events; their default
@@ -55,11 +57,12 @@
 //! runner's terminal result; join the runner or inspect its control status.
 //! Retransmitted Informs are independent events, with no exactly-once promise.
 //!
-//! # Caller-owned I/O
+//! # Choose caller-owned I/O
 //!
-//! [`NotificationProcessor::builder`] prepares runtime-free protocol state without
-//! sockets or tasks. Feed original complete bytes and receive metadata through
-//! [`crate::ProcessingInput`] with explicit limits; register custom endpoint
+//! Use [`NotificationProcessor::builder`] when your application owns I/O and
+//! message framing. It prepares runtime-free protocol state. Feed original
+//! complete bytes and receive metadata through [`crate::ProcessingInput`]
+//! with explicit limits; register custom endpoint
 //! capacity on [`crate::LocalEngine`]. Metadata and pre-authentication selectors
 //! are untrusted routing hints. Select a logical [`crate::UsmSecurityContext`]
 //! once, then apply security; do not retry contexts on failure.
@@ -117,7 +120,7 @@
 //! use std::convert::Infallible;
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
-//! # // Replace this no-op with durable storage in an application.
+//! // Persist the engine ID and boots in durable storage in a deployed application.
 //! let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
 //!     Ok::<(), Infallible>(())
 //! })?;
@@ -160,13 +163,14 @@
 //! admission uses the exchange deadline and is cancelled by endpoint shutdown.
 //!
 //! With the agent feature, `AgentBuilder::notifications` attaches this consumer
-//! to the agent's command listeners and configured command sessions. These are
-//! the sources the receiver exposes. The agent's own endpoint view also includes
-//! dedicated notification sinks. Configure the shared engine, users, and client
-//! capability on the agent.
-//! Attached control shutdown closes only notifications; standalone control
-//! shutdown stops its endpoint service. Consumer closure never enables itself
-//! again through a retained control or client handle.
+//! to the agent's command listeners and configured command sessions. Configure
+//! those sources, the shared engine, users, and client exchange capability on
+//! the agent. Set an explicit notification admission policy when the agent has
+//! USM users or an explicit USM security context. The attached receiver lists the
+//! command listeners and sessions. The agent's endpoint list also includes its
+//! dedicated notification sinks. Closing the attached consumer or shutting down
+//! its control permanently disables notification delivery for that service
+//! instance. Standalone control shutdown stops the endpoint service.
 //!
 //! Configure `.listener(ListenerSource::udp(...))` and
 //! `.listener(ListenerSource::tcp(...))` for multiple sources, or
@@ -206,7 +210,7 @@
 //! use std::convert::Infallible;
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
-//! # // Replace this no-op with durable storage in an application.
+//! // Persist the engine ID and boots in durable storage in a deployed application.
 //! let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
 //!     Ok::<(), Infallible>(())
 //! })?;
@@ -299,7 +303,7 @@
 //! that requires at least [`SecurityLevel::AuthNoPriv`] when authenticated
 //! input is required.
 //!
-//! # Caller-owned I/O
+//! # Process messages with caller-owned I/O
 //!
 //! [`NotificationProcessor`] accepts complete [`crate::ProcessingInput`] values
 //! without owning sockets, tasks or delivery queues. It uses the same protocol,
@@ -750,13 +754,15 @@ pub mod oids {
 
 /// Builder for `NotificationReceiver`.
 ///
-/// Configures the bind address, optional community filtering for v1/v2c, the
-/// standard notification varbind validation policy, and USM credentials for
-/// v3. Community filtering and USM users are independent and may be combined;
-/// a single receiver then handles all versions on one port. Any USM user also
-/// requires a persisted [`AuthoritativeEngine`] and an explicit notification
-/// admission policy. See the
-/// [module docs](crate::notification#mixed-versions-on-one-port).
+/// Configure a standalone listener service or the receive policies for an
+/// agent's attached notification role. A standalone receiver can bind one UDP
+/// socket, take ownership of a supplied socket, or serve an explicit UDP/TCP
+/// listener set.
+///
+/// Combine community filtering for v1/v2c and USM credentials for v3 to
+/// [receive all versions on one port](crate::notification#mixed-versions-on-one-port).
+/// USM users require a persisted [`AuthoritativeEngine`] and an explicit
+/// notification admission policy.
 pub struct NotificationReceiverBuilder {
     listeners: Vec<crate::ListenerSource>,
     network_explicit: bool,
@@ -866,12 +872,20 @@ impl NotificationReceiverBuilder {
         }
     }
 
-    /// Add a UDP endpoint or TCP acceptor. Explicit sources replace the default UDP bind.
+    /// Add a UDP endpoint or TCP listener to a standalone receiver.
+    ///
+    /// Explicit sources replace the default UDP bind. They conflict with
+    /// [`Self::bind`] and [`Self::from_socket`]. Add a supplied socket to a
+    /// listener set with [`ListenerSource::udp_socket`](crate::ListenerSource::udp_socket)
+    /// or [`ListenerSource::tcp_listener`](crate::ListenerSource::tcp_listener).
     pub fn listener(mut self, source: crate::ListenerSource) -> Self {
         self.listeners.push(source);
         self
     }
-    /// Prepare an outbound or supplied connected TCP session with this notification role.
+    /// Add an outbound or supplied connected TCP session to a standalone receiver.
+    ///
+    /// This is an explicit source and follows the same configuration rules as
+    /// [`Self::listener`].
     pub fn session(mut self, source: crate::TcpTransportBuilder) -> Self {
         self.listeners.push(crate::ListenerSource::Session(source));
         self
@@ -907,9 +921,10 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Set the UDP bind address.
+    /// Bind a standalone receiver to one UDP address.
     ///
     /// Default is `0.0.0.0:162` (UDP, standard SNMP trap port).
+    /// Use [`Self::listener`] and [`Self::session`] to configure a listener set.
     #[must_use]
     pub fn bind(mut self, addr: impl Into<String>) -> Self {
         self.bind_addr = addr.into();
@@ -917,8 +932,14 @@ impl NotificationReceiverBuilder {
         self
     }
 
-    /// Supply an owned bound, unconnected socket, retaining its options and runtime registration.
-    /// An explicit bind address conflicts with this source.
+    /// Supply one owned, bound, unconnected UDP socket to a standalone receiver.
+    ///
+    /// Use this when the application binds the socket or sets socket options
+    /// before handing it over. The receiver keeps the socket's binding and
+    /// Tokio runtime registration. Its runner reads and closes the socket.
+    /// This method conflicts with [`Self::bind`], [`Self::listener`], and
+    /// [`Self::session`]. To include a supplied socket in a listener set, use
+    /// [`Self::listener`] with [`ListenerSource::udp_socket`](crate::ListenerSource::udp_socket).
     pub fn from_socket(mut self, socket: UdpSocket) -> Self {
         self.socket = Some(socket);
         self
@@ -1047,7 +1068,7 @@ impl NotificationReceiverBuilder {
     /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-    /// # // Replace this no-op with durable storage in an application.
+    /// // Persist the engine ID and boots in durable storage in a deployed application.
     /// let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
     ///     Ok::<(), Infallible>(())
     /// })?;
@@ -1869,7 +1890,7 @@ impl Notification {
 /// use std::convert::Infallible;
 ///
 /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-/// # // Replace this no-op with durable storage in an application.
+/// // Persist the engine ID and boots in durable storage in a deployed application.
 /// let engine = AuthoritativeEngine::install(b"receiver-engine".to_vec(), |_| {
 ///     Ok::<(), Infallible>(())
 /// })?;

@@ -10,23 +10,7 @@
 //! [`RunningUdpEndpoint`]; dropping that owner requests shutdown. The detached
 //! runner path lets an application's supervisor own and join the task directly.
 //!
-//! ```rust,no_run
-//! use async_snmp::{Auth, ClientBuilder, UdpEndpoint};
-//! # async fn example() -> async_snmp::Result<()> {
-//! let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await.unwrap();
-//! let (endpoint, runner) = UdpEndpoint::builder()
-//!     .from_socket(socket).prepare().await?.into_parts();
-//! let control = endpoint.control();
-//! let client = ClientBuilder::new(Auth::v2c("public"))
-//!     .build_with_transport(endpoint.handle("192.0.2.1:161".parse().unwrap())?)?;
-//! let task = tokio::spawn(runner.run());
-//! // Use client, then stop admission and observe completion.
-//! control.request_shutdown();
-//! task.await.expect("UDP driver task panicked")?;
-//! # let _ = client;
-//! # Ok(())
-//! # }
-//! ```
+//! To adopt an existing socket, see [`UdpEndpointBuilder::from_socket`].
 //!
 //! # Response demultiplexing
 //!
@@ -655,9 +639,63 @@ impl UdpEndpointBuilder {
         self
     }
 
-    /// Supply an owned, bound, unconnected Tokio socket. Its runtime registration
-    /// and socket options are retained. Explicit bind/buffer options conflict.
-    /// Destination-metadata collection is enabled where supported by the platform.
+    /// Adopt a bound, unconnected Tokio UDP socket.
+    ///
+    /// Use an existing socket for socket activation or to configure the socket
+    /// before handoff. For an inherited `std::net::UdpSocket`, enable nonblocking
+    /// mode and call [`UdpSocket::from_std`] inside the Tokio I/O runtime.
+    /// Set the local address and kernel buffer sizes before handoff. Preparation
+    /// rejects builder bind and kernel buffer options for a supplied socket and
+    /// can enable destination address metadata where the platform supports it.
+    ///
+    /// Give the endpoint runner exclusive access to incoming datagrams after
+    /// handoff. Keep the socket's original Tokio I/O runtime running, including
+    /// when you use [`Self::spawn_on`] to run the endpoint on a different runtime.
+    /// To supply sockets to a managed listener set, use
+    /// [`crate::ListenerSource::udp_socket`].
+    ///
+    /// # Example
+    ///
+    /// Hand off a loopback socket to an endpoint, drive the runner, and send an
+    /// Inform. The receiver sees the source address chosen before handoff.
+    ///
+    /// ```rust
+    /// use async_snmp::{Auth, ClientBuilder, NotificationReceiver, UdpEndpoint, oid};
+    /// use std::time::Duration;
+    /// use tokio::net::UdpSocket;
+    ///
+    /// #[tokio::main(flavor = "current_thread")]
+    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    ///     let mut receiver = NotificationReceiver::builder()
+    ///         .bind("127.0.0.1:0")
+    ///         .community("public")
+    ///         .spawn()
+    ///         .await?;
+    ///     let destination = receiver.bound_addresses()[0].local_addr;
+    ///     let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    ///     let source = socket.local_addr()?;
+    ///     let (endpoint, runner) = UdpEndpoint::builder()
+    ///         .from_socket(socket)
+    ///         .prepare()
+    ///         .await?
+    ///         .into_parts();
+    ///     let task = tokio::spawn(runner.run());
+    ///
+    ///     let client = ClientBuilder::new(Auth::v2c("public"))
+    ///         .build_with_transport(endpoint.handle(destination)?)?;
+    ///     let cold_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    ///     client.send_inform(&cold_start, 0, vec![]).await?;
+    ///     let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
+    ///         .await?
+    ///         .expect("receiver closed before delivery");
+    ///     assert_eq!(event.receive_info.peer_addr(), source);
+    ///
+    ///     endpoint.control().request_shutdown();
+    ///     task.await??;
+    ///     receiver.shutdown().await?;
+    ///     Ok(())
+    /// }
+    /// ```
     #[must_use]
     pub fn from_socket(mut self, socket: UdpSocket) -> Self {
         self.socket = Some(socket);

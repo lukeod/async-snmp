@@ -46,8 +46,10 @@
 //! consumer alongside the handle and runner. For a spawned agent, use
 //! [`RunningAgent::take_notifications`]. The notification role inherits the
 //! prepared engine, USM users, privacy sender state and message/security counters.
-//! Configure engine identity and users only on the agent.
-//! The role keeps its own community, admission, decoding and delivery policies.
+//! Configure listeners, engine identity, and USM users on the agent. Configure
+//! community, admission, decoding, and delivery policies on the notification
+//! builder. When the agent has USM users or an explicit USM security context,
+//! the notification role requires an explicit admission policy.
 //!
 //! Closing the notification consumer or its attached control disables that role.
 //! [`Agent::close_commands`] disables commands while notifications and exchanges
@@ -642,29 +644,68 @@ impl AgentBuilder {
         self.client_exchanges = enabled;
         self
     }
-    /// Attach one notification consumer to the agent's command listeners and
-    /// configured command sessions. The consumer inherits the agent's engine,
-    /// USM users and privacy sender state. Obtain it through [`PreparedAgent::into_parts`] or
+    /// Receive notifications on the agent's command listeners and sessions.
+    ///
+    /// Set listeners, network limits, client exchanges, the local engine, and
+    /// USM credentials on this agent builder. The notification builder accepts
+    /// its own community, admission, decoding, delivery, and acknowledgement
+    /// policies. When the agent has USM users or an explicit USM security
+    /// context, set an explicit notification
+    /// [admission policy](crate::NotificationReceiverBuilder::admission_policy).
+    ///
+    /// Get the single consumer from [`PreparedAgent::into_parts`] or
     /// [`RunningAgent::take_notifications`].
+    ///
+    /// # Example
+    ///
+    /// Attach a receiver to an agent builder with USM already configured.
+    /// The receiver admits authenticated SNMPv3 notifications.
+    ///
+    /// ```rust
+    /// use async_snmp::{AgentBuilder, NotificationAdmissionDecision, NotificationReceiver};
+    /// use async_snmp::SecurityLevel;
+    ///
+    /// fn attach_notifications(agent: AgentBuilder) -> AgentBuilder {
+    ///     let receiver = NotificationReceiver::builder().admission_policy(|info| {
+    ///         if info.security_level >= Some(SecurityLevel::AuthNoPriv) {
+    ///             NotificationAdmissionDecision::Admit
+    ///         } else {
+    ///             NotificationAdmissionDecision::Reject
+    ///         }
+    ///     });
+    ///     agent.notifications(receiver)
+    /// }
+    /// ```
     #[must_use]
     pub fn notifications(mut self, role: crate::notification::NotificationReceiverBuilder) -> Self {
         self.notifications = Some(role);
         self
     }
 
-    /// Add an explicit UDP or TCP listener. When present, replaces the default
-    /// UDP bind; an explicit `bind` or `recv_buffer_size` configuration conflicts.
+    /// Add a UDP endpoint or a TCP listener to the service.
+    ///
+    /// Explicit sources replace the default UDP bind and conflict with
+    /// [`Self::bind`] and [`Self::recv_buffer_size`]. To use a supplied socket
+    /// in a listener set, add
+    /// [`ListenerSource::udp_socket`](crate::ListenerSource::udp_socket) or
+    /// [`ListenerSource::tcp_listener`](crate::ListenerSource::tcp_listener).
     #[must_use]
     pub fn listener(mut self, source: crate::transport::ListenerSource) -> Self {
         self.listeners.push(source);
         self
     }
-    /// Prepare an outbound or supplied connected session with this service's roles.
+    /// Add an outbound or supplied connected TCP session with this service's roles.
+    ///
+    /// This is an explicit source and follows the same configuration rules as
+    /// [`Self::listener`].
     pub fn session(mut self, source: crate::TcpTransportBuilder) -> Self {
         self.listeners.push(crate::ListenerSource::Session(source));
         self
     }
-    /// Bound simultaneous TCP connections across all listeners (default 128).
+    /// Bound simultaneous TCP connections (default 128).
+    ///
+    /// The limit counts accepted sessions, configured command sessions, and
+    /// dedicated TCP notification sinks.
     #[must_use]
     pub fn max_connections(mut self, count: usize) -> Self {
         self.max_connections = count;
@@ -884,7 +925,7 @@ impl AgentBuilder {
     /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-    /// # // Replace this no-op with durable storage in an application.
+    /// // Persist the engine ID and boots in durable storage in a deployed application.
     /// let engine = AuthoritativeEngine::install(b"agent-engine".to_vec(), |_| {
     ///     Ok::<(), Infallible>(())
     /// })?;
@@ -960,7 +1001,7 @@ impl AgentBuilder {
     /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-    /// # // Replace this no-op with durable storage in an application.
+    /// // Persist the engine ID and boots in durable storage in a deployed application.
     /// let engine = AuthoritativeEngine::install(b"my-engine".to_vec(), |_| {
     ///     Ok::<(), Infallible>(())
     /// })?;
@@ -1062,7 +1103,8 @@ impl AgentBuilder {
     /// The default is 4 MiB. The kernel may cap this at `net.core.rmem_max`.
     /// A larger buffer prevents packet loss during request bursts.
     ///
-    /// Set to `None` to use the kernel default.
+    /// Set to `None` to use the kernel default. For an explicit UDP listener set,
+    /// configure the buffer on its [`crate::UdpEndpointBuilder`] or supplied socket.
     #[must_use]
     pub fn recv_buffer_size(mut self, size: Option<usize>) -> Self {
         self.recv_buffer_explicit = true;
@@ -1207,10 +1249,8 @@ impl AgentBuilder {
     /// latter to IPv4, and reject native IPv6 destinations. IPv6 binds retain
     /// IPv6 destinations and map IPv4 destinations into the dual-stack address
     /// space. Hostname candidates are considered in resolver order under the
-    /// same rules against the selected endpoint. Shared UDP selection enables
-    /// exchanges on the shared service; both traps and Informs use that endpoint.
-    /// Separate UDP/TCP resources are prepared atomically with listeners and run
-    /// under the Agent runner. Existing peers keep their independent service owner.
+    /// same rules against the selected endpoint. See [`NotificationTarget`] for
+    /// how to choose the source endpoint or connection.
     ///
     /// # Example
     ///
@@ -1222,7 +1262,7 @@ impl AgentBuilder {
     /// use std::convert::Infallible;
     ///
     /// # async fn example() -> Result<(), Box<async_snmp::Error>> {
-    /// # // Replace this no-op with durable storage in an application.
+    /// // Persist the engine ID and boots in durable storage in a deployed application.
     /// let engine = AuthoritativeEngine::install(b"agent-engine".to_vec(), |_| {
     ///     Ok::<(), Infallible>(())
     /// })?;
@@ -1258,10 +1298,9 @@ impl AgentBuilder {
 
     /// Set the timeout for each unconfirmed trap send to a configured sink.
     ///
-    /// Default is [`crate::DEFAULT_SEND_TIMEOUT`] (5 seconds). The timeout
-    /// includes local UDP socket queueing and send I/O for each sink. It only
-    /// affects `send_trap`; confirmed informs use
-    /// [`inform_timeout`](Self::inform_timeout) while waiting for a response.
+    /// Defaults to [`crate::DEFAULT_SEND_TIMEOUT`] (5 seconds), including local
+    /// queueing and socket writes for each UDP or TCP sink. Use
+    /// [`Self::inform_timeout`] to set the wait for an Inform response.
     #[must_use]
     pub fn trap_send_timeout(mut self, timeout: Duration) -> Self {
         self.trap_send_timeout = timeout;

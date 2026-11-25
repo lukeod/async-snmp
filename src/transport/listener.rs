@@ -14,7 +14,49 @@ pub struct BoundListener {
     pub local_addr: SocketAddr,
 }
 
-/// A UDP endpoint, TCP acceptor or explicit connected session configured before execution.
+/// A UDP endpoint, TCP listener, or connected session for a managed service.
+///
+/// Supply a [`ListenerSource`] to [`crate::NotificationReceiverBuilder::listener`]
+/// or, with the `agent` feature, to `AgentBuilder::listener`. Use
+/// [`Self::udp_socket`] or [`Self::tcp_listener`] to hand off sockets that a
+/// service manager opened or that you configured before startup. For one
+/// connected TCP stream, use [`Self::Session`] with
+/// [`super::TcpTransportBuilder::from_stream`].
+///
+/// # Example
+///
+/// Give a notification receiver a prebound UDP socket and TCP listener. The
+/// receiver serves both addresses with one event queue.
+///
+/// ```rust
+/// use async_snmp::{ListenerSource, NotificationReceiver, TransportKind};
+/// use tokio::net::{TcpListener, UdpSocket};
+///
+/// #[tokio::main(flavor = "current_thread")]
+/// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+///     let udp = UdpSocket::bind("127.0.0.1:0").await?;
+///     let udp_addr = udp.local_addr()?;
+///     let tcp = TcpListener::bind("127.0.0.1:0").await?;
+///     let tcp_addr = tcp.local_addr()?;
+///
+///     let mut receiver = NotificationReceiver::builder()
+///         .listener(ListenerSource::udp_socket(udp))
+///         .listener(ListenerSource::tcp_listener(tcp))
+///         .community("public")
+///         .spawn()
+///         .await?;
+///     let addresses = receiver.bound_addresses();
+///     assert!(addresses.iter().any(|listener| {
+///         listener.transport == TransportKind::Udp && listener.local_addr == udp_addr
+///     }));
+///     assert!(addresses.iter().any(|listener| {
+///         listener.transport == TransportKind::Tcp && listener.local_addr == tcp_addr
+///     }));
+///
+///     receiver.shutdown().await?;
+///     Ok(())
+/// }
+/// ```
 pub enum ListenerSource {
     Udp(UdpEndpointBuilder),
     Tcp(TcpListenerSource),
@@ -30,7 +72,13 @@ impl ListenerSource {
                 .max_message_size(crate::MAX_UDP_PAYLOAD),
         )
     }
-    /// Supply an owned bound, unconnected UDP socket without changing its options.
+    /// Adopt a bound, unconnected Tokio UDP socket with full datagram capacities.
+    ///
+    /// The service becomes the sole reader. The socket keeps its bind address,
+    /// kernel buffer sizes, and original Tokio I/O registration. Keep that runtime
+    /// running. Preparation can enable destination address metadata where the
+    /// platform supports it. Use [`Self::Udp`] with
+    /// [`UdpEndpointBuilder::from_socket`] to set custom SNMP message limits.
     pub fn udp_socket(socket: UdpSocket) -> Self {
         Self::Udp(
             UdpEndpoint::builder()
@@ -42,7 +90,11 @@ impl ListenerSource {
     pub fn tcp(address: impl AsRef<str>) -> Self {
         Self::Tcp(TcpListenerSource::bind(address))
     }
-    /// Supply an owned TCP listener.
+    /// Adopt a bound Tokio TCP listener with default session limits.
+    ///
+    /// The service takes over accepting connections. Keep the listener's original
+    /// Tokio I/O runtime running. For custom session limits, use [`Self::Tcp`]
+    /// with [`TcpListenerSource::from_listener`].
     pub fn tcp_listener(listener: TcpListener) -> Self {
         Self::Tcp(TcpListenerSource::from_listener(listener))
     }
@@ -174,6 +226,8 @@ impl TcpListenerSource {
             options: TcpOptions::default(),
         }
     }
+    /// Adopt a bound Tokio TCP listener. Use [`Self::session_options`] to tune
+    /// the limits for each accepted connection.
     pub fn from_listener(listener: TcpListener) -> Self {
         Self {
             observation: Default::default(),
@@ -184,6 +238,7 @@ impl TcpListenerSource {
             options: TcpOptions::default(),
         }
     }
+    /// Set the transport limits for each accepted connection.
     #[must_use]
     pub fn session_options(mut self, options: TcpOptions) -> Self {
         self.options = options;

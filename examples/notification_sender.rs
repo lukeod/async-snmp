@@ -1,15 +1,14 @@
 //! Send SNMP notifications
 //!
-//! The library provides two ways to send SNMP traps and Inform requests:
-//!
-//! 1. Agent-based sending configures notification sinks on the agent builder.
-//!    The agent sends through its own socket, engine ID, and credentials without
-//!    retaining persistent per-destination state.
-//!
-//! 2. Client-based sending creates one `Client` per destination. This approach
-//!    suits standalone tools such as `snmptrap` and `snmpinform`.
-//!
 //! Run `cargo run --example notification_sender --features agent`.
+//! The example starts a local receiver and sends traps and Informs using both APIs.
+//!
+//! - Configure agent notification sinks to send to several destinations from
+//!   a service that also handles SNMP commands. The example shares the agent's
+//!   command socket. `NotificationTarget` also supports a dedicated UDP
+//!   endpoint, a TCP connection, or an existing peer.
+//! - Create a `Client` per destination for standalone senders such as
+//!   `snmptrap` and `snmpinform`.
 
 use async_snmp::agent::{Agent, NotificationOutcome, SinkStatus};
 use async_snmp::notification::{Notification, NotificationAdmissionDecision, NotificationReceiver};

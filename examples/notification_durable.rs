@@ -1,10 +1,15 @@
 //! Persist accepted notification content before acknowledging an Inform.
-//! Run: cargo run --example notification_durable -- ./notifications.log
-//! Receives one event on 127.0.0.1:1162, then shuts down. This v2c example
-//! needs no authoritative engine persistence; the log uses append + fsync.
-//! Retransmissions are independent records: this is not an exactly-once store.
-//! The platform and filesystem must support opening and syncing the log's
-//! parent directory.
+//!
+//! Run `cargo run --example notification_durable -- ./notifications.log`.
+//! Send an Inform from another shell.
+//!
+//! ```sh
+//! MIBS='' snmpinform -v2c -c public 127.0.0.1:1162 '' .1.3.6.1.6.3.1.1.5.1
+//! ```
+//!
+//! The receiver appends and syncs one notification record, then shuts down.
+//! Retransmissions are independent events. Use a platform and filesystem that
+//! support opening and syncing the log's parent directory.
 
 #[path = "support/notification_log.rs"]
 mod notification_log;

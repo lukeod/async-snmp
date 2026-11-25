@@ -30,8 +30,42 @@ use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
 use crate::version::Version;
 
-/// Explicit transport selection for a configured notification destination.
-/// Preparation binds/connects owned resources without starting their drivers.
+/// Transport route for an [agent notification sink](super::AgentBuilder::notification_sink).
+///
+/// # Choose a route
+///
+/// | Use case | Constructor |
+/// | --- | --- |
+/// | Send through the UDP socket that serves commands. | [`Self::shared_udp`] |
+/// | Use a separate UDP source address, port, or socket configuration. | [`Self::udp`] |
+/// | Connect to a TCP receiver during agent preparation or hand over a connected stream. | [`Self::tcp`] |
+/// | Reuse an already prepared UDP peer or TCP session. | [`Self::peer`] |
+///
+/// The agent prepares and drives dedicated UDP and TCP sinks. Shared UDP sinks
+/// enable exchanges on the selected listener automatically. If you reuse a peer
+/// from a shared application service, enable client exchanges on that service
+/// before preparation to receive Inform acknowledgements.
+///
+/// For a TCP session accepted after startup, select it through
+/// [`crate::Agent::notification_peer`] and send directly through the returned handle.
+///
+/// ```rust
+/// use async_snmp::{NotificationTarget, TcpTransport, UdpEndpoint, UdpHandle};
+///
+/// fn routes(existing: UdpHandle) -> [NotificationTarget; 4] {
+///     [
+///         NotificationTarget::shared_udp(0, "192.0.2.10:162"),
+///         NotificationTarget::udp(
+///             UdpEndpoint::builder().bind("0.0.0.0:1162"),
+///             "192.0.2.20:162",
+///         ),
+///         NotificationTarget::tcp(
+///             TcpTransport::builder().target("192.0.2.30:162".parse().unwrap()),
+///         ),
+///         NotificationTarget::peer(existing),
+///     ]
+/// }
+/// ```
 pub enum NotificationTarget {
     /// Reuse the UDP listener at this zero-based position in configured listener order.
     /// With the default `bind` configuration its index is zero.
@@ -53,8 +87,8 @@ pub enum NotificationTarget {
 impl NotificationTarget {
     /// Select a UDP listener by its position in the Agent listener configuration.
     /// Index zero selects the default `bind` endpoint. Non-UDP or missing indices
-    /// fail preparation. Hostnames are resolved against the selected socket's
-    /// address family; both traps and Informs use its bound source port.
+    /// fail preparation. Hostname resolution uses the selected socket's
+    /// address family. Both traps and Informs use its bound source port.
     pub fn shared_udp(listener: usize, destination: impl Into<String>) -> Self {
         Self::SharedUdp {
             listener,
@@ -62,8 +96,8 @@ impl NotificationTarget {
         }
     }
     /// Prepare a separate UDP endpoint from bind configuration or an owned socket.
-    /// `destination` includes a port and may contain a hostname. Its driver belongs
-    /// to the Agent runner; this endpoint has only the client exchange role.
+    /// `destination` includes a port and may contain a hostname. The Agent runner
+    /// drives this endpoint for client exchanges.
     pub fn udp(endpoint: crate::UdpEndpointBuilder, destination: impl Into<String>) -> Self {
         Self::Udp {
             endpoint,
@@ -71,12 +105,13 @@ impl NotificationTarget {
         }
     }
     /// Prepare one TCP session using the supplied target, socket or connected stream.
-    /// Target configuration connects during preparation. The Agent runner supervises
-    /// the session driver. A terminated session is never replaced or replayed.
+    /// Target configuration connects during preparation. The Agent runner drives
+    /// the session. If it closes, the configured sink fails delivery. To send
+    /// over a new session, use [`crate::Agent::notification_peer`] or prepare a new agent.
     pub fn tcp(session: crate::TcpTransportBuilder) -> Self {
         Self::Tcp(session)
     }
-    /// Select an existing UDP peer or exact TCP session without opening a connection.
+    /// Reuse an existing UDP peer or exact TCP session.
     /// The peer retains its own service lifetime and requires its runner to be driven.
     /// Shared application services must have client exchanges enabled for Informs.
     /// When using the Agent's [`crate::LocalEngine`], the endpoint owner declares

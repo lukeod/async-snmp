@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
+
 ### Added
 
 - Agents and notification receivers support mixed UDP/TCP listener sets, supplied

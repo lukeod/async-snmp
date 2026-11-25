@@ -1,6 +1,7 @@
 //! Select a configured built-in transport at runtime
 //!
-//! Pass `udp` or `tcp`, followed by an optional socket address:
+//! Pass `udp` or `tcp`, followed by an optional socket address. Run against an
+//! agent that accepts SNMPv2c with the `public` community on the selected transport.
 //!
 //! `cargo run --example runtime_transport -- tcp 127.0.0.1:161`
 
@@ -8,6 +9,7 @@ use async_snmp::{
     Auth, BuiltinTransport, ClientBuilder, RuntimeClient, TcpTransport, UdpEndpoint, oid,
 };
 use std::net::SocketAddr;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> async_snmp::Result<()> {
@@ -18,23 +20,25 @@ async fn main() -> async_snmp::Result<()> {
         .parse()
         .expect("target must be a socket address");
 
-    // Apply transport-specific settings before erasing the concrete type into
-    // BuiltinTransport. The client builder preserves these settings.
+    // Configure the selected transport before converting its handle to BuiltinTransport.
     let mut udp_service = None;
     let transport = match protocol.as_str() {
         "udp" => {
-            let endpoint = UdpEndpoint::builder()
-                .bind("0.0.0.0:0")
-                .max_message_size(8192)
-                .spawn()
-                .await?;
+            // Pick a matching local address family and use the default caps for this GET.
+            let bind = if target.ip().to_canonical().is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let endpoint = UdpEndpoint::spawn(bind).await?;
             let peer = endpoint.handle(target)?;
             udp_service = Some(endpoint);
             BuiltinTransport::from(peer)
         }
         "tcp" => BuiltinTransport::from(
             TcpTransport::builder()
-                .max_message_size(256 * 1024)
+                // Bound connection setup independently of SNMP request deadlines.
+                .connect_timeout(Duration::from_secs(5))
                 .connect(target)
                 .await?,
         ),

@@ -14,6 +14,7 @@ This crate is pre-1.0, so its API can change between releases. This README
 describes the `main` branch, which can differ from published crate versions.
 For version-specific API documentation, see
 [async-snmp on docs.rs](https://docs.rs/async-snmp/latest/async_snmp/).
+To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
 
 ## Supported operations
 
@@ -165,44 +166,59 @@ when `response` contains bytes. `response: None` indicates a counted silent drop
 
 ## Transport and service lifecycle
 
-Built-in services use `prepare().await?` followed by `into_parts()` to obtain
-public handles and an owned runner. Preparation binds/connects and validates
-configuration without starting tasks. Drive `runner.run()` or use the explicit
-`spawn()`/`spawn_on()` conveniences; retain the running owner to observe shutdown
-and failures. Supplied Tokio sockets keep their original runtime registration.
-Dropping the last public handle requests shutdown; controls also retain lifetime.
+### Choose a transport
+
+Use a dedicated UDP endpoint for a simple client, or share an endpoint across
+many clients to use one source port and receive loop. Use TCP when the peer
+supports it and you need to carry messages larger than the UDP path can handle
+without fragmentation. To select UDP or TCP from application configuration,
+wrap the configured transport in `BuiltinTransport`.
+[Runtime transport example](examples/runtime_transport.rs)
+
+To use a prebound socket from socket activation or to configure socket options
+before handoff, pass the socket to `UdpEndpointBuilder::from_socket` for a
+client endpoint or to `ListenerSource::udp_socket` for a managed listener.
+Use `ListenerSource::tcp_listener` to accept TCP connections on an existing
+listener. Use `TcpTransportBuilder::from_socket` to connect a configured TCP
+socket or `from_stream` to drive a connected stream.
+The runner takes over reads. Keep the runtime that registered the supplied
+Tokio I/O resource alive and running, including when you start the runner on a
+different runtime. Use `CommandProcessor` or `NotificationProcessor` when your
+application needs to keep reading and writing on its own endpoints.
+
+### Run a managed service
+
+Call `prepare().await?` to validate configuration and set up connections or
+listeners without starting tasks. Call `into_parts()` to get the public handles
+and drive `runner.run()` from your supervisor. When you use `spawn()` or
+`spawn_on()`, retain the running owner to observe shutdown and failures. Control
+handles keep the service alive.
+Dropping the last public handle requests shutdown.
 Dropping an unpolled runner closes its endpoints. Timed sends and exchanges use
 their ordinary deadlines before startup. Direct TCP sends use the session's
 write timeout. Direct `UdpHandle::send` can transmit before startup, with any
 timeout supplied by the caller. Sends and exchanges fail after termination.
 
+To receive notifications on command listeners, attach a notification role with
+`AgentBuilder::notifications`. Configure the listeners and USM on the Agent.
+If the Agent uses USM, set an explicit `admission_policy` on the attached role.
 `PreparedAgent::into_parts()` returns `(agent, runner, notifications)`, with an
 optional notification receiver. Keep the receiver alive to admit notifications.
 If you use `spawn()` or `spawn_on()`, call `RunningAgent::take_notifications()`
 to receive events.
 
-| API migration | Current API |
-| --- | --- |
-| Custom client transport contract | `RequestTransport` |
-| Shared UDP transport | `UdpEndpoint`, target-specific `UdpHandle` |
-| Agent/receiver startup | `prepare` plus runner, or explicit `spawn` |
-| Notification `acceptance_policy` | `admission_policy` with `NotificationAdmissionInfo`. Inspect payloads in delivered events and use manual acknowledgement when needed. |
-| Single service local address | Identified `bound_addresses()` |
-| Notification consumer | Non-Clone receiver; `recv(&mut self)` and separate control |
-| Managed `ReceivedNotification::inform_ack` | `NotificationAcknowledgement::{NotRequired, Completed, Pending}` |
-| Agent notification destinations | `notification_sink(id, NotificationTarget, auth)` |
-| Client response history | `ResponseMetadata::received_messages` |
-| Aggregate decode anomalies | `ResponseMetadata::decode_anomalies()` iterator |
+### Choose a notification target
 
-Notification targets explicitly select `shared_udp(listener_index, destination)`,
-`udp(endpoint_builder, destination)`, `tcp(session_builder)`, or `peer(existing)`.
-The shared index follows configured listener order; index zero selects the default
-UDP bind. Shared traps and Informs use the same source endpoint as commands.
-Separate UDP/TCP resources prepare with the Agent and run under its supervisor.
-TCP targets connect during preparation; selected existing sessions never reconnect,
-replay, or fall back to UDP. Use `Agent::notification_peer` for accepted sessions
+Use `NotificationTarget::shared_udp(listener_index, destination)` to send through
+the command listener and keep its source port. The index follows configured
+listener order, with zero selecting the default UDP bind. Choose `udp` for a
+separate source address or port, `tcp` to give the Agent a dedicated TCP session, or
+`peer` to reuse an existing independently driven endpoint or session. The Agent
+prepares and supervises its dedicated endpoints and sessions. Outbound TCP
+targets connect during preparation. When a TCP session closes, create a new
+session for future sends. Use `Agent::notification_peer` for accepted sessions
 obtained after startup, enabling client exchanges on the selected service first.
-Sink outcomes include endpoint/session identity, transport and limits without credentials.
+Sink outcomes include endpoint or session identity, transport, and limits.
 
 See [shared UDP roles](examples/shared_udp_roles.rs) and
 [shared TCP roles](examples/shared_tcp_roles.rs) for command handling alongside

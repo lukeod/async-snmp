@@ -1,20 +1,41 @@
-//! Transport abstractions for SNMP communication.
+//! Client transports, listener sources, and transport limits for SNMP.
 //!
-//! The module provides the [`RequestTransport`] trait and these implementations:
+//! # Choose a transport
 //!
-//! - [`UdpEndpoint`] + [`UdpHandle`] - UDP socket with per-target handles
-//! - [`TcpTransport`] - TCP stream with BER framing
-//! - [`BuiltinTransport`] - runtime selection between library-maintained transports
+//! | Goal | Approach |
+//! | --- | --- |
+//! | Poll a few targets over UDP | Call [`TargetClientBuilder::connect`](crate::TargetClientBuilder::connect). Each client gets its own local socket and receive loop. |
+//! | Poll many UDP targets from one process | Create one [`UdpEndpoint`] and pass it to [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with) for each target. The clients share a socket and receive loop. |
+//! | Carry larger messages or use a TCP-only network path | Call [`TargetClientBuilder::connect_tcp`](crate::TargetClientBuilder::connect_tcp) when the peer accepts SNMP over TCP. The connection carries BER-framed messages and supports concurrent exchanges. |
+//! | Use a prebound UDP socket for client exchanges | Pass the socket to [`UdpEndpointBuilder::from_socket`]. Use this path to keep a provisioned port or apply socket options before handoff. |
+//! | Configure a managed agent or receiver to listen on a local address | Use [`ListenerSource::udp`] for datagrams or [`ListenerSource::tcp`] to accept TCP connections. Add multiple sources to serve both protocols or bind multiple addresses. |
+//! | Hand a bound socket to a managed agent or receiver | Use [`ListenerSource::udp_socket`] for a UDP socket or [`ListenerSource::tcp_listener`] for an acceptor. The service drives reception. |
+//! | Control TCP socket setup before connecting | Pass a configured socket to [`TcpTransportBuilder::from_socket`] and set the target. Use [`TcpTransportBuilder::from_stream`] if the application has already connected or accepted the stream. |
+//! | Choose UDP or TCP from runtime configuration | Configure the transport, convert its handle to [`BuiltinTransport`], and pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) to get one client type. |
+//! | Use application-specific client I/O | Implement [`RequestTransport`] and pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport). The implementation owns the target, I/O, and response correlation. |
 //!
-//! # Choosing a transport
+//! Use separate UDP endpoints when clients need different source ports or
+//! independent shutdown and failure handling.
 //!
-//! | Scenario | Approach |
-//! |----------|---------|
-//! | Single target or few targets | [`Client::builder().connect()`](crate::Client::builder) - each client gets its own socket |
-//! | Many UDP targets from one process | Pass a preconstructed [`UdpEndpoint`] socket owner to [`TargetClientBuilder::build_with`](crate::TargetClientBuilder::build_with) - each target gets a handle on one socket and receive loop |
-//! | UDP blocked or messages exceed MTU | [`Client::builder().connect_tcp()`](crate::TargetClientBuilder::connect_tcp) |
-//! | Preconstruct or implement any client transport | Pass the [`RequestTransport`] implementation to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) without a target |
-//! | Choose UDP or TCP at runtime | Configure the concrete transport, convert it to [`BuiltinTransport`], then pass it to [`ClientBuilder::build_with_transport`](crate::ClientBuilder::build_with_transport) |
+//! # Set message sizes and buffering
+//!
+//! For UDP, keep requests and expected responses within the path MTU after IP
+//! and UDP headers to avoid fragmentation. [`UdpEndpointBuilder::send_capacity`]
+//! caps encoded outgoing messages. [`UdpEndpointBuilder::receive_capacity`]
+//! sets the size advertised to SNMPv3 peers, while the library still accepts
+//! datagrams up to its full UDP receive limit. [`UdpEndpointBuilder::max_message_size`]
+//! sets both the advertisement and send cap. Tune the kernel socket queues with
+//! [`UdpEndpointBuilder::recv_buffer_size`] and [`UdpEndpointBuilder::send_buffer_size`].
+//! Increase the receive queue if bursts cause kernel drops.
+//!
+//! For TCP, [`TcpTransportBuilder::max_message_size`] caps incoming BER frames
+//! and sets the advertised receive size. [`TcpTransportBuilder::send_capacity`]
+//! caps outgoing messages. Set [`TcpOptions::max_buffered_bytes`] to at least
+//! the sum of the two limits. The budget reserves the send capacity for writes.
+//! Size the per-session [`TcpOptions::write_queue_capacity`] and
+//! [`TcpOptions::max_in_flight`] for expected concurrency. For accepted
+//! connections, apply limits through [`TcpListenerSource::session_options`]
+//! and size the service-wide byte budget for concurrent sessions.
 
 mod builtin;
 pub(crate) mod dispatch;

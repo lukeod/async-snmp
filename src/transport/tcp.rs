@@ -11,18 +11,7 @@
 //! spawn conveniences return a [`RunningTcpSession`] owner. `connect` conveniences
 //! retain their task with the public session lifetime and expose [`TcpControl`].
 //!
-//! ```rust,no_run
-//! use async_snmp::{Auth, ClientBuilder, TcpTransport};
-//! # async fn example() -> async_snmp::Result<()> {
-//! let prepared = TcpTransport::builder()
-//!     .target("192.0.2.1:161".parse().unwrap()).prepare().await?;
-//! let (session, runner) = prepared.into_parts();
-//! let client = ClientBuilder::new(Auth::v2c("public")).build_with_transport(session)?;
-//! let driver = tokio::spawn(runner.run());
-//! # let _ = (client, driver);
-//! # Ok(())
-//! # }
-//! ```
+//! To adopt an existing connection, see [`TcpTransportBuilder::from_stream`].
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -183,13 +172,49 @@ impl TcpTransportBuilder {
         self.target = Some(target);
         self
     }
-    /// Supply an owned connected or accepted stream without modifying its options.
+    /// Adopt a connected Tokio TCP stream.
+    ///
+    /// Use this method when your application already opened the connection or
+    /// accepted it on a listener. The session runner takes over reading and
+    /// writing the stream. It keeps the stream's socket options and Tokio I/O
+    /// registration. Keep the original I/O runtime running, including when you
+    /// use [`Self::spawn_on`] to run the session on a different runtime.
+    ///
+    /// Give a managed service a listener with
+    /// [`crate::ListenerSource::tcp_listener`] if it should accept connections.
+    /// To configure a socket and have this builder connect it, use
+    /// [`Self::from_socket`].
+    ///
+    /// # Example
+    ///
+    /// Send an Inform on an existing stream connected to a receiver that accepts
+    /// the `public` community over TCP.
+    ///
+    /// ```rust,no_run
+    /// use async_snmp::{Auth, ClientBuilder, TcpTransport, oid};
+    /// use tokio::net::TcpStream;
+    ///
+    /// async fn send_inform(stream: TcpStream) -> async_snmp::Result<()> {
+    ///     let session = TcpTransport::builder().from_stream(stream).spawn().await?;
+    ///     let client = ClientBuilder::new(Auth::v2c("public"))
+    ///         .build_with_transport(session.transport())?;
+    ///     let cold_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
+    ///     client.send_inform(&cold_start, 0, vec![]).await?;
+    ///     session.shutdown().await
+    /// }
+    /// ```
     #[must_use]
     pub fn from_stream(mut self, stream: TcpStream) -> Self {
         self.stream = Some(stream);
         self
     }
-    /// Supply a configured pre-connect socket. Also configure a target.
+    /// Adopt a Tokio TCP socket before connecting it.
+    ///
+    /// Use this method to set the local bind address or socket options for an
+    /// outbound connection. Set the remote address with [`Self::target`].
+    /// Preparation connects the socket and registers the resulting stream with
+    /// the Tokio I/O runtime that polls [`Self::prepare`]. If you already have
+    /// a connection, pass its stream to [`Self::from_stream`].
     #[must_use]
     pub fn from_socket(mut self, socket: TcpSocket) -> Self {
         self.socket = Some(socket);

@@ -1107,10 +1107,11 @@ impl<T: RequestTransport> Client<T> {
     /// [`FixedCardinalityChunkError::source`].
     ///
     /// The stream emits one [`FixedCardinalityChunkError`] for a terminal
-    /// failure, then remains fused. Dropping a chunk stream while a TCP request
-    /// is in flight follows [`TcpTransport`](crate::TcpTransport)'s cancellation
-    /// contract: cancellation after acquiring the connection lock poisons that
-    /// connection, and later operations fail with [`Error::Closed`].
+    /// failure, then remains fused. Dropping the stream cancels any in-flight
+    /// exchange. With [`TcpTransport`](crate::TcpTransport), the session removes
+    /// the response registration and preserves framing for later exchanges.
+    /// The writer finishes any partial write under the existing deadline and
+    /// closes the session if the write fails or times out.
     ///
     /// # Errors
     ///

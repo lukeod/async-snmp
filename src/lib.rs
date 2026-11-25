@@ -6,6 +6,10 @@
 //!
 //! An asynchronous SNMP library built on Tokio.
 //!
+//! To upgrade from v0.18, see the [v0.19 migration guide].
+//!
+//! [v0.19 migration guide]: https://github.com/lukeod/async-snmp/blob/v0.19.0/docs/migrations/0.19.md
+//!
 //! ## Application and I/O layers
 //!
 //! Use [`Client`] with built-in transports or a custom [`RequestTransport`] for
@@ -71,6 +75,8 @@
 //! application-owned. A preconstructed shared [`UdpEndpoint`] is a socket
 //! owner rather than a per-target transport, so pair it with a target through
 //! [`TargetClientBuilder::build_with`] to derive a [`UdpHandle`].
+//! See the [`transport`] module for help choosing a transport, supplying a
+//! socket, and setting message and buffer limits.
 //!
 //! ### SNMPv2c
 //!
@@ -143,9 +149,10 @@
 //!
 //! ### Errors and retries
 //!
-//! Client operations use the boxed [`Error`] type. Match on variants when an
-//! application needs to distinguish transport, protocol, authentication, or
-//! response-shape failures. The [`error`] module documents every variant.
+//! Client operations return a boxed [`Error`]. Use [`Error::exchange_source`]
+//! to match the underlying failure even when the error wraps it with response
+//! history. Use [`Error::response_metadata`] on the original error to inspect
+//! any messages the client accepted before the operation failed.
 //!
 //! ```rust,no_run
 //! use async_snmp::{Auth, Client, Error, ErrorStatus, Retry, oid};
@@ -165,15 +172,20 @@
 //!             .and_then(|varbind| varbind.value.as_str())
 //!             .map(str::to_owned)
 //!             .ok_or_else(|| format!("unexpected response shape: {:?}", response.anomalies)),
-//!         Err(error) => match *error {
-//!             Error::Timeout { retries, .. } => {
-//!                 Err(format!("device did not respond after {retries} retries"))
+//!         Err(error) => {
+//!             if let Some(metadata) = error.response_metadata() {
+//!                 eprintln!("Accepted {} messages", metadata.received_messages.len());
 //!             }
-//!             Error::Snmp { status: ErrorStatus::NoSuchName, .. } => {
-//!                 Err("OID is not supported by the device".to_owned())
+//!             match error.exchange_source() {
+//!                 Error::Timeout { retries, .. } => {
+//!                     Err(format!("device did not respond after {retries} retries"))
+//!                 }
+//!                 Error::Snmp { status: ErrorStatus::NoSuchName, .. } => {
+//!                     Err("OID is not supported by the device".to_owned())
+//!                 }
+//!                 _ => Err(format!("SNMP request failed: {error}")),
 //!             }
-//!             _ => Err(format!("SNMP request failed: {error}")),
-//!         },
+//!         }
 //!     }
 //! }
 //! ```
