@@ -372,8 +372,9 @@ impl<T: RequestTransport> Client<T> {
     /// address has been replaced or reconfigured with a new engine ID.
     /// Discovery never replaces an established identity during ordinary
     /// request processing. The current identity, localized keys, and shared
-    /// cache mapping remain usable until a fresh response has been strictly
-    /// validated and replacement keys have been derived. A failed or cancelled
+    /// cache mapping remain usable until a fresh discovery Report passes
+    /// validation under the configured [decode policy](crate::DecodeConfig)
+    /// and replacement keys have been derived. A failed or cancelled
     /// rediscovery therefore leaves the previous generation intact.
     ///
     /// Client clones share a successful replacement because they share the
@@ -383,7 +384,8 @@ impl<T: RequestTransport> Client<T> {
     /// [`TargetClientBuilder::strict_source`](crate::TargetClientBuilder::strict_source) or
     /// by the supplied transport handle.
     ///
-    /// Returns metadata from the accepted discovery Report.
+    /// Returns metadata from the accepted discovery Report, including any
+    /// anomalies allowed by the decode policy.
     pub async fn rediscover_engine(&self) -> Result<ResponseMetadata> {
         if !self.is_v3() {
             return Err(Error::Config("engine discovery requires SNMPv3".into()).boxed());
@@ -1632,9 +1634,9 @@ impl<T: RequestTransport> Client<T> {
 
     /// Build and encode a V3 trap message using local engine ID.
     ///
-    /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
-    /// trap PDUs. Uses the persisted local engine state and sets
-    /// reportable=false (no Report PDU expected for traps).
+    /// RFC 3414 Section 1.5.1 defines the trap sender as authoritative.
+    /// The message uses the persisted local engine state and clears
+    /// `reportableFlag` as specified by RFC 3412 Section 6.4.
     pub(super) fn build_v3_trap_message(&self, pdu: &Pdu, msg_id: i32) -> Result<Vec<u8>> {
         let security = self
             .inner

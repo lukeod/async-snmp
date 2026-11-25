@@ -190,8 +190,9 @@ pub struct DiscoveredEngine {
 impl DiscoveredEngine {
     /// Validate a discovered authoritative engine identity.
     ///
-    /// Use the peer's `msgMaxSize` from the decoded message header as
-    /// `msg_max_size`.
+    /// Pass the peer's advertised `msgMaxSize` from the decoded message header.
+    /// For a manually encoded request, enforce the smaller of that value and
+    /// the local transport's [`send_capacity`](crate::RequestTransport::send_capacity).
     pub fn new(engine_id: impl Into<Bytes>, msg_max_size: MessageSize) -> Result<Self> {
         let engine_id = engine_id.into();
         validate_engine_id(&engine_id)?;

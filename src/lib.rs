@@ -356,9 +356,10 @@
 //!
 //! Agents with USM users or v3 trap sinks, notification receivers with USM
 //! users, and clients originating v3 traps are locally authoritative and need
-//! a persisted [`AuthoritativeEngine`]. Polling clients and v3 Inform
-//! originators use the remote responder as authoritative and do not need local
-//! engine state.
+//! a persisted [`AuthoritativeEngine`]. For trap clients, prepare it with
+//! [`LocalEngine::new`] and pass the result to [`TargetClientBuilder::local_engine`]
+//! or [`ClientBuilder::local_engine`]. Polling clients and v3 Inform originators
+//! use the remote responder as authoritative.
 //!
 //! Notification trust depends on the wire security level. V1/v2c community
 //! strings and content are cleartext; a receiver without a configured

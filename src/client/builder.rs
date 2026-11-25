@@ -380,10 +380,10 @@ impl ClientBuilder {
     /// Share local authoritative time, health and privacy-sender state with
     /// other clients, agents or notification receivers.
     ///
-    /// Per RFC 3412 Section 6.4, the sender is the authoritative engine for
-    /// trap PDUs. For SNMPv3 traps, pass a [`crate::LocalEngine`] prepared from a
-    /// persisted [`crate::v3::AuthoritativeEngine`]. Informs discover the
-    /// receiver's authoritative engine.
+    /// RFC 3414 Section 1.5.1 defines the trap sender as the authoritative
+    /// engine. For SNMPv3 traps, use [`crate::LocalEngine::new`] with a persisted
+    /// [`crate::v3::AuthoritativeEngine`]. Informs discover the receiver's
+    /// authoritative engine.
     ///
     /// Conflicts with [`Self::des_salt_state`]. Install durable DES/3DES sender
     /// state with [`crate::LocalEngine::set_des_salt_state`]. Changes on the

@@ -54,9 +54,10 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
   `usize` in place of `Option<usize>`.
 - **Breaking.** `NotificationReceiver::spawn()` replaces `bind()`. The receiver
   is single-consumer and `recv(&mut self)` returns `Option<ReceivedNotification>`.
-  Use its control for shutdown, terminal status, and persistence health. A
-  command-only Agent ignores Informs. Attach a notification receiver to deliver
-  and acknowledge Informs on the command listeners.
+  Use its control for shutdown, terminal status, and persistence health.
+  Inform delivery and ordinary acknowledgements on command listeners require an
+  attached notification receiver. A command-only Agent can still send SNMPv3
+  USM failure Reports.
 - **Breaking.** Replace `trap_sink(id, destination, auth)` with
   `notification_sink(id, NotificationTarget, auth)`. Targets select a shared UDP
   listener, dedicated UDP endpoint, TCP session, or existing peer. Sink
@@ -85,7 +86,9 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
   and `ReceivedMessageInfo`. Notifications expose `receive_info` in place of
   `source`, and agent handlers can read it through `RequestContext::receive_info()`.
 - **Breaking.** The `v3::parse_discovery_response` helpers are removed. Use
-  `DiscoveredEngine::new` with the decoded engine ID and advertised `msgMaxSize`.
+  `DiscoveredEngine::new` to store the decoded engine ID and the peer's advertised
+  `msgMaxSize`. When sending a manually encoded request, limit its size to the
+  smaller of that value and the local transport's send capacity.
 - **Breaking.** SNMPv3 client trap senders configure `local_engine` with a
   `LocalEngine` prepared from their persisted `AuthoritativeEngine`. Attach
   durable DES/3DES sender state to the engine.
