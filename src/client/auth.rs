@@ -24,7 +24,7 @@
 
 use crate::Community;
 use crate::v3::UsmConfig;
-pub use crate::version::CommunityVersion;
+use crate::version::CommunityVersion;
 use crate::version::Version;
 
 /// Authentication configuration for SNMP clients.

@@ -649,14 +649,13 @@ pub use agent::{
     VacmBuilder, VacmConfig, VacmSecurityModel, View,
 };
 pub use client::{
-    Auth, BulkResponse, Client, ClientBuilder, ClientConfig, CommunityVersion,
-    DEFAULT_CONSTRUCTION_TIMEOUT, DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS,
-    DEFAULT_REQUEST_TIMEOUT, DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk,
-    FixedCardinalityChunkError, FixedCardinalityChunkStream, FixedCardinalityOperation,
-    FixedCardinalityResponse, MAX_RETRIES, OidOrdering, ReceivedResponse, ResponseMetadata,
-    ResponseShapeAnomaly, ResponseShapePolicy, Retry, RetryBuilder, RetryConfigError, Target,
-    TargetClientBuilder, WalkCollection, WalkError, WalkItem, WalkMetadataStream, WalkMethod,
-    WalkOptions, WalkStream,
+    Auth, BulkResponse, Client, ClientBuilder, ClientConfig, DEFAULT_CONSTRUCTION_TIMEOUT,
+    DEFAULT_MAX_OIDS_PER_REQUEST, DEFAULT_MAX_REPETITIONS, DEFAULT_REQUEST_TIMEOUT,
+    DEFAULT_SEND_TIMEOUT, FixedCardinalityChunk, FixedCardinalityChunkError,
+    FixedCardinalityChunkStream, FixedCardinalityOperation, FixedCardinalityResponse, MAX_RETRIES,
+    OidOrdering, ReceivedResponse, ResponseMetadata, ResponseShapeAnomaly, ResponseShapePolicy,
+    Retry, RetryBuilder, RetryConfigError, Target, TargetClientBuilder, WalkCollection, WalkError,
+    WalkItem, WalkMetadataStream, WalkMethod, WalkOptions, WalkStream,
 };
 pub use community::Community;
 pub use compatibility::{
@@ -681,7 +680,7 @@ pub use notification::{
     EncodedInformResponse, InformAckOutcome, InformAcknowledgementMode, InformResponse,
     Notification, NotificationAcknowledgement, NotificationAdmissionDecision,
     NotificationAdmissionError, NotificationAdmissionInfo, NotificationAdmissionPolicy,
-    NotificationAdmissionResult, NotificationControl, NotificationHealth, NotificationPduClass,
+    NotificationAdmissionResult, NotificationControl, NotificationPduClass,
     NotificationProcessResult, NotificationProcessor, NotificationProcessorBuilder,
     NotificationReceiver, NotificationReceiverBuilder, NotificationRunner, NotificationStatus,
     NotificationVarbindValidation, NotificationWireIdentity, PendingInformAck,
@@ -716,7 +715,7 @@ pub use v3::{
 pub use v3::{LocalizedKey, MasterKey, MasterKeys};
 pub use value::{RowStatus, StorageType, Value, ValueKind};
 pub use varbind::VarBind;
-pub use version::Version;
+pub use version::{CommunityVersion, Version};
 
 /// Type alias for a client using UDP transport.
 ///

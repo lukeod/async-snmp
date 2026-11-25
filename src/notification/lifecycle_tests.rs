@@ -700,6 +700,7 @@ fn supplied_socket_prepares_outside_runtime_then_runs_on_second_runtime() {
 async fn persistence_degradation_withholds_local_acceptance_and_recovers_without_blocking_other_traffic()
  {
     use super::tests::{build_authed_v3_inform, build_authed_v3_trap};
+    use crate::v3::LocalEngineHealth;
     use std::sync::atomic::AtomicBool;
     let unavailable = Arc::new(AtomicBool::new(false));
     let failed = unavailable.clone();
@@ -752,7 +753,7 @@ async fn persistence_degradation_withholds_local_acceptance_and_recovers_without
         .unwrap();
     assert!(matches!(
         control.health(),
-        NotificationHealth::AuthoritativePersistenceDegraded {
+        LocalEngineHealth::AuthoritativePersistenceDegraded {
             consecutive_failures: 1,
             ..
         }
@@ -779,7 +780,7 @@ async fn persistence_degradation_withholds_local_acceptance_and_recovers_without
     ));
     assert!(matches!(
         control.health(),
-        NotificationHealth::AuthoritativePersistenceDegraded { .. }
+        LocalEngineHealth::AuthoritativePersistenceDegraded { .. }
     ));
     unavailable.store(false, Ordering::Relaxed);
     sender
@@ -801,7 +802,7 @@ async fn persistence_degradation_withholds_local_acceptance_and_recovers_without
         receiver.recv().await.unwrap().inform_ack,
         crate::NotificationAcknowledgement::Completed(InformAckOutcome::Sent)
     ));
-    assert_eq!(control.health(), NotificationHealth::Healthy);
+    assert_eq!(control.health(), LocalEngineHealth::Healthy);
 }
 
 #[tokio::test]

@@ -173,7 +173,6 @@ mod response;
 mod set_handler;
 pub mod vacm;
 
-pub use crate::handler::SecurityModel;
 pub use notification::{
     NotificationOutcome, NotificationPeer, NotificationSendStream, NotificationSinkId,
     NotificationSinkIdError, NotificationSinkSummary, NotificationTarget, SinkOutcome,
@@ -221,7 +220,7 @@ use crate::util::{
     community_matches, validate_authoritative_usm_deferred,
 };
 use crate::v3::SaltCounter;
-use crate::v3::{AuthoritativeEngine, DesSaltState, PrivProtocol, UsmUser};
+use crate::v3::{AuthoritativeEngine, DesSaltState, LocalEngineHealth, PrivProtocol, UsmUser};
 use crate::value::Value;
 use crate::varbind::VarBind;
 use crate::version::Version;
@@ -475,9 +474,6 @@ pub enum AgentShutdownPolicy {
     /// dropped. SET, Inform, and unclassified tasks are always drained.
     AbortCancellationSafeRetrievalsAfter(Duration),
 }
-
-/// Shared local authoritative-engine persistence health.
-pub use crate::v3::LocalEngineHealth as AgentHealth;
 
 /// Registered handler with its OID prefix.
 pub(crate) struct RegisteredHandler {
@@ -1161,7 +1157,8 @@ impl AgentBuilder {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use async_snmp::agent::{Agent, SecurityModel, VacmBuilder};
+    /// use async_snmp::agent::{Agent, VacmBuilder};
+    /// use async_snmp::handler::SecurityModel;
     /// use async_snmp::message::SecurityLevel;
     /// use async_snmp::oid;
     ///
@@ -2339,7 +2336,7 @@ impl Agent {
 
     /// Return the Agent's current local-authoritative persistence health.
     #[must_use]
-    pub fn health(&self) -> AgentHealth {
+    pub fn health(&self) -> LocalEngineHealth {
         *self.inner.state.health.borrow()
     }
 
@@ -2350,7 +2347,7 @@ impl Agent {
     /// packet. Recovery is published only after authoritative-state sampling
     /// succeeds on a later attempt.
     #[must_use]
-    pub fn subscribe_health(&self) -> tokio::sync::watch::Receiver<AgentHealth> {
+    pub fn subscribe_health(&self) -> tokio::sync::watch::Receiver<LocalEngineHealth> {
         self.inner.state.health.subscribe()
     }
 
@@ -7001,7 +6998,7 @@ mod tests {
         let mut health = agent.subscribe_health();
         engine.set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
 
-        assert_eq!(agent.health(), AgentHealth::Healthy);
+        assert_eq!(agent.health(), LocalEngineHealth::Healthy);
         assert_eq!(
             agent.engine_boots_time().unwrap_err().kind(),
             crate::ErrorKind::AuthoritativeEnginePersistence
@@ -7013,7 +7010,7 @@ mod tests {
         assert!(health.has_changed().unwrap());
         assert!(matches!(
             agent.health(),
-            AgentHealth::AuthoritativePersistenceDegraded {
+            LocalEngineHealth::AuthoritativePersistenceDegraded {
                 consecutive_failures: 2,
                 operation: crate::AuthoritativeEnginePersistenceOperation::EngineTimeRollover,
                 previous_engine_boots: Some(1),
@@ -7025,8 +7022,8 @@ mod tests {
 
         assert_eq!(agent.engine_boots_time().unwrap(), (2, 0));
         health.changed().await.unwrap();
-        assert_eq!(*health.borrow_and_update(), AgentHealth::Healthy);
-        assert_eq!(agent.health(), AgentHealth::Healthy);
+        assert_eq!(*health.borrow_and_update(), LocalEngineHealth::Healthy);
+        assert_eq!(agent.health(), LocalEngineHealth::Healthy);
     }
 
     #[tokio::test]
@@ -7108,7 +7105,7 @@ mod tests {
         );
         assert!(matches!(
             agent.health(),
-            AgentHealth::AuthoritativePersistenceDegraded {
+            LocalEngineHealth::AuthoritativePersistenceDegraded {
                 consecutive_failures: 2,
                 ..
             }

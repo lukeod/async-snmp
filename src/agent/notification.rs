@@ -19,7 +19,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::Community;
 use crate::RequestTransport;
-use crate::client::{Auth, Client, ClientConfig, CommunityVersion, Retry};
+use crate::client::{Auth, Client, ClientConfig, Retry};
 use crate::error::{Error, Result};
 use crate::handler::SecurityModel;
 use crate::message::{CommunityMessage, SecurityLevel};
@@ -28,7 +28,7 @@ use crate::pdu::NotificationPdu;
 use crate::transport::BuiltinTransport;
 use crate::v3::{DerivedKeys, UsmConfig};
 use crate::varbind::VarBind;
-use crate::version::Version;
+use crate::version::{CommunityVersion, Version};
 
 /// Transport route for an [agent notification sink](super::AgentBuilder::notification_sink).
 ///
@@ -1213,7 +1213,8 @@ mod tests {
         NotificationOperation, NotificationSendStream, NotificationSinkId, PendingSinkOutcome,
         SinkOutcome, SinkSkipReason, SinkStatus, TrapSink,
     };
-    use crate::agent::{Agent, SecurityModel, VacmSecurityModel};
+    use crate::agent::{Agent, VacmSecurityModel};
+    use crate::handler::SecurityModel;
     use crate::{Auth, Error, SecurityLevel, Value, VarBind, oid};
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     use crate::{AuthProtocol, PrivProtocol};
@@ -1367,7 +1368,7 @@ mod tests {
             ));
             assert!(matches!(
                 agent.health(),
-                crate::agent::AgentHealth::AuthoritativePersistenceDegraded {
+                crate::v3::LocalEngineHealth::AuthoritativePersistenceDegraded {
                     consecutive_failures,
                     ..
                 } if consecutive_failures == expected_failures
@@ -1386,7 +1387,7 @@ mod tests {
                     })
                 )
         ));
-        assert_eq!(agent.health(), crate::agent::AgentHealth::Healthy);
+        assert_eq!(agent.health(), crate::v3::LocalEngineHealth::Healthy);
         assert_eq!(persistence_calls.load(Ordering::Relaxed), 4);
 
         receiver_task.abort();

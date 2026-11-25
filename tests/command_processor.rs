@@ -339,7 +339,7 @@ async fn community_operations_share_handlers_and_original_input_metadata() {
 
 #[tokio::test]
 async fn v2c_command_role_ignores_informs_with_read_only_vacm() {
-    use async_snmp::agent::SecurityModel;
+    use async_snmp::handler::SecurityModel;
 
     let processor = CommandProcessor::builder()
         .community("public")

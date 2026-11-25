@@ -1,6 +1,7 @@
 //! Notification admission, delivery and supervised I/O.
 
 use super::*;
+use crate::v3::LocalEngineHealth;
 use tokio::sync::mpsc::{OwnedPermit, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -111,9 +112,6 @@ impl NotificationAdmission {
             .send(notification);
     }
 }
-
-/// Shared local authoritative-engine persistence health.
-pub use crate::v3::LocalEngineHealth as NotificationHealth;
 
 /// Network runner state. Queue EOF does not distinguish normal termination
 /// from failure; inspect this state or join the runner.
@@ -249,11 +247,11 @@ impl NotificationControl {
         self.state.status.lock().unwrap().clone()
     }
     /// Current authoritative persistence health.
-    pub fn health(&self) -> NotificationHealth {
+    pub fn health(&self) -> LocalEngineHealth {
         *self.inner.health.borrow()
     }
     /// Subscribe to bounded, coalesced persistence-health changes.
-    pub fn subscribe_health(&self) -> watch::Receiver<NotificationHealth> {
+    pub fn subscribe_health(&self) -> watch::Receiver<LocalEngineHealth> {
         self.inner.health.subscribe()
     }
     /// Overload drops charged to notification processing, TCP admission or delivery.

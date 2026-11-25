@@ -347,8 +347,8 @@ mod varbind;
 pub(crate) use lifecycle::RunnerCleanup;
 use lifecycle::{Delivery, NotificationLease};
 pub use lifecycle::{
-    NotificationControl, NotificationHealth, NotificationRunner, NotificationStatus,
-    PreparedNotificationReceiver, RunningNotificationReceiver,
+    NotificationControl, NotificationRunner, NotificationStatus, PreparedNotificationReceiver,
+    RunningNotificationReceiver,
 };
 
 use std::collections::HashMap;
@@ -2661,6 +2661,8 @@ mod tests {
     #[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
     #[tokio::test]
     async fn runner_reports_pre_acceptance_persistence_degradation() {
+        use crate::v3::LocalEngineHealth;
+
         let engine_id = Bytes::from_static(b"local-persist-engine");
         let calls = Arc::new(AtomicUsize::new(0));
         let callback_calls = Arc::clone(&calls);
@@ -2702,7 +2704,7 @@ mod tests {
 
         let mut health = receiver.control().subscribe_health();
         tokio::time::timeout(Duration::from_secs(1), async {
-            while *health.borrow_and_update() == NotificationHealth::Healthy {
+            while *health.borrow_and_update() == LocalEngineHealth::Healthy {
                 health.changed().await.unwrap();
             }
         })
@@ -2710,7 +2712,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             receiver.control().health(),
-            NotificationHealth::AuthoritativePersistenceDegraded { .. }
+            LocalEngineHealth::AuthoritativePersistenceDegraded { .. }
         ));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), receiver.recv())

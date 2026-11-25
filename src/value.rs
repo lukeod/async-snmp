@@ -70,16 +70,6 @@ impl TryFrom<i32> for RowStatus {
     }
 }
 
-impl RowStatus {
-    /// Create from raw SNMP integer value.
-    ///
-    /// Returns `None` for values outside the valid range (1-6).
-    #[must_use]
-    pub fn from_i32(value: i32) -> Option<Self> {
-        Self::try_from(value).ok()
-    }
-}
-
 impl From<RowStatus> for Value {
     fn from(status: RowStatus) -> Self {
         Value::Integer(status as i32)
@@ -152,16 +142,6 @@ impl TryFrom<i32> for StorageType {
             5 => Ok(Self::ReadOnly),
             _ => Err(value),
         }
-    }
-}
-
-impl StorageType {
-    /// Create from raw SNMP integer value.
-    ///
-    /// Returns `None` for values outside the valid range (1-5).
-    #[must_use]
-    pub fn from_i32(value: i32) -> Option<Self> {
-        Self::try_from(value).ok()
     }
 }
 
@@ -982,7 +962,7 @@ impl Value {
     /// ```
     pub fn as_row_status(&self) -> Option<RowStatus> {
         match self {
-            Value::Integer(v) => RowStatus::from_i32(*v),
+            Value::Integer(v) => RowStatus::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -1006,7 +986,7 @@ impl Value {
     /// ```
     pub fn as_storage_type(&self) -> Option<StorageType> {
         match self {
-            Value::Integer(v) => StorageType::from_i32(*v),
+            Value::Integer(v) => StorageType::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -2417,23 +2397,12 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_row_status_from_i32() {
-        assert_eq!(RowStatus::from_i32(1), Some(RowStatus::Active));
-        assert_eq!(RowStatus::from_i32(2), Some(RowStatus::NotInService));
-        assert_eq!(RowStatus::from_i32(3), Some(RowStatus::NotReady));
-        assert_eq!(RowStatus::from_i32(4), Some(RowStatus::CreateAndGo));
-        assert_eq!(RowStatus::from_i32(5), Some(RowStatus::CreateAndWait));
-        assert_eq!(RowStatus::from_i32(6), Some(RowStatus::Destroy));
-
-        // Invalid values
-        assert_eq!(RowStatus::from_i32(0), None);
-        assert_eq!(RowStatus::from_i32(7), None);
-        assert_eq!(RowStatus::from_i32(-1), None);
-    }
-
-    #[test]
     fn test_row_status_try_from() {
         assert_eq!(RowStatus::try_from(1), Ok(RowStatus::Active));
+        assert_eq!(RowStatus::try_from(2), Ok(RowStatus::NotInService));
+        assert_eq!(RowStatus::try_from(3), Ok(RowStatus::NotReady));
+        assert_eq!(RowStatus::try_from(4), Ok(RowStatus::CreateAndGo));
+        assert_eq!(RowStatus::try_from(5), Ok(RowStatus::CreateAndWait));
         assert_eq!(RowStatus::try_from(6), Ok(RowStatus::Destroy));
         assert_eq!(RowStatus::try_from(0), Err(0));
         assert_eq!(RowStatus::try_from(7), Err(7));
@@ -2479,22 +2448,11 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_storage_type_from_i32() {
-        assert_eq!(StorageType::from_i32(1), Some(StorageType::Other));
-        assert_eq!(StorageType::from_i32(2), Some(StorageType::Volatile));
-        assert_eq!(StorageType::from_i32(3), Some(StorageType::NonVolatile));
-        assert_eq!(StorageType::from_i32(4), Some(StorageType::Permanent));
-        assert_eq!(StorageType::from_i32(5), Some(StorageType::ReadOnly));
-
-        // Invalid values
-        assert_eq!(StorageType::from_i32(0), None);
-        assert_eq!(StorageType::from_i32(6), None);
-        assert_eq!(StorageType::from_i32(-1), None);
-    }
-
-    #[test]
     fn test_storage_type_try_from() {
         assert_eq!(StorageType::try_from(1), Ok(StorageType::Other));
+        assert_eq!(StorageType::try_from(2), Ok(StorageType::Volatile));
+        assert_eq!(StorageType::try_from(3), Ok(StorageType::NonVolatile));
+        assert_eq!(StorageType::try_from(4), Ok(StorageType::Permanent));
         assert_eq!(StorageType::try_from(5), Ok(StorageType::ReadOnly));
         assert_eq!(StorageType::try_from(0), Err(0));
         assert_eq!(StorageType::try_from(6), Err(6));

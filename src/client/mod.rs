@@ -8,7 +8,7 @@ mod retry;
 mod v3;
 mod walk;
 
-pub use auth::{Auth, CommunityVersion};
+pub use auth::Auth;
 pub use builder::{ClientBuilder, DEFAULT_CONSTRUCTION_TIMEOUT, Target, TargetClientBuilder};
 pub use chunks::{FixedCardinalityChunk, FixedCardinalityChunkError, FixedCardinalityChunkStream};
 pub use response_shape::{
@@ -77,10 +77,12 @@ use crate::message::{CommunityMessage, Message, SecurityLevel};
 use crate::oid::Oid;
 use crate::pdu::{GetBulkPdu, NotificationPdu, Pdu, PduType, RequestPdu, TrapV1Notification};
 use crate::transport::{Candidate, RequestTransport, UdpHandle, UdpStats};
-use crate::v3::{DesSaltState, EngineCache, EngineState, PrivProtocol, SaltCounter};
+use crate::v3::{
+    DerivedKeys, DesSaltState, EngineCache, EngineState, PrivProtocol, SaltCounter, UsmConfig,
+};
 use crate::value::Value;
 use crate::varbind::VarBind;
-use crate::version::Version;
+use crate::version::{CommunityVersion, Version};
 use response_shape::{RequestShape, classify};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -91,11 +93,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::{Span, instrument};
 
-#[cfg(any(feature = "crypto-rustcrypto", feature = "crypto-fips"))]
-pub use crate::v3::DerivedKeys;
-#[cfg(not(any(feature = "crypto-rustcrypto", feature = "crypto-fips")))]
-use crate::v3::DerivedKeys;
-pub use crate::v3::UsmConfig;
 pub use walk::{
     OidOrdering, WalkCollection, WalkError, WalkItem, WalkMetadataStream, WalkMethod, WalkOptions,
     WalkStream,

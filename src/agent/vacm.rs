@@ -28,7 +28,8 @@
 //! Configure read-only access for "public" community:
 //!
 //! ```rust
-//! use async_snmp::agent::{Agent, SecurityModel, VacmBuilder};
+//! use async_snmp::agent::{Agent, VacmBuilder};
+//! use async_snmp::handler::SecurityModel;
 //! use async_snmp::{SecurityLevel, oid};
 //!
 //! # fn example() {
@@ -49,7 +50,8 @@
 //! Configure different access levels for different users:
 //!
 //! ```rust
-//! use async_snmp::agent::{Agent, SecurityModel, VacmBuilder};
+//! use async_snmp::agent::{Agent, VacmBuilder};
+//! use async_snmp::handler::SecurityModel;
 //! use async_snmp::message::SecurityLevel;
 //! use async_snmp::oid;
 //!
@@ -134,7 +136,8 @@
 //! Use [`AgentBuilder::vacm()`](super::AgentBuilder::vacm) to configure VACM:
 //!
 //! ```rust,no_run
-//! use async_snmp::agent::{Agent, SecurityModel};
+//! use async_snmp::agent::Agent;
+//! use async_snmp::handler::SecurityModel;
 //! use async_snmp::{SecurityLevel, oid};
 //!
 //! # async fn example() -> Result<(), Box<async_snmp::Error>> {
@@ -181,7 +184,8 @@ use crate::handler::SecurityModel;
 /// where a mapping should match every concrete request model.
 ///
 /// ```rust
-/// use async_snmp::agent::{SecurityModel, VacmSecurityModel};
+/// use async_snmp::agent::VacmSecurityModel;
+/// use async_snmp::handler::SecurityModel;
 ///
 /// let exact = VacmSecurityModel::from(SecurityModel::Usm);
 /// assert_eq!(exact, VacmSecurityModel::Exact(SecurityModel::Usm));
@@ -555,7 +559,8 @@ impl StdError for DuplicateVacmAccessEntry {}
 /// # Example
 ///
 /// ```rust
-/// use async_snmp::agent::{SecurityModel, VacmBuilder};
+/// use async_snmp::agent::VacmBuilder;
+/// use async_snmp::handler::SecurityModel;
 /// use async_snmp::message::SecurityLevel;
 /// use async_snmp::oid;
 ///
@@ -868,7 +873,8 @@ impl VacmConfig {
 /// # Example
 ///
 /// ```rust
-/// use async_snmp::agent::{SecurityModel, VacmBuilder};
+/// use async_snmp::agent::VacmBuilder;
+/// use async_snmp::handler::SecurityModel;
 /// use async_snmp::message::SecurityLevel;
 /// use async_snmp::oid;
 ///
@@ -921,7 +927,8 @@ impl VacmBuilder {
     /// # Example
     ///
     /// ```rust
-    /// use async_snmp::agent::{SecurityModel, VacmBuilder};
+    /// use async_snmp::agent::VacmBuilder;
+    /// use async_snmp::handler::SecurityModel;
     ///
     /// let vacm = VacmBuilder::new()
     ///     // Multiple communities in same group
@@ -951,7 +958,8 @@ impl VacmBuilder {
     /// # Example
     ///
     /// ```rust
-    /// use async_snmp::agent::{SecurityModel, VacmBuilder};
+    /// use async_snmp::agent::VacmBuilder;
+    /// use async_snmp::handler::SecurityModel;
     /// use async_snmp::message::SecurityLevel;
     /// use async_snmp::oid;
     ///
