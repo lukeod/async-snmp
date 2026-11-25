@@ -47,12 +47,19 @@ pub fn write_to(out: &mut String, bytes: &[u8]) {
 /// assert!(decode("abc").is_err()); // odd length
 /// ```
 pub fn decode(s: &str) -> Result<Vec<u8>, DecodeError> {
-    if !s.len().is_multiple_of(2) {
+    let (pairs, remainder) = s.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
         return Err(DecodeError::OddLength);
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| DecodeError::InvalidChar))
+    let hex_digit = |byte| match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(DecodeError::InvalidChar),
+    };
+    pairs
+        .iter()
+        .map(|&[high, low]| Ok((hex_digit(high)? << 4) | hex_digit(low)?))
         .collect()
 }
 
@@ -230,6 +237,8 @@ mod tests {
         assert_eq!(decode("g0"), Err(DecodeError::InvalidChar));
         assert_eq!(decode("xx"), Err(DecodeError::InvalidChar));
         assert_eq!(decode("  "), Err(DecodeError::InvalidChar));
+        assert_eq!(decode("+f"), Err(DecodeError::InvalidChar));
+        assert_eq!(decode("aéz"), Err(DecodeError::InvalidChar));
     }
 
     #[test]
