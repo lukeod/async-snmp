@@ -528,12 +528,13 @@
 //! [`ReceptionId`]. Histories describe operation provenance, not unique traffic.
 //!
 //! Fixed GET/GETNEXT/SET responses expose metadata through
-//! [`FixedCardinalityResponse::metadata`]; GETBULK and Inform callers use
-//! [`Client::get_bulk_with_metadata`] and [`Client::send_inform_with_metadata`].
+//! [`FixedCardinalityResponse::metadata`]. [`Client::get_bulk`] returns a
+//! [`BulkResponse`] with metadata. [`Client::send_inform`] and
+//! [`Client::rediscover_engine`] return [`ResponseMetadata`] directly.
 //! Metadata-preserving walk streams expose per-item anomalies exactly once and
 //! a cumulative [`WalkCollection::metadata`] that also includes non-yielding
-//! terminal responses. The shorter Inform and walk methods intentionally
-//! discard this metadata. Delivered notifications retain their anomalies through
+//! terminal responses. Plain walks yield bindings without accumulating a full
+//! response history. Delivered notifications retain their anomalies through
 //! [`Notification::decode_anomalies`].
 //!
 //! ### Strict low-level inspection and network-role controls

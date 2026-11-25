@@ -81,7 +81,7 @@ async fn udp_batch_error_and_inform_histories_keep_each_input_length() {
         async_snmp::Error::Snmp { .. }
     ));
     let inform = client
-        .send_inform_with_metadata(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 123, vec![])
+        .send_inform(&oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1), 123, vec![])
         .await
         .unwrap();
     let no_response = client.get(&oids[0]).await.unwrap_err();

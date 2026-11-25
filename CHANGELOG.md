@@ -101,6 +101,9 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
   Histories include discovery and correction Reports and are retained across
   batch splits and subsequent failures. Read them from the original error with
   `Error::response_metadata()`. `Error::ResponseShape::response` is now boxed.
+- **Breaking.** `Client::get_bulk()`, `send_inform()`, and `rediscover_engine()`
+  return response metadata. Use the base method names in place of the former
+  `_with_metadata()` methods.
 - Faster BER number and OID decoding and response shape validation. SNMPv3
   signing avoids extra copies, and shared dispatch reuses correlation parsing
   and packet-specific SNMPv3 authentication and decryption work.

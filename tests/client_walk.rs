@@ -223,6 +223,11 @@ async fn getbulk_returns_multiple_varbinds() {
         .unwrap();
 
     // Should get up to 5 entries
-    assert!(results.len() <= 5);
-    assert!(!results.is_empty());
+    assert!(results.varbinds.len() <= 5);
+    assert!(!results.varbinds.is_empty());
+    assert_eq!(results.metadata.received_messages.len(), 1);
+    assert_eq!(
+        results.metadata.received_messages[0].pdu_type,
+        async_snmp::PduType::Response
+    );
 }

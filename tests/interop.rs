@@ -416,7 +416,7 @@ async fn getbulk_returns_multiple() {
         .await
         .unwrap();
 
-    assert!(results.len() >= 2);
+    assert!(results.varbinds.len() >= 2);
 }
 
 // ============================================================================

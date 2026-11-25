@@ -936,7 +936,7 @@ async fn standalone_v3_tcp_and_udp_listeners_share_engine_and_full_queue_allows_
     // must still complete on this session.
     let poller = client(session.clone(), security("priv").into());
     let discovery = poller
-        .rediscover_engine_with_metadata()
+        .rediscover_engine()
         .await
         .expect("discovery must succeed with the notification queue full");
     assert_eq!(discovery.received_messages.len(), 1);

@@ -509,10 +509,7 @@ impl<T: RequestTransport + 'static> GetBulkDriver<T> {
                     self.max_repetitions
                 };
 
-                let fut =
-                    Box::pin(
-                        async move { client.get_bulk_with_metadata(&[oid], 0, max_rep).await },
-                    );
+                let fut = Box::pin(async move { client.get_bulk(&[oid], 0, max_rep).await });
                 self.pending = Some(fut);
             }
 

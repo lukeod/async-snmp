@@ -383,15 +383,8 @@ impl<T: RequestTransport> Client<T> {
     /// [`TargetClientBuilder::strict_source`](crate::TargetClientBuilder::strict_source) or
     /// by the supplied transport handle.
     ///
-    /// This convenience method discards accepted discovery-response metadata.
-    /// Use [`Self::rediscover_engine_with_metadata`] to retain it.
-    pub async fn rediscover_engine(&self) -> Result<()> {
-        self.rediscover_engine_with_metadata().await.map(|_| ())
-    }
-
-    /// Discover and replace the authoritative engine while retaining accepted
-    /// wire deviations from the discovery Report.
-    pub async fn rediscover_engine_with_metadata(&self) -> Result<ResponseMetadata> {
+    /// Returns metadata from the accepted discovery Report.
+    pub async fn rediscover_engine(&self) -> Result<ResponseMetadata> {
         if !self.is_v3() {
             return Err(Error::Config("engine discovery requires SNMPv3".into()).boxed());
         }

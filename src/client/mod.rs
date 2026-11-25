@@ -1359,6 +1359,9 @@ impl<T: RequestTransport> Client<T> {
     /// PDU that echoes the request variable bindings. Uses the same retry and
     /// timeout logic as other request types.
     ///
+    /// Returns metadata for discovery, correction Reports, and the
+    /// acknowledgement in exchange order.
+    ///
     /// For V3: uses engine discovery against the receiver (same as GET/SET).
     /// V1 is not supported and returns an error.
     ///
@@ -1367,25 +1370,8 @@ impl<T: RequestTransport> Client<T> {
     /// * `trap_oid` - The trap OID (snmpTrapOID.0 value)
     /// * `uptime` - sysUpTime.0 value in hundredths of seconds
     /// * `varbinds` - Additional variable bindings (appended after the prefix)
-    ///
-    /// This convenience method intentionally discards accepted wire-deviation
-    /// metadata. Use [`Self::send_inform_with_metadata`] when it is needed.
     #[instrument(skip(self, varbinds), err, fields(snmp.target = %self.peer_addr(), snmp.trap_oid = %trap_oid))]
     pub async fn send_inform(
-        &self,
-        trap_oid: &Oid,
-        uptime: u32,
-        varbinds: Vec<VarBind>,
-    ) -> Result<()> {
-        self.send_inform_with_metadata(trap_oid, uptime, varbinds)
-            .await
-            .map(|_| ())
-    }
-
-    /// Send an Inform and retain metadata from discovery, correction Reports,
-    /// and the acknowledgement in exchange order.
-    #[instrument(skip(self, varbinds), err, fields(snmp.target = %self.peer_addr(), snmp.trap_oid = %trap_oid))]
-    pub async fn send_inform_with_metadata(
         &self,
         trap_oid: &Oid,
         uptime: u32,
@@ -1428,6 +1414,8 @@ impl<T: RequestTransport> Client<T> {
     /// - **Repeaters** (remaining OIDs): Each gets up to `max_repetitions` GETNEXTs,
     ///   returning multiple values per OID. Use for walking table columns.
     ///
+    /// Returns the decoded bindings and response metadata in a [`BulkResponse`].
+    ///
     /// # Arguments
     ///
     /// * `oids` - OIDs to retrieve
@@ -1447,19 +1435,15 @@ impl<T: RequestTransport> Client<T> {
     /// # let client = Client::builder("127.0.0.1:161", Auth::v2c("public")).connect().await?;
     /// // Get sysUpTime.0 (non-repeater) plus 10 interface descriptions (repeater).
     /// // Both inputs are object OIDs; GETBULK returns their instance successors.
-    /// let results = client.get_bulk(
+    /// let response = client.get_bulk(
     ///     &[oid!(1, 3, 6, 1, 2, 1, 1, 3), oid!(1, 3, 6, 1, 2, 1, 2, 2, 1, 2)],
     ///     1,  // first OID is non-repeating
     ///     10, // get up to 10 values for the second OID
     /// ).await?;
-    /// // Results: [sysUpTime value, ifDescr.1, ifDescr.2, ..., ifDescr.10]
+    /// let results = response.varbinds;
     /// # Ok(())
     /// # }
     /// ```
-    ///
-    /// This convenience method discards accepted response metadata. Use
-    /// [`Self::get_bulk_with_metadata`] when compatibility deviations must be
-    /// retained.
     #[instrument(skip(self, oids), err, fields(
         snmp.target = %self.peer_addr(),
         snmp.oid_count = oids.len(),
@@ -1467,19 +1451,6 @@ impl<T: RequestTransport> Client<T> {
         snmp.max_repetitions = max_repetitions
     ))]
     pub async fn get_bulk(
-        &self,
-        oids: &[Oid],
-        non_repeaters: u32,
-        max_repetitions: u32,
-    ) -> Result<Vec<VarBind>> {
-        Ok(self
-            .get_bulk_with_metadata(oids, non_repeaters, max_repetitions)
-            .await?
-            .varbinds)
-    }
-
-    /// GETBULK with accepted wire deviations retained as response metadata.
-    pub async fn get_bulk_with_metadata(
         &self,
         oids: &[Oid],
         non_repeaters: u32,
@@ -3307,7 +3278,7 @@ mod tests {
         )
         .unwrap();
         let metadata = client
-            .send_inform_with_metadata(
+            .send_inform(
                 &Oid::from_slice(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
                 123,
                 vec![],
@@ -3343,7 +3314,7 @@ mod tests {
         )
         .unwrap();
         let error = client
-            .send_inform_with_metadata(
+            .send_inform(
                 &Oid::from_slice(&[1, 3, 6, 1, 6, 3, 1, 1, 5, 1]),
                 123,
                 vec![],

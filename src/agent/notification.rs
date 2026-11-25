@@ -1090,7 +1090,7 @@ impl super::Agent {
         tokio::select! {
             biased;
             () = self.inner.cancel.cancelled() => Err(Error::Config("agent notification originator stopped".into()).boxed()),
-            result = client.send_inform_with_metadata(trap_oid, uptime, varbinds.to_vec()) => result,
+            result = client.send_inform(trap_oid, uptime, varbinds.to_vec()) => result,
         }
     }
 
