@@ -7,148 +7,104 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- `CommandProcessor` exposes socketless command handling with the managed
-  Agent's application/security/SET machinery. Owned, bounded request tasks
-  retain mutation cleanup after caller cancellation, deadlines or shutdown;
-  `CommandControl` observes and drains retained work. Caller-owned endpoints
-  declare engine receive capacity with an RAII `ReceiveCapacityRegistration`;
-  admitted input holds preserve MIB state without authorizing new admissions.
-
-- **Breaking:** managed receivers support application-controlled Inform
-  acknowledgement with bounded outstanding work, expiry and supervised completion.
-  `inform_ack` now uses `NotificationAcknowledgement` to distinguish traps, completed outcomes
-  and pending capabilities, replacing `Option<InformAckOutcome>`/`None` semantics.
-  Automatic acknowledgement remains the default. Manual mode defaults to 256
-  outstanding Informs and 30 seconds from acceptance, including dequeued work
-  and sending. Expiry releases service-owned payloads; first polling completion
-  commits a bounded supervised attempt even if its waiter is abandoned. Drop or
-  reject sends nothing; retransmissions remain independent.
-
-- `NotificationProcessor` processes complete v1/v2c/v3 inputs without owning I/O
-  or tasks, sharing protocol processing with managed receivers. Accepted Informs
-  carry an owned `InformResponse` encoded only on explicit completion, with
-  current authoritative time/sender state and the original selected keys.
-  Selected processors handle engine discovery and stale Informs in `process`.
-  USM failures retain any Report bytes, and `LocalEngine::usm_stats` exposes a
-  counter snapshot. Caller-owned endpoints without a selected listener can
-  answer through their designated `LocalEngine::report_unknown_engine`.
-
-- Managed and caller-owned SNMPv3 receivers resolve Inform and trap authority
-  before updating remote timeliness. Stale Informs take the unknown-engine
-  path, and only recognized authenticated traps can advance the remote clock.
-  Report eligibility follows the PDU type when available, with the reportable
-  flag as fallback. Reports preserve the original request ID when available.
-
-- **Breaking:** `admission_policy` and `try_admission_policy` replace the
-  notification acceptance callbacks on both builders. `NotificationAdmissionInfo`
-  exposes receive metadata, wire identity, scoped context, class, and notification
-  OID. Inspect payloads in delivered events and use deferred acknowledgement
-  for application-controlled completion. `admit_all_notifications` explicitly
-  admits every validated notification.
-
-- **Breaking:** For an admitted Inform, the processor checks response size before
-  delivery. In either acknowledgement mode, managed receivers attempt a
-  fitting `tooBig` reply or count a silent drop if both responses exceed the
-  limit. Socketless processors expose this outcome as
-  `NotificationProcessResult::InformTooBig`. If current engine boots/time make
-  an admitted response too large at completion, encoding tries the same
-  alternate. `EncodedInformResponse` and managed `InformAckOutcome` distinguish
-  ordinary replies, `tooBig` replies and counted silent drops.
-
-- `UsmSecurityContext` shares selectable inbound credentials and bounded remote
-  timeliness state. Engine-specific user entries precede explicit defaults;
-  atomic user replacement preserves each in-flight input's credential snapshot.
-  Agent and notification builders accept an explicit `security_context`.
-  Exact-entry security failure never falls back to default credentials; invalid
-  replacements leave the previous table active and preserve remote timeliness.
-
-- Clients accept `local_engine` to share authoritative time, persistence health
-  and privacy-sender state with other roles. Existing clients and cached agent
-  Inform clients observe DES state removal and replacement; AES clients share
-  the local engine's salt allocator. Client receive capacities contribute to
-  the shared engine minimum until the last client clone is dropped.
-
-- `LocalEngine` shares local identity, authoritative time, engine counters,
-  persistence health and privacy-sender state across independently prepared
-  agent and notification services. Builders accept `local_engine`; engine MIB
-  receive capacity tracks the minimum across registered service lifetimes.
-
-- Public `ProcessingInput` validates original packet length and the hard receive
-  bound using `ProcessingLimits`. Managed command and notification processing
-  use the same envelope, preserving receive identity, UDP tolerance and TCP limits.
-
-- **Breaking:** `PreparedAgent::into_parts()` returns
-  `(agent, runner, notifications)`. The optional attached receiver is the
-  third element. Use `RunningAgent::take_notifications()` after spawning.
-
-- **Breaking:** notification receivers use `prepare()` or explicit `spawn()` /
-  `spawn_on()` and an independently driven runner. `recv(&mut self)` is a
-  cancellation-safe single-consumer queue returning `Option`; receivers are no
-  longer cloneable. Controls expose shutdown, terminal status and coalesced
-  authoritative persistence health. Deliverable Informs reserve queue capacity
-  before ordinary acknowledgement. Shutdown invalidates pending manual
-  acknowledgements and drains admitted automatic response attempts. Consumer
-  `close()` stops new admission. Admitted manual tokens remain usable until
-  their deadlines while the runner stays active.
-  `RunningNotificationReceiver` provides `recv()` and `close()` directly and
-  dereferences to the consumer immutably. Its `task()` returns an optional
-  handle, which is absent once `join()` or `shutdown()` finishes.
-
-- TCP sessions now own one reader and serialized writer, with bounded concurrent
-  exchanges and aggregate message buffering. Cancelling a request leaves framing
-  intact; started writes finish within their original deadline or close the session.
-  `TcpTransportBuilder::prepare()` returns a session/runner pair, accepts owned
-  connected streams or configured pre-connect sockets, and creates no task.
-  Explicit `spawn()`/`spawn_on()` return a `RunningTcpSession`; `TcpControl`
-  exposes shutdown, status and managed-driver joining. Session handles never reconnect.
-  Session and service budgets reserve output capacity so retained input cannot
-  block Responses or Inform acknowledgements. Session budgets must accommodate
-  the sum of receive/send limits; service budgets must accommodate the largest
-  inbound partition and largest send capacity across their listeners.
-  `NotificationReceiverBuilder::max_tcp_buffered_bytes` replaces
-  `max_buffered_bytes` and sets the shared TCP budget. UDP notification processing
-  and response candidates use independent dispatch budgets.
-
-- Shared endpoint dispatch retains packet-bound v3 header and cryptographic work
-  for the selected consumer. Applications retain their own decode policy,
-  ordered security checks and timeliness processing. Optional plaintext retention
-  uses available byte permits and falls back to decryption in the consumer.
-
-- **Breaking:** `UdpTransport` is now `UdpEndpoint`. Its builder uses `prepare()`
-  for an unstarted endpoint/runner pair, or explicit `spawn()`/`spawn_on()` for a
-  `RunningUdpEndpoint` that retains the task result and requests shutdown on drop.
-  `from_socket()` accepts an owned unconnected Tokio socket without migrating its
-  runtime registration. `UdpControl` separates shutdown requests from completion
-  waits and exposes terminal status. Driver termination closes all sends and
-  requests, including when the runner is dropped before its first poll.
-
-- **Breaking:** `UdpStatus` and `TcpStatus` report `Interrupted` when their
-  runner drops before completion. Joining an interrupted runner returns an
-  I/O interruption on every call. A join that observes a panic reports failure.
-
-- **Breaking:** The client exchange trait is named `RequestTransport`. Its send
-  and request methods take owned `Bytes`, allowing queued TCP writes to retain
-  encoded storage without copying it; clone `Bytes` when retaining a request.
-  Validators receive a `ReceivedPacket` containing the original bytes and `ReceivedMessageInfo`.
-  Custom transports construct it with `ReceivedPacket::new(bytes, info)`; validators
-  can use `packet.into_parts()` to take both values. Notification results
-  and admission policy inputs expose `receive_info` instead of `source`. Use
-  `receive_info.peer_addr()` for the sender and `receive_info.received_len()` for
-  the complete encoded SNMP input length, including accepted UDP suffixes.
-- `RequestContext::receive_info()` exposes the receiving endpoint and original
-  input length. Read retained received-message history through
-  `Error::response_metadata()` on the original error. Use
-  `Error::exchange_source()` to match the underlying failure.
-  `Error::ResponseShape::response` is boxed to keep the error representation bounded.
-
-
 ### Added
 
-- `HandlerError::drop_request` lets simulators suppress the entire SNMPv1/v2c/v3
-  retrieval response, even after successful GETBULK repetitions. Ordinary
-  handler errors retain their existing `genErr` behavior.
+- Agents and notification receivers support mixed UDP/TCP listener sets, supplied
+  sockets and connected TCP sessions. Attach a notification receiver to an Agent
+  to share listeners with command handling and optionally enable client exchanges
+  on the same endpoints. Command and notification admission can close independently.
+- `CommandProcessor` runs the Agent's command, security, and SET processing over
+  caller-owned I/O. Bounded request tasks retain SET cleanup after caller
+  cancellation or deadlines. `CommandControl` can close admission and drain
+  mutations or all requests.
+- `NotificationProcessor` synchronously handles complete SNMPv1/v2c/v3 messages
+  without a Tokio runtime. It returns USM Reports when applicable and gives
+  accepted Informs an owned `InformResponse` for deferred encoding with current
+  engine state and the original selected credentials.
+- `LocalEngine` shares authoritative identity, boots/time, persistence health,
+  counters, and AES/DES sender state across agents, receivers, and clients.
+  Managed endpoints register their receive capacity for their serving lifetime.
+  Caller-owned endpoints can use `register_receive_capacity()`. The engine MIB
+  reports the minimum registered capacity.
+- `UsmSecurityContext` shares inbound credentials and bounded remote timeliness
+  across roles. An exact engine and username match determines the credentials
+  for that message. Explicit username defaults cover unmatched pairs. Atomic
+  replacement preserves remote timeliness and in-flight credential selections.
+- `ProcessingInput` validates the original message length against explicit
+  receive limits and carries receive metadata and reply limits for both
+  processors.
+- `TransportObserver` provides bounded send, receive, and disposition events
+  with message and socket-byte counters. Events share reception IDs with client
+  response histories and notification metadata.
+- `HandlerError::drop_request` suppresses the entire SNMPv1/v2c/v3 retrieval
+  response, including earlier successful GETBULK repetitions.
+
+### Changed
+
+- **Breaking.** Agent and notification receiver builders use `prepare()` with
+  owned runners or explicit `spawn()` / `spawn_on()` in place of `build()`.
+  The single-use `AgentRunner::run()` replaces `Agent::run()`, and
+  `AgentAlreadyRunning` is removed.
+  `PreparedAgent::into_parts()` yields `(agent, runner, notifications)`.
+  Use `RunningAgent::take_notifications()` after spawning. Both services expose
+  identified listener addresses through `bound_addresses()` in place of
+  `local_addr()`. The Agent's `max_concurrent_requests()` takes a positive
+  `usize` in place of `Option<usize>`.
+- **Breaking.** `NotificationReceiver::spawn()` replaces `bind()`. The receiver
+  is single-consumer and `recv(&mut self)` returns `Option<ReceivedNotification>`.
+  Use its control for shutdown, terminal status, and persistence health. A
+  command-only Agent ignores Informs by default. Use an attached receiver
+  for delivery or `discard_notifications()` to acknowledge and discard them.
+- **Breaking.** Replace `trap_sink(id, destination, auth)` with
+  `notification_sink(id, NotificationTarget, auth)`. Targets select a shared UDP
+  listener, dedicated UDP endpoint, TCP session, or existing peer. Sink
+  outcomes expose endpoint or session identity and route limits.
+- **Breaking.** `admission_policy` and `try_admission_policy` replace
+  `acceptance_policy` and `try_acceptance_policy`. `NotificationAdmissionInfo`
+  carries receive metadata, wire identity, scoped context, class, and OID.
+  Inspect payloads after delivery.
+- **Breaking.** `ReceivedNotification::inform_ack` is now a
+  `NotificationAcknowledgement` with variants for traps, completed attempts, and
+  pending application-controlled acknowledgements. Automatic mode remains the
+  default. Manual mode defaults to 256 outstanding Informs and a 30-second
+  deadline from acceptance, including time after dequeue. An acknowledgement
+  can finish on the original route if its waiter is cancelled. Dropping or
+  rejecting a pending token leaves the Inform unacknowledged. Retransmissions
+  are handled independently.
+- **Breaking.** `UdpEndpoint` replaces `UdpTransport`. Use `prepare()` for an
+  endpoint and runner or explicit `spawn()` / `spawn_on()`. The builder accepts
+  an owned unconnected Tokio socket. `UdpControl` separates shutdown requests
+  from completion waits. TCP also supports explicit runners and bounded
+  concurrent exchanges, preserves stream framing on cancellation, and reserves
+  room for replies while retaining input.
+- **Breaking.** `RequestTransport` replaces `Transport`. Send and request methods
+  take owned `Bytes`. Validators receive a `ReceivedPacket` with original bytes
+  and `ReceivedMessageInfo`. Notifications expose `receive_info` in place of
+  `source`, and agent handlers can read it through `RequestContext::receive_info()`.
+- **Breaking.** `ResponseMetadata::received_messages` records each accepted PDU's
+  kind, receive identity, original message length, and decode anomalies. The
+  former `decode_anomalies` field becomes a flattened iterator method.
+  Histories include discovery and correction Reports and are retained across
+  batch splits and subsequent failures. Read them from the original error with
+  `Error::response_metadata()`. `Error::ResponseShape::response` is now boxed.
+- Faster BER number and OID decoding and response shape validation. SNMPv3
+  signing avoids extra copies, and shared dispatch reuses correlation parsing
+  and packet-specific SNMPv3 authentication and decryption work.
+
+### Fixed
+
+- SNMPv3 notification receivers distinguish Informs naming stale receiver engine
+  IDs from traps using sender engine IDs. Only recognized, authenticated traps
+  advance remote timeliness. SNMPv3 Report eligibility follows the PDU type
+  when available, and Reports preserve the original request ID when available.
+- Notification receivers check an admitted Inform's reply size before delivery.
+  If it exceeds the limit, they attempt a fitting empty-varbind `tooBig` reply
+  or count a silent drop. Socketless callers get
+  `NotificationProcessResult::InformTooBig`. The same fallback applies if the
+  response grows past the limit at completion.
+- Agent-originated SNMPv1 traps use a concrete local IPv4 address when available,
+  with best-effort route lookup for wildcard UDP sinks. An explicit
+  `snmpTrapAddress.0` takes precedence.
 
 ## [0.18.1] - 2026-08-19
 
@@ -1187,7 +1143,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Zero-copy BER encoding/decoding
 - CLI utilities: `asnmp-get`, `asnmp-walk`, `asnmp-set`
 
-[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/lukeod/async-snmp/compare/v0.18.1...HEAD
+[0.18.1]: https://github.com/lukeod/async-snmp/compare/v0.18.0...v0.18.1
 [0.18.0]: https://github.com/lukeod/async-snmp/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/lukeod/async-snmp/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/lukeod/async-snmp/compare/v0.15.0...v0.16.0
