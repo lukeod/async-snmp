@@ -1461,40 +1461,57 @@ async fn cancelling_started_write_finishes_frame_before_next_message() {
 #[tokio::test]
 async fn partial_write_uses_original_exchange_deadline_and_closes_session() {
     let (observer, mut events) = crate::TransportObserver::channel(8).unwrap();
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let socket = TcpSocket::new_v4().unwrap();
-    socket.set_send_buffer_size(4096).unwrap();
-    let (prepared, accepted) = tokio::join!(
+    let (prepared, mut peer) = pair(
         TcpTransport::builder()
             .observer(observer.clone())
-            .from_socket(socket)
-            .target(address)
-            .prepare(),
-        listener.accept()
-    );
-    let running = prepared.unwrap().spawn();
-    let mut peer = accepted.unwrap().0;
-    let payload = vec![b'X'; 4 * 1024 * 1024];
-    let error = running
-        .request(
-            &payload,
-            RequestRegistration::test_unchecked(1, Duration::from_millis(30)),
-        )
+            .write_timeout(Duration::from_secs(30)),
+    )
+    .await;
+    // Make the writer stall after the prefix regardless of socket buffer sizes.
+    let mut prefix = [0; 3];
+    prepared
+        .transport
+        .inner
+        .state
+        .stall_write_after
+        .set(prefix.len())
+        .unwrap();
+    let running = prepared.spawn();
+    let transport = running.transport();
+    let exchange_timeout = Duration::from_secs(10);
+    let exchange = tokio::spawn(async move {
+        transport
+            .request(
+                b"prefix and remainder",
+                RequestRegistration::test_unchecked(1, exchange_timeout),
+            )
+            .await
+    });
+    timeout(Duration::from_secs(5), peer.read_exact(&mut prefix))
         .await
-        .unwrap_err();
+        .unwrap()
+        .unwrap();
+    assert_eq!(&prefix, b"pre");
+
+    tokio::time::pause();
+    tokio::time::advance(exchange_timeout).await;
+    tokio::time::resume();
+
+    let error = exchange.await.unwrap().unwrap_err();
     assert_eq!(error.kind(), crate::ErrorKind::Timeout);
     assert!(
-        matches!(error.exchange_source(), Error::Timeout { elapsed, retries: 0, .. } if *elapsed >= Duration::from_millis(20))
+        matches!(error.exchange_source(), Error::Timeout { elapsed, retries: 0, .. } if *elapsed >= exchange_timeout)
     );
-    timeout(Duration::from_secs(1), running.control().wait_closed())
+    timeout(Duration::from_secs(2), running.control().wait_closed())
         .await
         .unwrap();
-    let mut written = Vec::new();
-    peer.read_to_end(&mut written).await.unwrap();
-    assert!(!written.is_empty());
-    assert!(written.len() < payload.len());
-    assert_eq!(observer.stats().socket_written_bytes, written.len() as u64);
+    let mut remaining = Vec::new();
+    timeout(Duration::from_secs(2), peer.read_to_end(&mut remaining))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(remaining.is_empty());
+    assert_eq!(observer.stats().socket_written_bytes, prefix.len() as u64);
     assert_eq!(observer.stats().sent_messages, 0);
     assert_eq!(observer.stats().sent_message_bytes, 0);
     assert!(events.try_recv().is_err());

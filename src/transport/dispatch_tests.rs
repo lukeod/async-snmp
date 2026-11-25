@@ -956,6 +956,10 @@ async fn one_peers_parked_candidates_leave_response_bytes_for_other_peers() {
     let _notifications = service.take_notifications();
     let endpoint = endpoint(&service);
     let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    // The default macOS send buffer is smaller than the response datagrams below.
+    socket2::SockRef::from(&peer)
+        .set_send_buffer_size(crate::UDP_RECEIVE_BUFFER_SIZE)
+        .unwrap();
     let handle = endpoint.handle(peer.local_addr().unwrap()).unwrap();
     let request = community(crate::Pdu::get_request(1, &[get_oid()]));
     let mut pending = Vec::new();

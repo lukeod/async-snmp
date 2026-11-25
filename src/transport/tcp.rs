@@ -342,6 +342,8 @@ impl TcpTransportBuilder {
             terminal_error: Mutex::new(None),
             in_flight: Arc::new(Semaphore::new(self.options.max_in_flight)),
             budget,
+            #[cfg(test)]
+            stall_write_after: Default::default(),
             dispatch: Mutex::new(None),
             ingress: self.ingress.map(|mut ingress| {
                 ingress.session = Some(Arc::new(Semaphore::new(
@@ -423,6 +425,8 @@ struct SessionState {
     terminal_error: Mutex<Option<Arc<Error>>>,
     in_flight: Arc<Semaphore>,
     budget: Arc<BufferBudget>,
+    #[cfg(test)]
+    stall_write_after: std::sync::OnceLock<usize>,
     ingress: Option<super::ingress::ApplicationIngress>,
 }
 
@@ -1080,12 +1084,26 @@ async fn write_loop(
                 .send(Err(timeout_error(state.target, command.started.elapsed())));
             continue;
         }
+        let write_limit = command.bytes.len();
+        #[cfg(test)]
+        let write_limit = state
+            .stall_write_after
+            .get()
+            .map_or(write_limit, |limit| write_limit.min(*limit));
         let mut offset = 0;
         while offset < command.bytes.len() {
+            let writable = write.writable();
+            #[cfg(test)]
+            let writable = async {
+                if offset == write_limit {
+                    std::future::pending::<()>().await;
+                }
+                writable.await
+            };
             let ready = tokio::select! {
                 biased;
                 () = command.cancelled.cancelled(), if offset == 0 => continue 'commands,
-                result = tokio::time::timeout_at(deadline, write.writable()) => result,
+                result = tokio::time::timeout_at(deadline, writable) => result,
             };
             match ready {
                 Ok(Ok(())) => {}
@@ -1122,7 +1140,7 @@ async fn write_loop(
                 }
                 return Err(timeout_error(state.target, command.started.elapsed()));
             }
-            match write.try_write(&command.bytes[offset..]) {
+            match write.try_write(&command.bytes[offset..write_limit]) {
                 Ok(0) => {
                     return Err(Error::Network {
                         target: state.target,

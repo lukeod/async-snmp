@@ -777,6 +777,13 @@ impl UdpEndpointBuilder {
     /// can be packaged without an entered runtime. Binding a new socket requires
     /// an entered Tokio runtime and preserves that runtime's I/O registration.
     pub async fn prepare(self) -> Result<PreparedUdpEndpoint> {
+        self.prepare_with_reuse_address(true).await
+    }
+
+    pub(crate) async fn prepare_with_reuse_address(
+        self,
+        reuse_address: bool,
+    ) -> Result<PreparedUdpEndpoint> {
         let (receive_limits, bind_addr) = self.validate_config()?;
         let socket = match self.socket {
             Some(socket) => {
@@ -794,7 +801,7 @@ impl UdpEndpointBuilder {
                     bind_addr,
                     self.recv_buffer_size,
                     self.send_buffer_size,
-                    true,
+                    reuse_address,
                 )
                 .await
                 .map_err(|source| Error::Network {
@@ -803,13 +810,26 @@ impl UdpEndpointBuilder {
                 })?
             }
         };
-        let local_addr = socket.local_addr().map_err(|source| Error::Network {
-            target: "0.0.0.0:0".parse().unwrap(),
-            source,
-        })?;
-        if local_addr.port() == 0 {
-            return Err(Error::Config("UDP endpoint requires a bound socket".into()).boxed());
+        let local_addr = match socket.local_addr() {
+            Ok(addr) => (addr.port() != 0).then_some(addr),
+            // Winsock reports WSAEINVAL from getsockname for an unbound socket.
+            #[cfg(windows)]
+            Err(source)
+                if bind_addr.is_none()
+                    && source.raw_os_error()
+                        == Some(windows_sys::Win32::Networking::WinSock::WSAEINVAL) =>
+            {
+                None
+            }
+            Err(source) => {
+                return Err(Error::Network {
+                    target: "0.0.0.0:0".parse().unwrap(),
+                    source,
+                }
+                .boxed());
+            }
         }
+        .ok_or_else(|| Error::Config("UDP endpoint requires a bound socket".into()).boxed())?;
         let ipv6_only = local_addr.is_ipv6()
             && socket2::SockRef::from(&socket)
                 .only_v6()
@@ -1611,7 +1631,6 @@ mod tests {
         .unwrap();
         socket.set_nonblocking(true).unwrap();
         let socket = UdpSocket::from_std(socket.into()).unwrap();
-        assert_eq!(socket.local_addr().unwrap().port(), 0);
         let error = UdpEndpoint::builder()
             .from_socket(socket)
             .prepare()

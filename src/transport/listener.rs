@@ -22,7 +22,7 @@ pub enum ListenerSource {
     Session(super::TcpTransportBuilder),
 }
 impl ListenerSource {
-    /// Configure UDP with full datagram receive/send capacities.
+    /// Bind UDP without address reuse and with full datagram receive/send capacities.
     pub fn udp(address: impl AsRef<str>) -> Self {
         Self::Udp(
             UdpEndpoint::builder()
@@ -69,7 +69,10 @@ impl ListenerSource {
     ) -> Result<PreparedListener> {
         match self {
             Self::Udp(builder) => {
-                let (endpoint, runner) = builder.prepare().await?.into_parts();
+                let (endpoint, runner) = builder
+                    .prepare_with_reuse_address(false)
+                    .await?
+                    .into_parts();
                 let bound = BoundListener {
                     endpoint_id: endpoint.endpoint_id(),
                     transport: TransportKind::Udp,

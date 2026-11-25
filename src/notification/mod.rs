@@ -2421,7 +2421,12 @@ mod tests {
                 if message.as_ref() == "invalid bind address: not a socket address"
         ));
 
-        let occupied = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Reserve the address with reuse enabled so a second reuse-enabled bind
+        // would succeed on Linux as well as Windows.
+        let occupied =
+            crate::util::bind_udp_socket("127.0.0.1:0".parse().unwrap(), None, None, true)
+                .await
+                .unwrap();
         let occupied_addr = occupied.local_addr().unwrap();
         let bound_error = NotificationReceiver::bind_with_engine_id_generator(
             occupied_addr.to_string(),
@@ -2437,12 +2442,15 @@ mod tests {
             .err()
             .expect("occupied builder bind must fail");
         for error in [bound_error, built_error] {
-            assert!(matches!(
-                *error,
-                Error::Network { target, ref source }
-                    if target == occupied_addr
-                        && source.kind() == std::io::ErrorKind::AddrInUse
-            ));
+            assert!(
+                matches!(
+                    *error,
+                    Error::Network { target, ref source }
+                        if target == occupied_addr
+                            && source.kind() == std::io::ErrorKind::AddrInUse
+                ),
+                "unexpected occupied-address error: {error:?}"
+            );
         }
     }
 
