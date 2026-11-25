@@ -83,6 +83,8 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
   take owned `Bytes`. Validators receive a `ReceivedPacket` with original bytes
   and `ReceivedMessageInfo`. Notifications expose `receive_info` in place of
   `source`, and agent handlers can read it through `RequestContext::receive_info()`.
+- **Breaking.** The `v3::parse_discovery_response` helpers are removed. Use
+  `DiscoveredEngine::new` with the decoded engine ID and advertised `msgMaxSize`.
 - **Breaking.** `ResponseMetadata::received_messages` records each accepted PDU's
   kind, receive identity, original message length, and decode anomalies. The
   former `decode_anomalies` field becomes a flattened iterator method.

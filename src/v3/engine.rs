@@ -7,7 +7,6 @@
 //! - `EngineCache`: Thread-safe target identities and per-engine authenticated time
 //! - `DiscoveredEngine`: Validated identity and advertised receive capacity
 //! - `EngineState`: Cached identity with optional authenticated time
-//! - Discovery response parsing
 //!
 //! # Discovery flow
 //!
@@ -36,7 +35,6 @@ use bytes::Bytes;
 
 use crate::error::{Error, Result};
 use crate::message_size::{MessageSize, UDP_RECEIVE_LIMITS};
-use crate::v3::UsmSecurityParams;
 
 /// Time window in seconds (RFC 3414 Section 2.2.3).
 pub const TIME_WINDOW: u32 = 150;
@@ -191,6 +189,9 @@ pub struct DiscoveredEngine {
 
 impl DiscoveredEngine {
     /// Validate a discovered authoritative engine identity.
+    ///
+    /// Use the peer's `msgMaxSize` from the decoded message header as
+    /// `msg_max_size`.
     pub fn new(engine_id: impl Into<Bytes>, msg_max_size: MessageSize) -> Result<Self> {
         let engine_id = engine_id.into();
         validate_engine_id(&engine_id)?;
@@ -322,12 +323,9 @@ impl EngineState {
 
     /// Create an identity learned through unauthenticated discovery.
     #[must_use]
-    pub(crate) fn from_discovery(engine_id: Bytes, msg_max_size: MessageSize) -> Self {
+    pub(crate) fn from_discovery(discovered: DiscoveredEngine) -> Self {
         Self {
-            discovered: DiscoveredEngine {
-                engine_id,
-                msg_max_size,
-            },
+            discovered,
             authenticated_time: None,
         }
     }
@@ -365,7 +363,7 @@ impl EngineState {
             engine_id,
             engine_boots,
             engine_time,
-            cap_msg_max_size(reported_msg_max_size, session_max),
+            reported_msg_max_size.min(session_max),
         )
     }
 
@@ -483,15 +481,6 @@ impl EngineState {
     fn is_in_time_window(&self, msg_boots: u32, msg_time: u32) -> bool {
         let (local_boots, local_time) = self.estimated_boots_time();
         in_authoritative_time_window(local_boots, local_time, msg_boots, msg_time)
-    }
-}
-
-fn cap_msg_max_size(reported: MessageSize, session_max: MessageSize) -> MessageSize {
-    if reported > session_max {
-        tracing::debug!(target: "async_snmp::v3", { reported = reported.as_usize(), session_max = session_max.as_usize() }, "capping msgMaxSize to session limit");
-        session_max
-    } else {
-        reported
     }
 }
 
@@ -817,7 +806,7 @@ impl EngineCache {
     /// refreshed target identity is evicted.
     pub fn insert_discovered(&self, target: SocketAddr, engine: DiscoveredEngine) -> Result<()> {
         let expected_engine_id = engine.engine_id.clone();
-        let state = EngineState::from_discovery(engine.engine_id, engine.msg_max_size);
+        let state = EngineState::from_discovery(engine);
         let outcome = self.store_at(target, state, Instant::now(), false);
         match outcome {
             StoreOutcome::Stored(stored) if stored.engine_id() == &expected_engine_id => Ok(()),
@@ -1328,83 +1317,6 @@ fn remove_orphaned_time(inner: &mut EngineCacheInner, engine_id: &Bytes) {
     {
         inner.authenticated_times.remove(engine_id);
     }
-}
-
-/// Extract engine identity from a discovery response's USM security parameters.
-///
-/// The discovery response carries boots/time too, but this parser deliberately
-/// discards them because the discovery message is unauthenticated.
-pub fn parse_discovery_response(security_params: &Bytes) -> Result<DiscoveredEngine> {
-    parse_discovery_response_with_msg_max_size(security_params, UDP_RECEIVE_LIMITS.advertised())
-}
-
-/// Extract engine identity and the peer's exact advertised receive capacity.
-///
-/// This preserves the remote protocol value independently of any local
-/// transport send capacity. Callers compute their effective outbound limit
-/// when a message has been exactly encoded.
-pub(crate) fn parse_discovery_response_with_msg_max_size(
-    security_params: &Bytes,
-    reported_msg_max_size: MessageSize,
-) -> Result<DiscoveredEngine> {
-    let usm = UsmSecurityParams::decode(security_params.clone(), crate::DecodeConfig::default())?;
-    discovered_engine(usm.value.engine_id, reported_msg_max_size)
-}
-
-/// Construct discovery state from security parameters already decoded under
-/// the receiving role's selected compatibility policy.
-pub(crate) fn discovered_engine_state(
-    engine_id: Bytes,
-    reported_msg_max_size: MessageSize,
-) -> Result<EngineState> {
-    let engine = discovered_engine(engine_id, reported_msg_max_size)?;
-    Ok(EngineState::from_discovery(
-        engine.engine_id,
-        engine.msg_max_size,
-    ))
-}
-
-fn discovered_engine(
-    engine_id: Bytes,
-    reported_msg_max_size: MessageSize,
-) -> Result<DiscoveredEngine> {
-    validate_discovered_engine_id(&engine_id)?;
-    Ok(DiscoveredEngine {
-        engine_id,
-        msg_max_size: reported_msg_max_size,
-    })
-}
-
-/// Extract engine identity with explicit msgMaxSize and session limit.
-///
-/// The `reported_msg_max_size` comes from the V3 message header (`MsgGlobalData`).
-/// The `session_max` is our transport's maximum message size.
-/// Values are capped to prevent issues with non-compliant agents.
-pub fn parse_discovery_response_with_limits(
-    security_params: &Bytes,
-    reported_msg_max_size: MessageSize,
-    session_max: MessageSize,
-) -> Result<DiscoveredEngine> {
-    let usm = UsmSecurityParams::decode(security_params.clone(), crate::DecodeConfig::default())?;
-    discovered_engine(
-        usm.value.engine_id,
-        cap_msg_max_size(reported_msg_max_size, session_max),
-    )
-}
-
-fn validate_discovered_engine_id(engine_id: &[u8]) -> Result<()> {
-    // RFC 3411 Section 5: a valid SnmpEngineID is 5..=32 octets and is neither
-    // all-zero nor all-0xff. Reject discovery responses carrying an engine ID
-    // outside those bounds (including the empty ID) rather than caching it and
-    // deriving unusable localized keys from it.
-    if validate_engine_id(engine_id).is_err() {
-        tracing::debug!(target: "async_snmp::engine", { length = engine_id.len() }, "discovery response contained invalid engine ID");
-        return Err(Error::InvalidMessage(
-            "discovery response contains an invalid authoritative engine ID".into(),
-        )
-        .boxed());
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -2056,8 +1968,11 @@ mod tests {
                     cache.insert_state_at(
                         addr,
                         EngineState::from_discovery(
-                            Bytes::from_static(b"engine"),
-                            crate::MessageSize::new(1400).unwrap(),
+                            DiscoveredEngine::new(
+                                Bytes::from_static(b"engine"),
+                                MessageSize::new(1400).unwrap(),
+                            )
+                            .unwrap(),
                         ),
                         now,
                     );
@@ -2102,12 +2017,18 @@ mod tests {
         let addr: SocketAddr = "192.168.1.1:161".parse().unwrap();
         let shared_addr: SocketAddr = "192.168.1.2:161".parse().unwrap();
         let old = EngineState::from_discovery(
-            Bytes::from_static(b"old-engine"),
-            crate::MessageSize::new(1400).unwrap(),
+            DiscoveredEngine::new(
+                Bytes::from_static(b"old-engine"),
+                MessageSize::new(1400).unwrap(),
+            )
+            .unwrap(),
         );
         let new = EngineState::from_discovery(
-            Bytes::from_static(b"new-engine"),
-            crate::MessageSize::new(1500).unwrap(),
+            DiscoveredEngine::new(
+                Bytes::from_static(b"new-engine"),
+                MessageSize::new(1500).unwrap(),
+            )
+            .unwrap(),
         );
         let shared = EngineState::new(Bytes::from_static(b"new-engine"), 7, 500);
 
@@ -2134,11 +2055,15 @@ mod tests {
 
         cache.insert_state(
             addr1,
-            EngineState::from_discovery(engine_id.clone(), crate::MessageSize::new(1400).unwrap()),
+            EngineState::from_discovery(
+                DiscoveredEngine::new(engine_id.clone(), MessageSize::new(1400).unwrap()).unwrap(),
+            ),
         );
         cache.insert_state(
             addr2,
-            EngineState::from_discovery(engine_id, crate::MessageSize::new(1500).unwrap()),
+            EngineState::from_discovery(
+                DiscoveredEngine::new(engine_id, MessageSize::new(1500).unwrap()).unwrap(),
+            ),
         );
         assert!(cache.update_time(&addr1, 4, 500));
 
@@ -2158,7 +2083,9 @@ mod tests {
         cache.insert_state(addr, EngineState::new(engine_id.clone(), 6, 9000));
         cache.insert_state(
             addr,
-            EngineState::from_discovery(engine_id, crate::MessageSize::new(1400).unwrap()),
+            EngineState::from_discovery(
+                DiscoveredEngine::new(engine_id, MessageSize::new(1400).unwrap()).unwrap(),
+            ),
         );
 
         let state = cache.get(&addr).unwrap();
@@ -2444,7 +2371,9 @@ mod tests {
 
         cache.insert_state_at(
             addr,
-            EngineState::from_discovery(engine_id.clone(), crate::MessageSize::new(1400).unwrap()),
+            EngineState::from_discovery(
+                DiscoveredEngine::new(engine_id.clone(), MessageSize::new(1400).unwrap()).unwrap(),
+            ),
             now,
         );
         let outcome = cache.check_and_update_timeliness_at(
@@ -2544,63 +2473,15 @@ mod tests {
         assert!(cache.get(&addr3).is_some());
     }
 
-    fn raw_usm_with_engine_id(engine_id: &[u8]) -> Bytes {
-        let mut buf = crate::ber::EncodeBuf::new();
-        buf.push_sequence(|buf| {
-            buf.push_octet_string(&[])?;
-            buf.push_octet_string(&[])?;
-            buf.push_octet_string(&[])?;
-            buf.push_integer(1);
-            buf.push_integer(1);
-            buf.push_octet_string(engine_id)
-        })
-        .unwrap();
-        buf.finish()
-    }
-
-    #[test]
-    fn test_parse_discovery_response() {
-        let usm = UsmSecurityParams::new(b"test-engine-id".as_slice(), 42, 12345, b"".as_slice())
-            .unwrap();
-        let encoded = usm.encode().unwrap();
-
-        let state = parse_discovery_response(&encoded).unwrap();
-        assert_eq!(state.engine_id.as_ref(), b"test-engine-id");
-        assert_eq!(state.msg_max_size, UDP_RECEIVE_LIMITS.advertised());
-    }
-
     #[test]
     fn test_discovered_engine_rejects_invalid_identity() {
         let capacity = crate::MessageSize::new(1400).unwrap();
         assert!(DiscoveredEngine::new(Bytes::new(), capacity).is_err());
+        assert!(DiscoveredEngine::new(Bytes::from_static(b"abcd"), capacity).is_err());
         assert!(DiscoveredEngine::new(Bytes::from_static(b"valid"), capacity).is_ok());
         assert!(DiscoveredEngine::new(Bytes::from_static(&[0; 5]), capacity).is_err());
         assert!(DiscoveredEngine::new(Bytes::from_static(&[0xff; 5]), capacity).is_err());
         assert!(DiscoveredEngine::new(Bytes::from(vec![1; 33]), capacity).is_err());
-    }
-
-    #[test]
-    fn test_parse_discovery_response_empty_engine_id() {
-        let usm = UsmSecurityParams::discovery();
-        let encoded = usm.encode().unwrap();
-
-        let result = parse_discovery_response(&encoded);
-        assert!(matches!(*result.unwrap_err(), Error::InvalidMessage(_)));
-    }
-
-    #[test]
-    fn test_parse_discovery_response_rejects_invalid_engine_id() {
-        for engine_id in [
-            b"abcd".as_slice(),
-            [0_u8; 8].as_slice(),
-            [0xff_u8; 8].as_slice(),
-            [1_u8; 33].as_slice(),
-        ] {
-            assert!(matches!(
-                *parse_discovery_response(&raw_usm_with_engine_id(engine_id)).unwrap_err(),
-                Error::InvalidMessage(_)
-            ));
-        }
     }
 
     // ========================================================================
@@ -2882,26 +2763,6 @@ mod tests {
             UDP_RECEIVE_LIMITS.advertised(), // Our session maximum
         );
         assert_eq!(state.msg_max_size(), 65507);
-    }
-
-    #[test]
-    fn discovery_preserves_remote_capacity_independently_of_local_limits() {
-        let params =
-            UsmSecurityParams::new(Bytes::from_static(b"remote-engine"), 0, 0, Bytes::new())
-                .unwrap()
-                .encode()
-                .unwrap();
-        let reported = MessageSize::new(9000).unwrap();
-        let state = parse_discovery_response_with_msg_max_size(&params, reported).unwrap();
-        assert_eq!(state.msg_max_size, reported);
-
-        let capped = parse_discovery_response_with_limits(
-            &params,
-            reported,
-            MessageSize::new(1400).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(capped.msg_max_size, 1400);
     }
 
     /// Test msgMaxSize capping with TCP transport maximum.

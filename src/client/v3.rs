@@ -14,7 +14,7 @@ use crate::message::{
 use crate::pdu::{Pdu, PduType};
 use crate::transport::{Candidate, CorrelationWindow, RequestRegistration, RequestTransport};
 use crate::v3::{
-    EngineCache, EngineState, ReportStatus, TimelinessCandidateOutcome,
+    DiscoveredEngine, EngineCache, EngineState, ReportStatus, TimelinessCandidateOutcome,
     TimelinessPublicationOutcome, UsmSecurityParams, auth::verify_message, classify_report,
     validate_engine_id,
 };
@@ -637,11 +637,14 @@ impl<T: RequestTransport> Client<T> {
         }?;
         let decode_anomalies = combine_staged_v3_anomalies(decoded.anomalies, usm.anomalies);
         let usm = usm.value;
-        let engine_state = crate::v3::discovered_engine_state(
+        let discovered = DiscoveredEngine::new(
             usm.engine_id.clone(),
             response.global_data.msg_max_size,
         )
-        .map_err(|_| malformed())?;
+        .map_err(|_| {
+            tracing::debug!(target: "async_snmp::engine", { length = usm.engine_id.len() }, "discovery response contained invalid engine ID");
+            malformed()
+        })?;
         if !usm.username.is_empty() || !usm.auth_params.is_empty() || !usm.priv_params.is_empty() {
             return Err(malformed());
         }
@@ -670,7 +673,7 @@ impl<T: RequestTransport> Client<T> {
             return Err(malformed());
         }
 
-        if scoped_pdu.context_engine_id != *engine_state.engine_id()
+        if scoped_pdu.context_engine_id != *discovered.engine_id()
             || !scoped_pdu.context_name.is_empty()
         {
             return Err(malformed());
@@ -684,7 +687,7 @@ impl<T: RequestTransport> Client<T> {
         }
 
         Ok(DiscoveryResponse {
-            engine_state,
+            engine_state: EngineState::from_discovery(discovered),
             metadata: ResponseMetadata::from_received(
                 info,
                 scoped_pdu.pdu.pdu_type(),
@@ -2440,6 +2443,7 @@ mod tests {
         peer: SocketAddr,
         engine_id: Bytes,
         remote_limit: crate::MessageSize,
+        send_capacity: usize,
         sends: Arc<AtomicUsize>,
     }
 
@@ -2460,12 +2464,10 @@ mod tests {
     }
 
     impl RequestTransport for DiscoveryLimitTransport {
-        fn send(
-            &self,
-            _data: bytes::Bytes,
-        ) -> impl std::future::Future<Output = Result<()>> + Send {
+        async fn send(&self, data: Bytes) -> Result<()> {
+            crate::message_size::enforce_outbound_size(data.len(), self.send_capacity())?;
             self.sends.fetch_add(1, Ordering::Relaxed);
-            ready(Ok(()))
+            Ok(())
         }
 
         fn request_with<T, F>(
@@ -2499,6 +2501,10 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn send_capacity(&self) -> usize {
+            self.send_capacity
         }
     }
 
@@ -2778,8 +2784,11 @@ mod tests {
         };
         let client = Client::new(TestTransport::new(), config).unwrap();
         let replacement = EngineState::from_discovery(
-            Bytes::from_static(b"replacement-engine"),
-            crate::MessageSize::new(65_507).unwrap(),
+            DiscoveredEngine::new(
+                Bytes::from_static(b"replacement-engine"),
+                crate::MessageSize::new(65_507).unwrap(),
+            )
+            .unwrap(),
         );
         let replacement_keys = client
             .inner
@@ -2792,8 +2801,11 @@ mod tests {
             Some(ClientEngine::new(replacement.clone(), replacement_keys));
 
         let stale_ordinary = EngineState::from_discovery(
-            Bytes::from_static(b"ordinary-engine"),
-            crate::MessageSize::new(65_507).unwrap(),
+            DiscoveredEngine::new(
+                Bytes::from_static(b"ordinary-engine"),
+                crate::MessageSize::new(65_507).unwrap(),
+            )
+            .unwrap(),
         );
         client
             .install_discovered_state(stale_ordinary, &ResponseMetadata::default())
@@ -2836,42 +2848,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_learns_remote_limit_and_rejects_oversized_request_before_second_send() {
-        let remote_limit = crate::MessageSize::new(crate::MESSAGE_SIZE_MINIMUM).unwrap();
-        let sends = Arc::new(AtomicUsize::new(0));
-        let transport = DiscoveryLimitTransport {
-            peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
-            engine_id: Bytes::from_static(b"limited-engine"),
-            remote_limit,
-            sends: Arc::clone(&sends),
-        };
-        let config = ClientConfig {
-            auth: crate::Auth::Usm(UsmConfig::new("user")),
-            retry: crate::client::Retry::none(),
-            ..ClientConfig::default()
-        };
-        let client = Client::new(transport, config).expect("valid client config");
-        let oversized = Pdu::set_request(
-            7,
-            vec![crate::VarBind::new(
-                oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
-                crate::Value::OctetString(Bytes::from(vec![0; 512])),
-            )],
-        );
+    async fn discovery_preserves_remote_limit_and_applies_effective_send_limit() {
+        for (remote_limit, send_capacity) in [(crate::MESSAGE_SIZE_MINIMUM, 9000), (9000, 1400)] {
+            let remote_limit = crate::MessageSize::new(remote_limit).unwrap();
+            let sends = Arc::new(AtomicUsize::new(0));
+            let transport = DiscoveryLimitTransport {
+                peer: SocketAddr::from((Ipv4Addr::LOCALHOST, 161)),
+                engine_id: Bytes::from_static(b"limited-engine"),
+                remote_limit,
+                send_capacity,
+                sends: Arc::clone(&sends),
+            };
+            let config = ClientConfig {
+                auth: crate::Auth::Usm(UsmConfig::new("user")),
+                retry: crate::client::Retry::none(),
+                ..ClientConfig::default()
+            };
+            let client = Client::new(transport, config).expect("valid client config");
+            let oversized = Pdu::set_request(
+                7,
+                vec![crate::VarBind::new(
+                    oid!(1, 3, 6, 1, 2, 1, 1, 1, 0),
+                    crate::Value::OctetString(Bytes::from(vec![0; 1500])),
+                )],
+            );
 
-        let error = client.send_v3_and_recv(oversized).await.unwrap_err();
-        assert!(matches!(
-            error.exchange_source(),
-            Error::OutboundMessageTooLarge { limit, .. }
-                if *limit == crate::MESSAGE_SIZE_MINIMUM
-        ));
-        assert_eq!(
-            sends.load(Ordering::Relaxed),
-            1,
-            "only discovery may reach transport send"
-        );
-        let engine = client.inner.engine.read().unwrap();
-        assert_eq!(engine.as_ref().unwrap().state.msg_max_size(), remote_limit);
+            let error = client.send_v3_and_recv(oversized).await.unwrap_err();
+            assert!(matches!(
+                error.exchange_source(),
+                Error::OutboundMessageTooLarge { limit, .. }
+                    if *limit == remote_limit.as_usize().min(send_capacity)
+            ));
+            assert_eq!(
+                sends.load(Ordering::Relaxed),
+                1,
+                "only discovery may reach transport send"
+            );
+            let engine = client.inner.engine.read().unwrap();
+            assert_eq!(engine.as_ref().unwrap().state.msg_max_size(), remote_limit);
+        }
     }
 
     #[tokio::test]

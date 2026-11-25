@@ -102,12 +102,9 @@ pub use engine::report_oids;
 pub use engine::{
     AuthenticatedEngineTime, DiscoveredEngine, EngineCache, EngineState, MAX_ENGINE_ID_LEN,
     MAX_ENGINE_TIME, MIN_ENGINE_ID_LEN, TIME_WINDOW, compute_engine_boots_time, generate_engine_id,
-    in_authoritative_time_window, parse_discovery_response, parse_discovery_response_with_limits,
-    validate_engine_id,
+    in_authoritative_time_window, validate_engine_id,
 };
-pub(crate) use engine::{
-    TimelinessCandidateOutcome, TimelinessPublicationOutcome, discovered_engine_state,
-};
+pub(crate) use engine::{TimelinessCandidateOutcome, TimelinessPublicationOutcome};
 pub(crate) use privacy::PrivacyEncryptContext;
 pub use privacy::{
     DesSaltPersistenceError, DesSaltPersistenceOperation, DesSaltState, DesSaltStateError,
