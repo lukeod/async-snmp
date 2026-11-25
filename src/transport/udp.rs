@@ -656,13 +656,15 @@ impl UdpEndpointBuilder {
     ///
     /// # Example
     ///
-    /// Hand off a loopback socket to an endpoint, drive the runner, and send an
-    /// Inform. The receiver sees the source address chosen before handoff.
+    /// Register a socket on the selected runtime and build the client during
+    /// setup. Start the runner under the caller's supervision, then send an
+    /// Inform to verify that the endpoint uses the supplied socket.
     ///
     /// ```rust
-    /// use async_snmp::{Auth, ClientBuilder, NotificationReceiver, UdpEndpoint, oid};
+    /// use async_snmp::{Auth, Client, NotificationReceiver, UdpEndpoint, oid};
+    /// use std::net::UdpSocket as StdUdpSocket;
     /// use std::time::Duration;
-    /// use tokio::net::UdpSocket;
+    /// use tokio::{net::UdpSocket, runtime::Handle};
     ///
     /// #[tokio::main(flavor = "current_thread")]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -672,17 +674,25 @@ impl UdpEndpointBuilder {
     ///         .spawn()
     ///         .await?;
     ///     let destination = receiver.bound_addresses()[0].local_addr;
-    ///     let socket = UdpSocket::bind("127.0.0.1:0").await?;
+    ///     let runtime = Handle::current();
+    ///     let socket = StdUdpSocket::bind("127.0.0.1:0")?;
     ///     let source = socket.local_addr()?;
+    ///     socket.set_nonblocking(true)?;
+    ///     let socket = {
+    ///         let _entered = runtime.enter();
+    ///         UdpSocket::from_std(socket)?
+    ///     };
     ///     let (endpoint, runner) = UdpEndpoint::builder()
     ///         .from_socket(socket)
     ///         .prepare()
     ///         .await?
     ///         .into_parts();
-    ///     let task = tokio::spawn(runner.run());
+    ///     let client = Client::builder(destination, Auth::v2c("public"))
+    ///         .build_with(&endpoint)
+    ///         .await?;
+    ///     let control = endpoint.control();
     ///
-    ///     let client = ClientBuilder::new(Auth::v2c("public"))
-    ///         .build_with_transport(endpoint.handle(destination)?)?;
+    ///     let task = runtime.spawn(runner.run());
     ///     let cold_start = oid!(1, 3, 6, 1, 6, 3, 1, 1, 5, 1);
     ///     client.send_inform(&cold_start, 0, vec![]).await?;
     ///     let event = tokio::time::timeout(Duration::from_secs(5), receiver.recv())
@@ -690,7 +700,7 @@ impl UdpEndpointBuilder {
     ///         .expect("receiver closed before delivery");
     ///     assert_eq!(event.receive_info.peer_addr(), source);
     ///
-    ///     endpoint.control().request_shutdown();
+    ///     control.request_shutdown();
     ///     task.await??;
     ///     receiver.shutdown().await?;
     ///     Ok(())
