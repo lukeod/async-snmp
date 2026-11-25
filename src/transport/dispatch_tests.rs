@@ -90,9 +90,7 @@ async fn command_only_community_dispatch_keeps_admission_and_unmatched_responses
             disabled: disabled.clone(),
             capacity: Arc::new(Semaphore::new(1)),
             budget: Arc::new(BufferBudget::new(1024)),
-            overload_timeout: Duration::from_secs(1),
             drops: drops.clone(),
-            session: None,
         };
         let roles = Arc::new(DispatchRoles::new(
             Some(ingress),

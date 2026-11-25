@@ -1226,6 +1226,55 @@ impl crate::handler::MibHandler for GateHandler {
 }
 
 #[tokio::test]
+async fn commands_and_notifications_share_tcp_session_admission() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let entered = Arc::new(AtomicUsize::new(0));
+    let prefix = oid!(1, 3, 6, 1, 4, 1, 99999);
+    let source = TcpListenerSource::bind("127.0.0.1:0").session_options(TcpOptions {
+        max_application_in_flight: 1,
+        ..TcpOptions::default()
+    });
+    let mut service = Agent::builder()
+        .community("public")
+        .allow_all_access()
+        .client_exchanges(true)
+        .listener(ListenerSource::Tcp(source))
+        .notifications(NotificationReceiver::builder().community("public"))
+        .handler(
+            prefix.clone(),
+            Arc::new(GateHandler(gate.clone(), entered.clone())),
+        )
+        .spawn()
+        .await
+        .unwrap();
+    let notifications = service.take_notifications().unwrap();
+    let mut stream = TcpStream::connect(service.bound_addresses()[0].local_addr)
+        .await
+        .unwrap();
+    let session = accepted(&service).await;
+    stream
+        .write_all(&community(crate::Pdu::get_request(1, &[prefix.child(1)])))
+        .await
+        .unwrap();
+    until(|| entered.load(Ordering::SeqCst) == 1).await;
+
+    stream
+        .write_all(&community(crate::Pdu::inform_request(
+            2,
+            1,
+            &trap(),
+            vec![],
+        )))
+        .await
+        .unwrap();
+    until(|| session.control().is_shutdown()).await;
+    assert_eq!(notifications.control().overload_drops(), 1);
+
+    gate.add_permits(1);
+    service.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn closing_command_role_resumes_paused_session_notifications() {
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let entered = Arc::new(AtomicUsize::new(0));
@@ -1300,7 +1349,7 @@ async fn mixed_session_survives_command_closure_during_admission() {
         let hook_token = disabled.clone();
         let hook_receiver = receiver.clone();
         let ingress = ApplicationIngress {
-            admission_hook: Some(Arc::new(move |ingress, before_send| {
+            admission_hook: Some(Arc::new(move |limit, before_send| {
                 if before_send != (mode == 2) {
                     return;
                 }
@@ -1308,7 +1357,6 @@ async fn mixed_session_survives_command_closure_during_admission() {
                     0 => hook_token.cancel(),
                     1 => {
                         hook_token.cancel();
-                        let limit = ingress.session.as_ref().unwrap();
                         limit.forget_permits(limit.available_permits());
                     }
                     2 => {
@@ -1321,9 +1369,7 @@ async fn mixed_session_survives_command_closure_during_admission() {
             disabled,
             capacity: Arc::new(Semaphore::new(if mode == 0 || mode == 3 { 0 } else { 1 })),
             budget: Arc::new(super::framing::BufferBudget::new(32 * 1024 * 1024)),
-            overload_timeout: Duration::from_secs(2),
             drops: Arc::new(AtomicU64::new(0)),
-            session: (mode == 1).then(|| Arc::new(Semaphore::new(0))),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut peer = TcpStream::connect(listener.local_addr().unwrap())
@@ -1334,7 +1380,13 @@ async fn mixed_session_survives_command_closure_during_admission() {
         let prepared = TcpTransport::builder()
             .from_stream(stream)
             .observer(observer)
-            .ingress(ingress.clone(), EndpointId::new())
+            .managed(
+                super::TcpServiceSettings {
+                    budget: ingress.budget.clone(),
+                    overload_timeout: Duration::from_secs(2),
+                },
+                EndpointId::new(),
+            )
             .prepare()
             .await
             .unwrap();

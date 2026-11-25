@@ -200,9 +200,7 @@ async fn udp_command_admission_accounts_for_optional_plaintext() {
             disabled: tokio_util::sync::CancellationToken::new(),
             capacity: Arc::new(Semaphore::new(1)),
             budget: Arc::new(super::super::framing::BufferBudget::new(capacity)),
-            overload_timeout: std::time::Duration::from_secs(1),
             drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            session: None,
         };
         ingress.deliver_udp(message);
         drop(classifier);

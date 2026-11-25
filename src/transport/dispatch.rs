@@ -5,8 +5,8 @@
 //! client candidates retain their exchange-specific validation. Failure never tries
 //! another credential context. Application roles on one endpoint share USM users.
 use super::{
-    CorrelationEnvelope, ReceivedMessage, RequestRegistration, ingress::ApplicationIngress,
-    udp_core::UdpCore,
+    CorrelationEnvelope, ReceivedMessage, RequestRegistration, TcpSessionSettings,
+    ingress::ApplicationIngress, udp_core::UdpCore,
 };
 use crate::ber::Decoder;
 use crate::message::{RawMsgData, RawV3Message};
@@ -296,7 +296,7 @@ impl DispatchRoles {
         mut message: ReceivedMessage,
         mut buffers: super::framing::BufferPermits,
         core: Arc<UdpCore>,
-        ingress: &ApplicationIngress,
+        settings: &TcpSessionSettings,
         tasks: &mut JoinSet<()>,
     ) -> Result<()> {
         let envelope = CorrelationEnvelope::parse(&message.bytes);
@@ -357,11 +357,8 @@ impl DispatchRoles {
                 }
                 let admission = async {
                     let slot = acquire_tcp(self.application.clone(), self.client_exchanges).await?;
-                    let session_slot = if let Some(limit) = &ingress.session {
-                        Some(acquire_tcp(limit.clone(), self.client_exchanges).await?)
-                    } else {
-                        None
-                    };
+                    let session_slot =
+                        acquire_tcp(settings.application.clone(), self.client_exchanges).await?;
                     if let Some(work) = processor.admit_tcp(message, self.client_exchanges).await? {
                         tasks.spawn(async move {
                             let (_slot, _session_slot, _buffers) = (slot, session_slot, buffers);
@@ -374,16 +371,16 @@ impl DispatchRoles {
                     () = processor.admission_closed() => { observation.disposition(info, super::MessageDisposition::Disabled); },
                     result = admission => result?,
                 }
-            } else if commands.is_some() {
-                ingress
-                    .deliver_tcp(message, buffers, self.client_exchanges)
+            } else if let Some(commands) = commands {
+                commands
+                    .deliver_tcp(message, buffers, settings, self.client_exchanges)
                     .await?;
             } else {
                 message.observe(super::MessageDisposition::Disabled);
             }
             Ok(())
         };
-        let result = match tokio::time::timeout(ingress.overload_timeout, admit).await {
+        let result = match tokio::time::timeout(settings.service.overload_timeout, admit).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => Err(Error::Network {
                 target,

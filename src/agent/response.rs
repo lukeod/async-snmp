@@ -25,11 +25,13 @@ impl AgentProcessor {
         context_name: Bytes,
         derived_keys: Option<&DerivedKeys>,
     ) -> Result<crate::response_finalizer::FinalizedResponse> {
+        let state = &self.inner.state;
+        let engine = &state.local_engine;
         let security_level = incoming.msg_flags.security_level;
         // Handlers are asynchronous and may run for an arbitrary duration.
         // Derive both fields from one sample at response generation so the
         // authoritative tuple is current and cannot straddle a rollover.
-        let (engine_boots, engine_time) = self.inner.state.authoritative_boots_time()?;
+        let (engine_boots, engine_time) = engine.current_boots_time()?;
 
         // RFC 3414 Section 2.3: refuse authenticated messages when boots latched
         if security_level.requires_auth() && engine_boots == MAX_ENGINE_TIME {
@@ -38,7 +40,7 @@ impl AgentProcessor {
         }
 
         let response_usm = UsmSecurityParams::new(
-            self.inner.state.engine_id.clone(),
+            engine.inner.engine_id.clone(),
             engine_boots,
             engine_time,
             incoming_usm.username.clone(),
@@ -49,10 +51,7 @@ impl AgentProcessor {
                 .and_then(|keys| keys.priv_key.as_ref())
                 .is_some_and(|key| !key.protocol().is_des_family())
         {
-            self.inner
-                .state
-                .local_engine
-                .ensure_salt_counter(crate::v3::SaltCounter::new)?;
+            engine.ensure_salt_counter(crate::v3::SaltCounter::new)?;
         }
 
         // RFC 3412 Section 6.3: msgMaxSize advertises this agent's own receive
@@ -62,9 +61,9 @@ impl AgentProcessor {
             crate::Version::V3,
             request_pdu,
             response_pdu,
-            self.inner.state.max_message_size.min(limits.send),
+            state.max_message_size.min(limits.send),
             Some(incoming.msg_max_size.as_usize()),
-            &self.inner.state.snmp_silent_drops,
+            &engine.inner.snmp_silent_drops,
             |response_pdu| {
                 encode_v3_response(
                     response_pdu,
@@ -75,8 +74,8 @@ impl AgentProcessor {
                     context_engine_id.clone(),
                     context_name.clone(),
                     derived_keys,
-                    self.inner.state.local_engine.salt_counter().as_deref(),
-                    self.inner.state.local_engine.des_salt_state().as_ref(),
+                    engine.salt_counter().as_deref(),
+                    engine.des_salt_state().as_ref(),
                     source,
                 )
             },
@@ -122,7 +121,6 @@ mod tests {
     use crate::oid;
     use crate::oid::Oid;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
     use crate::handler::{BoxFuture, GetNextResult, GetResult, HandlerResult, MibHandler};
 
@@ -231,9 +229,7 @@ mod tests {
             .unwrap()
             .into_parts();
         let users = agent.inner.security_context.snapshot();
-        let user = users
-            .lookup(&agent.inner.state.engine_id, b"testuser")
-            .unwrap();
+        let user = users.lookup(agent.engine_id(), b"testuser").unwrap();
         let keys = user.derive_keys(b"agent-engine").unwrap();
 
         let error = agent
@@ -282,7 +278,7 @@ mod tests {
             "authenticated response should be dropped when boots is latched"
         );
         assert_eq!(
-            agent.inner.state.snmp_silent_drops.load(Ordering::Relaxed),
+            agent.snmp_silent_drops(),
             0,
             "max-engine-boots refusal is not a size-related silent drop"
         );

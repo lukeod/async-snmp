@@ -32,6 +32,19 @@ use crate::message_size::ReceiveLimits;
 
 const DEFAULT_MAX_MESSAGE_SIZE: usize = 10 * 1024 * 1024;
 
+/// Service-wide limits carried by both accepted and configured TCP sessions.
+#[derive(Clone, Debug)]
+pub(crate) struct TcpServiceSettings {
+    pub(crate) budget: Arc<BufferBudget>,
+    pub(crate) overload_timeout: Duration,
+}
+
+#[derive(Clone)]
+pub(crate) struct TcpSessionSettings {
+    pub(crate) service: TcpServiceSettings,
+    pub(crate) application: Arc<Semaphore>,
+}
+
 /// TCP frame, queue and execution limits. Limits are per session; listener
 /// supervisors additionally bound the number and aggregate capacity of sessions.
 #[derive(Debug, Clone)]
@@ -136,7 +149,7 @@ pub struct TcpTransportBuilder {
     socket: Option<TcpSocket>,
     connect_timeout: Option<Duration>,
     options: TcpOptions,
-    ingress: Option<super::ingress::ApplicationIngress>,
+    service: Option<TcpServiceSettings>,
     endpoint_id: Option<crate::EndpointId>,
 }
 impl TcpTransportBuilder {
@@ -151,13 +164,12 @@ impl TcpTransportBuilder {
         self
     }
 
-    #[cfg_attr(not(feature = "agent"), allow(dead_code))]
-    pub(crate) fn ingress(
+    pub(crate) fn managed(
         mut self,
-        ingress: super::ingress::ApplicationIngress,
+        service: TcpServiceSettings,
         endpoint_id: crate::EndpointId,
     ) -> Self {
-        self.ingress = Some(ingress);
+        self.service = Some(service);
         self.endpoint_id = Some(endpoint_id);
         self
     }
@@ -311,7 +323,7 @@ impl TcpTransportBuilder {
     pub async fn prepare(self) -> Result<PreparedTcpSession> {
         let started = Instant::now();
         let (limits, connect_deadline) =
-            self.validate_config(self.ingress.as_ref().map(|ingress| ingress.budget.as_ref()))?;
+            self.validate_config(self.service.as_ref().map(|service| service.budget.as_ref()))?;
         let budget = Arc::new(BufferBudget::new(self.options.max_buffered_bytes));
         self.options.reserve_buffer_budget(&budget)?;
         let stream = if let Some(stream) = self.stream {
@@ -370,11 +382,9 @@ impl TcpTransportBuilder {
             #[cfg(test)]
             stall_write_after: Default::default(),
             dispatch: Mutex::new(None),
-            ingress: self.ingress.map(|mut ingress| {
-                ingress.session = Some(Arc::new(Semaphore::new(
-                    self.options.max_application_in_flight,
-                )));
-                ingress
+            managed: self.service.map(|service| TcpSessionSettings {
+                service,
+                application: Arc::new(Semaphore::new(self.options.max_application_in_flight)),
             }),
         });
         let transport = TcpTransport {
@@ -452,7 +462,7 @@ struct SessionState {
     budget: Arc<BufferBudget>,
     #[cfg(test)]
     stall_write_after: std::sync::OnceLock<usize>,
-    ingress: Option<super::ingress::ApplicationIngress>,
+    managed: Option<TcpSessionSettings>,
 }
 
 struct SessionAdmission {
@@ -833,9 +843,10 @@ impl TcpTransport {
                 .acquire_many_owned(data.len() as u32)
                 .await
                 .map_err(|_| state.closed_error())?;
-            let shared = if let Some(ingress) = &state.ingress {
+            let shared = if let Some(session) = &state.managed {
                 Some(
-                    ingress
+                    session
+                        .service
                         .budget
                         .outbound
                         .clone()
@@ -990,19 +1001,25 @@ async fn read_loop(
         state.options.body_timeout,
         state.budget.inbound.clone(),
     );
-    if let Some(ingress) = &state.ingress {
-        framer =
-            framer.with_shared_budget(ingress.budget.inbound.clone(), ingress.overload_timeout);
+    if let Some(session) = &state.managed {
+        framer = framer.with_shared_budget(
+            session.service.budget.inbound.clone(),
+            session.service.overload_timeout,
+        );
     }
     let roles = state.dispatch.lock().unwrap().clone();
     // One queued complete frame, one classifier and one frame under construction.
     // All retain the original session/global byte permits. Protocol work runs
     // in an owned worker, independently from the framing reader and writer.
     let mut workers = tokio::task::JoinSet::new();
-    let dispatch = state.ingress.as_ref().map(|ingress| {
-        let ingress = ingress.clone();
+    let dispatch = if let Some(session) = &state.managed {
+        let roles = roles.ok_or_else(|| {
+            Error::Config("managed TCP dispatch is not configured".into()).boxed()
+        })?;
+        let session = session.clone();
         let core = state.core.clone();
-        let (sender, mut receiver) = mpsc::channel::<(super::ReceivedMessage, super::framing::BufferPermits)>(1);
+        let (sender, mut receiver) =
+            mpsc::channel::<(super::ReceivedMessage, super::framing::BufferPermits)>(1);
         workers.spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
@@ -1013,8 +1030,7 @@ async fn read_loop(
                     },
                     message = receiver.recv() => {
                         let Some((message, permit)) = message else { break; };
-                        if let Some(roles) = &roles { roles.dispatch_tcp(message, permit, core.clone(), &ingress, &mut tasks).await?; }
-                        else { ingress.deliver_tcp(message, permit, false).await?; }
+                        roles.dispatch_tcp(message, permit, core.clone(), &session, &mut tasks).await?;
                     }
                 }
             }
@@ -1023,8 +1039,10 @@ async fn read_loop(
             }
             Ok(())
         });
-        sender
-    });
+        Some(sender)
+    } else {
+        None
+    };
     let read_result = loop {
         let frame = tokio::select! { biased;
             joined = workers.join_next(), if !workers.is_empty() => return dispatch_result(joined),

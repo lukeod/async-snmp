@@ -893,23 +893,16 @@ async fn in_flight_bound_queues_under_absolute_deadline_without_sending() {
 #[tokio::test]
 async fn queued_write_retains_encoded_allocation_and_output_admission() {
     for shared in [false, true] {
-        let (sender, _receiver) = mpsc::channel(1);
         let service_budget = Arc::new(BufferBudget::new(1508));
         let mut builder = TcpTransport::builder()
             .max_message_size(484)
             .send_capacity(1024)
             .max_buffered_bytes(1508);
         if shared {
-            builder = builder.ingress(
-                super::super::ingress::ApplicationIngress {
-                    admission_hook: None,
-                    sender,
-                    disabled: CancellationToken::new(),
-                    capacity: Arc::new(Semaphore::new(1)),
+            builder = builder.managed(
+                TcpServiceSettings {
                     budget: service_budget.clone(),
                     overload_timeout: Duration::from_secs(1),
-                    drops: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-                    session: None,
                 },
                 crate::EndpointId::new(),
             );

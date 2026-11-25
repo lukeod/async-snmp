@@ -169,7 +169,6 @@ impl CommandProcessorBuilder {
         let inner = prepare_application(ApplicationConfig {
             local_engine,
             security_context: self.security_context.unwrap_or_default(),
-            security_context_required: has_security_context,
             communities: self.communities,
             handlers: self.handlers,
             authorization: self.authorization,
@@ -533,7 +532,6 @@ pub(super) fn allow_all_access(authorization: AgentAuthorization) -> AgentAuthor
 pub(super) struct ApplicationConfig {
     pub local_engine: crate::LocalEngine,
     pub security_context: crate::UsmSecurityContext,
-    pub security_context_required: bool,
     pub communities: Vec<crate::Community>,
     pub handlers: Vec<RegisteredHandler>,
     pub authorization: AgentAuthorization,
@@ -598,7 +596,6 @@ pub(super) fn prepare_application(mut config: ApplicationConfig) -> Arc<AgentInn
         task_changed: Arc::new(tokio::sync::Notify::new()),
         communities: config.communities,
         security_context,
-        security_context_required: config.security_context_required,
         handlers: config.handlers,
         state,
         set_coordinator: tokio::sync::Mutex::new(()),

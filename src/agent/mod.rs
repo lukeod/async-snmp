@@ -471,7 +471,8 @@ pub enum AgentShutdownPolicy {
     ///
     /// Selecting this variant is an affirmative contract that every registered
     /// handler's GET, GETNEXT, and GETBULK futures are cancellation-safe when
-    /// dropped. SET, Inform, and unclassified tasks are always drained.
+    /// dropped. SET and unclassified command tasks are always drained. An
+    /// attached notification role drains separately.
     AbortCancellationSafeRetrievalsAfter(Duration),
 }
 
@@ -599,12 +600,11 @@ struct ValidatedAgentBuilder {
     buffer_budget: Arc<BufferBudget>,
     overload_timeout: Duration,
     client_exchanges: bool,
-    notifications: Option<crate::notification::NotificationReceiverBuilder>,
+    notifications: Option<crate::notification::ValidatedNotificationRole>,
     bind_addr: SocketAddr,
     communities: Vec<crate::Community>,
     usm: ValidatedAuthoritativeUsm,
     security_context: Option<crate::UsmSecurityContext>,
-    security_context_required: bool,
     local_engine: Option<crate::LocalEngine>,
     handlers: Vec<RegisteredHandler>,
     max_message_size: usize,
@@ -1457,6 +1457,10 @@ impl AgentBuilder {
 
         let capacity = config.concurrency_limit.clone();
         let (sender, receiver) = tokio::sync::mpsc::channel(capacity.available_permits());
+        let tcp = crate::transport::TcpServiceSettings {
+            budget: config.buffer_budget.clone(),
+            overload_timeout: config.overload_timeout,
+        };
         let ingress = crate::transport::ingress::ApplicationIngress {
             #[cfg(test)]
             admission_hook: None,
@@ -1464,9 +1468,7 @@ impl AgentBuilder {
             disabled: CancellationToken::new(),
             capacity,
             budget: config.buffer_budget,
-            overload_timeout: config.overload_timeout,
             drops: Arc::new(AtomicU64::new(0)),
-            session: None,
         };
         let mut listeners = Vec::new();
         if config.listeners.is_empty() {
@@ -1485,7 +1487,7 @@ impl AgentBuilder {
                 .await?;
             listeners.push(
                 crate::transport::ListenerSource::udp_socket(socket)
-                    .prepare(ingress.clone())
+                    .prepare(tcp.clone())
                     .await?,
             );
         } else {
@@ -1496,7 +1498,7 @@ impl AgentBuilder {
                             ConstructionStage::Bind,
                             None,
                             None,
-                            source.prepare(ingress.clone()),
+                            source.prepare(tcp.clone()),
                         )
                         .await?,
                 );
@@ -1634,7 +1636,6 @@ impl AgentBuilder {
             security_context,
             communities: config.communities,
             handlers: config.handlers,
-            security_context_required: config.security_context_required,
             max_message_size: config.max_message_size,
             decode_config: config.decode_config,
             concurrency_limit: config.concurrency_limit,
@@ -1657,12 +1658,14 @@ impl AgentBuilder {
             network: network.clone(),
             lease: Arc::new(AgentLease::new(inner.cancel.clone())),
         };
-        let processor = AgentProcessor {
-            inner: inner.clone(),
-        };
         let (notifications, notification_role) = if let Some(role) = config.notifications {
-            let (mut consumer, processor, cleanup) =
-                role.prepare_attached(&processor, &network.io, shared_listener_count)?;
+            let (mut consumer, processor, cleanup) = role.prepare(
+                inner.state.local_engine.clone(),
+                inner.security_context.clone(),
+                network.io.clone(),
+                shared_listener_count,
+                None,
+            );
             consumer.attach_lifetime(agent.lease.clone());
             (Some(consumer), Some((processor, cleanup)))
         } else {
@@ -1713,9 +1716,11 @@ impl AgentBuilder {
         }
         let security_context_required =
             self.security_context.is_some() || !self.usm_users.is_empty();
-        if let Some(role) = &self.notifications {
-            role.validate_attached(security_context_required)?;
-        }
+        let notifications = self
+            .notifications
+            .take()
+            .map(|role| role.validate_attached(security_context_required))
+            .transpose()?;
         // Stable validation precedence: deadline representability (which reads
         // the monotonic clock), authorization, sink IDs, sizes/concurrency,
         // security configuration, then address syntax and family.
@@ -1955,12 +1960,11 @@ impl AgentBuilder {
             buffer_budget,
             overload_timeout: self.overload_timeout,
             client_exchanges: self.client_exchanges,
-            notifications: self.notifications,
+            notifications,
             bind_addr,
             communities: self.communities,
             usm,
             security_context: self.security_context,
-            security_context_required,
             local_engine: self.local_engine,
             handlers: self.handlers,
             max_message_size: self.max_message_size,
@@ -2148,13 +2152,6 @@ pub(crate) struct AgentState {
     pub(crate) decode_config: crate::DecodeConfig,
 }
 
-impl std::ops::Deref for AgentState {
-    type Target = crate::v3::local::LocalEngineInner;
-    fn deref(&self) -> &Self::Target {
-        &self.local_engine.inner
-    }
-}
-
 impl AgentState {
     pub(crate) fn authoritative_boots_time(&self) -> Result<(u32, u32)> {
         self.local_engine.current_boots_time()
@@ -2162,7 +2159,9 @@ impl AgentState {
 
     #[cfg(test)]
     pub(crate) fn set_authoritative_elapsed_for_test(&self, elapsed: u64) {
-        self.authoritative_elapsed_override
+        self.local_engine
+            .inner
+            .authoritative_elapsed_override
             .store(elapsed, Ordering::Relaxed);
     }
 }
@@ -2174,7 +2173,6 @@ pub(crate) struct AgentInner {
     task_changed: Arc<tokio::sync::Notify>,
     pub(crate) communities: Vec<crate::Community>,
     pub(crate) security_context: crate::UsmSecurityContext,
-    pub(crate) security_context_required: bool,
     pub(crate) handlers: Vec<RegisteredHandler>,
     pub(crate) state: Arc<AgentState>,
     /// Serializes complete SET transactions without restricting retrieval.
@@ -2318,7 +2316,7 @@ impl Agent {
     /// ID for its built-in engine objects.
     #[must_use]
     pub fn engine_id(&self) -> &[u8] {
-        &self.inner.state.engine_id
+        self.inner.state.local_engine.engine_id()
     }
 
     /// Return one coherent current engine boots/time pair.
@@ -2337,7 +2335,7 @@ impl Agent {
     /// Return the Agent's current local-authoritative persistence health.
     #[must_use]
     pub fn health(&self) -> LocalEngineHealth {
-        *self.inner.state.health.borrow()
+        self.inner.state.local_engine.health()
     }
 
     /// Observe bounded, coalesced health changes.
@@ -2348,7 +2346,7 @@ impl Agent {
     /// succeeds on a later attempt.
     #[must_use]
     pub fn subscribe_health(&self) -> tokio::sync::watch::Receiver<LocalEngineHealth> {
-        self.inner.state.health.subscribe()
+        self.inner.state.local_engine.subscribe_health()
     }
 
     /// Initiate graceful shutdown.
@@ -2389,6 +2387,8 @@ impl Agent {
     pub fn snmp_in_asn_parse_errs(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .snmp_in_asn_parse_errs
             .load(Ordering::Relaxed)
     }
@@ -2401,7 +2401,12 @@ impl Agent {
     /// OID: 1.3.6.1.6.3.11.2.1.2
     #[must_use]
     pub fn snmp_invalid_msgs(&self) -> u32 {
-        self.inner.state.snmp_invalid_msgs.load(Ordering::Relaxed)
+        self.inner
+            .state
+            .local_engine
+            .inner
+            .snmp_invalid_msgs
+            .load(Ordering::Relaxed)
     }
 
     /// Returns the snmpUnknownSecurityModels counter value.
@@ -2414,6 +2419,8 @@ impl Agent {
     pub fn snmp_unknown_security_models(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .snmp_unknown_security_models
             .load(Ordering::Relaxed)
     }
@@ -2428,7 +2435,12 @@ impl Agent {
     /// OID: 1.3.6.1.6.3.11.2.1.3
     #[must_use]
     pub fn snmp_silent_drops(&self) -> u32 {
-        self.inner.state.snmp_silent_drops.load(Ordering::Relaxed)
+        self.inner
+            .state
+            .local_engine
+            .inner
+            .snmp_silent_drops
+            .load(Ordering::Relaxed)
     }
 
     /// Returns the snmpUnknownContexts counter value.
@@ -2441,6 +2453,8 @@ impl Agent {
     pub fn snmp_unknown_contexts(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .snmp_unknown_contexts
             .load(Ordering::Relaxed)
     }
@@ -2456,6 +2470,8 @@ impl Agent {
     pub fn usm_unknown_engine_ids(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .usm_stats
             .unknown_engine_ids
             .load(Ordering::Relaxed)
@@ -2472,6 +2488,8 @@ impl Agent {
     pub fn usm_unknown_usernames(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .usm_stats
             .unknown_usernames
             .load(Ordering::Relaxed)
@@ -2487,6 +2505,8 @@ impl Agent {
     pub fn usm_wrong_digests(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .usm_stats
             .wrong_digests
             .load(Ordering::Relaxed)
@@ -2505,6 +2525,8 @@ impl Agent {
     pub fn usm_not_in_time_windows(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .usm_stats
             .not_in_time_windows
             .load(Ordering::Relaxed)
@@ -2521,6 +2543,8 @@ impl Agent {
     pub fn usm_unsupported_sec_levels(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .usm_stats
             .unsupported_sec_levels
             .load(Ordering::Relaxed)
@@ -2537,6 +2561,8 @@ impl Agent {
     pub fn usm_decryption_errors(&self) -> u32 {
         self.inner
             .state
+            .local_engine
+            .inner
             .usm_stats
             .decryption_errors
             .load(Ordering::Relaxed)
@@ -2548,7 +2574,7 @@ impl Agent {
     /// (1.3.6.1.2.1.1.3.0) as a `Value::TimeTicks` value.
     #[must_use]
     pub fn uptime_hundredths(&self) -> u32 {
-        let elapsed = self.inner.state.engine_start.elapsed();
+        let elapsed = self.inner.state.local_engine.inner.engine_start.elapsed();
         let centisecs = elapsed.as_millis() / 10;
         centisecs.min(u128::from(u32::MAX)) as u32
     }
@@ -2664,6 +2690,8 @@ impl AgentProcessor {
         ) {
             self.inner
                 .state
+                .local_engine
+                .inner
                 .snmp_in_asn_parse_errs
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -2763,7 +2791,7 @@ impl AgentProcessor {
             return RESPONSE_OVERHEAD + ctx.security_name().len();
         }
         let mut overhead = RESPONSE_OVERHEAD
-            + 2 * self.inner.state.engine_id.len()
+            + 2 * self.inner.state.local_engine.engine_id().len()
             + ctx.security_name().len()
             + ctx.context_name().len();
         if ctx.security_level().requires_auth() {

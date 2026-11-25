@@ -46,7 +46,9 @@ impl SnmpEngineHandler {
 
     fn get_column_value(&self, col: u32) -> HandlerResult<Option<Value>> {
         Ok(match col {
-            1 => Some(Value::OctetString(self.state.engine_id.clone())),
+            1 => Some(Value::OctetString(
+                self.state.local_engine.inner.engine_id.clone(),
+            )),
             2 => Some(Value::Integer(
                 self.state.authoritative_boots_time()?.0 as i32,
             )),
@@ -132,39 +134,25 @@ impl UsmStatsHandler {
     }
 
     fn get_column_value(&self, col: u32) -> Option<Value> {
+        let stats = &self.state.local_engine.inner.usm_stats;
         match col {
             1 => Some(Value::Counter32(
-                self.state
-                    .usm_stats
-                    .unsupported_sec_levels
-                    .load(Ordering::Relaxed),
+                stats.unsupported_sec_levels.load(Ordering::Relaxed),
             )),
             2 => Some(Value::Counter32(
-                self.state
-                    .usm_stats
-                    .not_in_time_windows
-                    .load(Ordering::Relaxed),
+                stats.not_in_time_windows.load(Ordering::Relaxed),
             )),
             3 => Some(Value::Counter32(
-                self.state
-                    .usm_stats
-                    .unknown_usernames
-                    .load(Ordering::Relaxed),
+                stats.unknown_usernames.load(Ordering::Relaxed),
             )),
             4 => Some(Value::Counter32(
-                self.state
-                    .usm_stats
-                    .unknown_engine_ids
-                    .load(Ordering::Relaxed),
+                stats.unknown_engine_ids.load(Ordering::Relaxed),
             )),
             5 => Some(Value::Counter32(
-                self.state.usm_stats.wrong_digests.load(Ordering::Relaxed),
+                stats.wrong_digests.load(Ordering::Relaxed),
             )),
             6 => Some(Value::Counter32(
-                self.state
-                    .usm_stats
-                    .decryption_errors
-                    .load(Ordering::Relaxed),
+                stats.decryption_errors.load(Ordering::Relaxed),
             )),
             _ => None,
         }
@@ -235,14 +223,13 @@ impl MpdStatsHandler {
     }
 
     fn get_column_value(&self, col: u32) -> Option<Value> {
+        let engine = &self.state.local_engine.inner;
         match col {
             1 => Some(Value::Counter32(
-                self.state
-                    .snmp_unknown_security_models
-                    .load(Ordering::Relaxed),
+                engine.snmp_unknown_security_models.load(Ordering::Relaxed),
             )),
             2 => Some(Value::Counter32(
-                self.state.snmp_invalid_msgs.load(Ordering::Relaxed),
+                engine.snmp_invalid_msgs.load(Ordering::Relaxed),
             )),
             _ => None,
         }

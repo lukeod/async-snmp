@@ -129,7 +129,7 @@ async fn run_tcp_listener(
         #[cfg(test)]
         accept_hook,
         options,
-        ingress,
+        tcp,
         roles,
         observation,
     } = source
@@ -160,7 +160,7 @@ async fn run_tcp_listener(
                     backoff.reset();
                     retry_at = None;
                     let Ok(permit) = network.connections.clone().try_acquire_owned() else { drop(stream); continue; };
-                    let prepared = match TcpTransport::builder().from_stream(stream).observation(observation.clone()).options(options.clone()).ingress(ingress.clone(), bound.endpoint_id).prepare().await {
+                    let prepared = match TcpTransport::builder().from_stream(stream).observation(observation.clone()).options(options.clone()).managed(tcp.clone(), bound.endpoint_id).prepare().await {
                         Ok(prepared) => prepared,
                         Err(error) => { tracing::debug!(%error, "accepted TCP session preparation failed"); continue; }
                     };

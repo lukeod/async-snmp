@@ -356,7 +356,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 #[cfg(test)]
 use std::sync::atomic::AtomicU32;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -773,14 +773,18 @@ pub struct NotificationReceiverBuilder {
     bind_addr: String,
     bind_explicit: bool,
     socket: Option<UdpSocket>,
-    queue_capacity: usize,
-    max_processing: usize,
     usm_users: HashMap<Bytes, UsmUser>,
     security_context: Option<crate::UsmSecurityContext>,
-    communities: Vec<Community>,
     local_engine: Option<crate::LocalEngine>,
     authoritative_engine: Option<AuthoritativeEngine>,
     des_salt_state: Option<DesSaltState>,
+    role: NotificationRoleConfig,
+}
+
+struct NotificationRoleConfig {
+    queue_capacity: usize,
+    max_processing: usize,
+    communities: Vec<Community>,
     varbind_validation: NotificationVarbindValidation,
     max_message_size: usize,
     decode_config: crate::DecodeConfig,
@@ -791,32 +795,7 @@ pub struct NotificationReceiverBuilder {
     pending_inform_timeout: Duration,
 }
 
-impl NotificationReceiverBuilder {
-    /// Choose automatic (default) or application-controlled Inform responses.
-    #[must_use]
-    pub fn acknowledgement_mode(mut self, mode: InformAcknowledgementMode) -> Self {
-        self.acknowledgement_mode = mode;
-        self
-    }
-
-    /// Bound outstanding manual Informs, including events already dequeued.
-    /// Defaults to 256. The permit remains service-owned through completion.
-    /// Saturation rejects new deliverable Informs on UDP/TCP,
-    /// without disabling traps or other roles on shared transports.
-    #[must_use]
-    pub fn max_pending_informs(mut self, limit: usize) -> Self {
-        self.max_pending_informs = limit;
-        self
-    }
-
-    /// Absolute lifetime of a manual Inform from acceptance (default 30 seconds).
-    /// Expiry releases request/keys and permits even if its token is retained.
-    #[must_use]
-    pub fn pending_inform_timeout(mut self, timeout: Duration) -> Self {
-        self.pending_inform_timeout = timeout;
-        self
-    }
-
+impl NotificationRoleConfig {
     fn validate_acknowledgement(&self) -> Result<()> {
         if self.max_pending_informs == 0
             || self.max_pending_informs > tokio::sync::Semaphore::MAX_PERMITS
@@ -831,6 +810,62 @@ impl NotificationReceiverBuilder {
         }
         crate::transport::checked_deadline(self.pending_inform_timeout, "pending Inform timeout")?;
         Ok(())
+    }
+
+    fn validate_queue_and_processing(&self) -> Result<()> {
+        if self.queue_capacity == 0
+            || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
+            || self.max_processing == 0
+            || self.max_processing > tokio::sync::Semaphore::MAX_PERMITS
+        {
+            return Err(Error::Config(
+                "notification queue and processing limits must be nonzero and representable".into(),
+            )
+            .boxed());
+        }
+        Ok(())
+    }
+
+    fn validate_response_limits(&self) -> Result<()> {
+        if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
+            return Err(
+                Error::Config("max_message_size exceeds the SNMP size range".into()).boxed(),
+            );
+        }
+        crate::transport::checked_deadline(
+            self.response_send_timeout,
+            "notification response send timeout",
+        )?;
+        Ok(())
+    }
+}
+
+pub(crate) struct ValidatedNotificationRole(NotificationRoleConfig);
+
+impl NotificationReceiverBuilder {
+    /// Choose automatic (default) or application-controlled Inform responses.
+    #[must_use]
+    pub fn acknowledgement_mode(mut self, mode: InformAcknowledgementMode) -> Self {
+        self.role.acknowledgement_mode = mode;
+        self
+    }
+
+    /// Bound outstanding manual Informs, including events already dequeued.
+    /// Defaults to 256. The permit remains service-owned through completion.
+    /// Saturation rejects new deliverable Informs on UDP/TCP,
+    /// without disabling traps or other roles on shared transports.
+    #[must_use]
+    pub fn max_pending_informs(mut self, limit: usize) -> Self {
+        self.role.max_pending_informs = limit;
+        self
+    }
+
+    /// Absolute lifetime of a manual Inform from acceptance (default 30 seconds).
+    /// Expiry releases request/keys and permits even if its token is retained.
+    #[must_use]
+    pub fn pending_inform_timeout(mut self, timeout: Duration) -> Self {
+        self.role.pending_inform_timeout = timeout;
+        self
     }
 
     /// Create a builder with the default settings.
@@ -853,22 +888,24 @@ impl NotificationReceiverBuilder {
             bind_addr: "0.0.0.0:162".to_string(),
             bind_explicit: false,
             socket: None,
-            queue_capacity: 256,
-            max_processing: 64,
             usm_users: HashMap::new(),
             security_context: None,
-            communities: Vec::new(),
             local_engine: None,
             authoritative_engine: None,
             des_salt_state: None,
-            varbind_validation: NotificationVarbindValidation::Tolerant,
-            max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
-            decode_config: crate::DecodeConfig::default(),
-            admission_policy: None,
-            response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
-            acknowledgement_mode: InformAcknowledgementMode::Automatic,
-            max_pending_informs: 256,
-            pending_inform_timeout: Duration::from_secs(30),
+            role: NotificationRoleConfig {
+                queue_capacity: 256,
+                max_processing: 64,
+                communities: Vec::new(),
+                varbind_validation: NotificationVarbindValidation::Tolerant,
+                max_message_size: crate::UDP_RECEIVE_LIMITS.advertised().as_usize(),
+                decode_config: crate::DecodeConfig::default(),
+                admission_policy: None,
+                response_send_timeout: crate::client::DEFAULT_SEND_TIMEOUT,
+                acknowledgement_mode: InformAcknowledgementMode::Automatic,
+                max_pending_informs: 256,
+                pending_inform_timeout: Duration::from_secs(30),
+            },
         }
     }
 
@@ -948,14 +985,14 @@ impl NotificationReceiverBuilder {
     /// Bound queued and admitted notifications. Default: 256 events. A full UDP
     /// queue drops deliverable notifications before ordinary Inform acknowledgement.
     pub fn queue_capacity(mut self, capacity: usize) -> Self {
-        self.queue_capacity = capacity;
+        self.role.queue_capacity = capacity;
         self
     }
 
     /// Bound concurrent protocol/response work. Default: 64 tasks. UDP overload
     /// drops without blocking the reader; TCP follows its configured-role admission policy.
     pub fn max_processing(mut self, limit: usize) -> Self {
-        self.max_processing = limit;
+        self.role.max_processing = limit;
         self
     }
 
@@ -972,7 +1009,7 @@ impl NotificationReceiverBuilder {
     /// authentication, SNMPv3 engine correlation, or outbound validation.
     #[must_use]
     pub fn varbind_validation(mut self, policy: NotificationVarbindValidation) -> Self {
-        self.varbind_validation = policy;
+        self.role.varbind_validation = policy;
         self
     }
 
@@ -986,7 +1023,7 @@ impl NotificationReceiverBuilder {
     /// Inform and increments [`NotificationReceiver::snmp_silent_drops`].
     #[must_use]
     pub fn max_message_size(mut self, size: usize) -> Self {
-        self.max_message_size = size;
+        self.role.max_message_size = size;
         self
     }
 
@@ -996,7 +1033,7 @@ impl NotificationReceiverBuilder {
     /// a failed acknowledgement outcome while other processing can continue.
     #[must_use]
     pub fn response_send_timeout(mut self, timeout: Duration) -> Self {
-        self.response_send_timeout = timeout;
+        self.role.response_send_timeout = timeout;
         self
     }
 
@@ -1006,7 +1043,7 @@ impl NotificationReceiverBuilder {
     /// V3 decode. The default is [`crate::DecodeConfig::DEFAULT`].
     #[must_use]
     pub fn decode_config(mut self, config: crate::DecodeConfig) -> Self {
-        self.decode_config = config;
+        self.role.decode_config = config;
         self
     }
 
@@ -1035,7 +1072,7 @@ impl NotificationReceiverBuilder {
     /// rejects the notification without an Inform Response.
     #[must_use]
     pub fn try_admission_policy(mut self, policy: impl NotificationAdmissionPolicy) -> Self {
-        self.admission_policy = Some(Arc::new(policy));
+        self.role.admission_policy = Some(Arc::new(policy));
         self
     }
 
@@ -1141,7 +1178,7 @@ impl NotificationReceiverBuilder {
     /// ```
     #[must_use]
     pub fn community(mut self, community: impl Into<Community>) -> Self {
-        self.communities.push(community.into());
+        self.role.communities.push(community.into());
         self
     }
 
@@ -1171,7 +1208,7 @@ impl NotificationReceiverBuilder {
         C: Into<Community>,
     {
         for c in communities {
-            self.communities.push(c.into());
+            self.role.communities.push(c.into());
         }
         self
     }
@@ -1255,7 +1292,7 @@ impl NotificationReceiverBuilder {
         mut self,
         generate_engine_id: impl FnOnce() -> Result<Bytes>,
     ) -> Result<PreparedNotificationReceiver> {
-        self.validate_acknowledgement()?;
+        self.role.validate_acknowledgement()?;
         if self.security_context.is_some() && !self.usm_users.is_empty() {
             return Err(Error::Config(
                 "security_context conflicts with usm_user configuration".into(),
@@ -1264,38 +1301,21 @@ impl NotificationReceiverBuilder {
         }
         let security_context_required =
             self.security_context.is_some() || !self.usm_users.is_empty();
-        if self.queue_capacity == 0
-            || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
-            || self.max_processing == 0
-            || self.max_processing > tokio::sync::Semaphore::MAX_PERMITS
-        {
-            return Err(Error::Config(
-                "notification queue and processing limits must be nonzero and representable".into(),
-            )
-            .boxed());
-        }
+        self.role.validate_queue_and_processing()?;
         if self.socket.is_some() && self.bind_explicit {
             return Err(Error::Config(
                 "supplied notification socket conflicts with bind address".into(),
             )
             .boxed());
         }
-        if security_context_required && self.admission_policy.is_none() {
+        if security_context_required && self.role.admission_policy.is_none() {
             return Err(Error::Config(
                 "a notification receiver with USM users requires an admission policy".into(),
             )
             .boxed());
         }
 
-        if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
-            return Err(
-                Error::Config("max_message_size exceeds the SNMP size range".into()).boxed(),
-            );
-        }
-        crate::transport::checked_deadline(
-            self.response_send_timeout,
-            "notification response send timeout",
-        )?;
+        self.role.validate_response_limits()?;
 
         if let Some(engine) = &self.local_engine {
             if self.authoritative_engine.is_some() || self.des_salt_state.is_some() {
@@ -1332,7 +1352,7 @@ impl NotificationReceiverBuilder {
             });
         if uses_des
             && self.des_salt_state.is_none()
-            && self.acknowledgement_mode == InformAcknowledgementMode::Automatic
+            && self.role.acknowledgement_mode == InformAcknowledgementMode::Automatic
         {
             return Err(Error::Config(
                 "durable DES sender state is required for DES/3DES notification receiving".into(),
@@ -1380,19 +1400,12 @@ impl NotificationReceiverBuilder {
             return Err(Error::Config("invalid notification network limits".into()).boxed());
         }
         crate::transport::checked_deadline(self.overload_timeout, "notification overload timeout")?;
-        let (sender, _) = mpsc::channel(self.max_processing);
-        let ingress = crate::transport::ingress::ApplicationIngress {
-            #[cfg(test)]
-            admission_hook: None,
-            sender,
-            disabled: tokio_util::sync::CancellationToken::new(),
-            capacity: Arc::new(tokio::sync::Semaphore::new(self.max_processing)),
+        let role = ValidatedNotificationRole(self.role);
+        let tcp = crate::transport::TcpServiceSettings {
             budget: Arc::new(crate::transport::framing::BufferBudget::new(
                 self.tcp_buffered_bytes,
             )),
             overload_timeout: self.overload_timeout,
-            drops: Arc::new(AtomicU64::new(0)),
-            session: None,
         };
         let sources = if self.listeners.is_empty() {
             vec![match self.socket.take() {
@@ -1404,7 +1417,7 @@ impl NotificationReceiverBuilder {
         };
         let mut listeners = Vec::new();
         for source in sources {
-            listeners.push(source.prepare(ingress.clone()).await?);
+            listeners.push(source.prepare(tcp.clone()).await?);
         }
         let network = Arc::new(crate::transport::network::NetworkState::new(
             &listeners,
@@ -1442,18 +1455,17 @@ impl NotificationReceiverBuilder {
                 &local_engine,
             );
         let enabled = self.client_exchanges;
-        let engine = PreparedNotificationRole {
+        let (receiver, processor, cleanup) = role.prepare(
             local_engine,
-            security_context,
-            requires_policy: security_context_required,
+            security_context.clone(),
+            network.clone(),
+            listeners.len(),
             capacity_registration,
-        };
-        let (receiver, processor, cleanup) =
-            self.prepare_role(engine, network.clone(), listeners.len())?;
+        );
         let roles = Arc::new(crate::transport::dispatch::DispatchRoles::new(
             None,
             Some(processor.clone()),
-            processor.inner.security_context.clone(),
+            security_context,
             enabled,
             processor.processing_limit(),
         ));
@@ -1463,110 +1475,9 @@ impl NotificationReceiverBuilder {
         let runner = NotificationRunner::from_network(network, listeners, processor, cleanup);
         Ok(PreparedNotificationReceiver { receiver, runner })
     }
-    fn prepare_role(
-        self,
-        engine: PreparedNotificationRole,
-        network: Arc<crate::transport::network::NetworkState>,
-        listener_count: usize,
-    ) -> Result<(NotificationReceiver, NotificationRole, RunnerCleanup)> {
-        self.validate_acknowledgement()?;
-        if self.queue_capacity == 0
-            || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
-            || self.max_processing == 0
-            || self.max_processing > tokio::sync::Semaphore::MAX_PERMITS
-        {
-            return Err(Error::Config(
-                "notification queue and processing limits must be nonzero and representable".into(),
-            )
-            .boxed());
-        }
-        if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
-            return Err(
-                Error::Config("max_message_size exceeds the SNMP size range".into()).boxed(),
-            );
-        }
-        crate::transport::checked_deadline(
-            self.response_send_timeout,
-            "notification response send timeout",
-        )?;
-        if engine.requires_policy && self.admission_policy.is_none() {
-            return Err(Error::Config(
-                "shared USM notification role requires an explicit admission policy".into(),
-            )
-            .boxed());
-        }
-        let (sender, events) = mpsc::channel(self.queue_capacity);
-        let delivery = Arc::new(Delivery::new(sender));
-        let pending = pending::PendingRegistry::new(self.max_pending_informs);
-        #[cfg(test)]
-        let udp = network.udp.first().filter(|endpoint| {
-            network.bound[..listener_count]
-                .iter()
-                .any(|bound| bound.endpoint_id == endpoint.endpoint_id())
-        });
-        let inner = Arc::new(ReceiverInner {
-            protocol: NotificationProcessor::configured(
-                engine.local_engine,
-                engine.security_context,
-                self.communities,
-                self.varbind_validation,
-                self.max_message_size,
-                self.decode_config,
-                self.admission_policy,
-            ),
-            #[cfg(test)]
-            udp_responder: udp.map(crate::UdpEndpoint::test_responder),
-            #[cfg(test)]
-            endpoint_id: udp.map_or(
-                network.bound[0].endpoint_id,
-                crate::UdpEndpoint::endpoint_id,
-            ),
-            delivery: delivery.clone(),
-            pending: pending.clone(),
-            acknowledgement_mode: self.acknowledgement_mode,
-            pending_inform_timeout: self.pending_inform_timeout,
-            max_processing: self.max_processing,
-            active: std::sync::atomic::AtomicUsize::new(0),
-            idle: tokio::sync::Notify::new(),
-            response_send_timeout: self.response_send_timeout,
-            #[cfg(test)]
-            response_send_gate: Mutex::new(None),
-            #[cfg(test)]
-            response_sends_started: AtomicU32::new(0),
-            #[cfg(test)]
-            response_send_errors: Mutex::new(std::collections::VecDeque::new()),
-            #[cfg(test)]
-            response_construction_errors: Mutex::new(std::collections::VecDeque::new()),
-            #[cfg(test)]
-            receive_errors: Arc::new(Mutex::new(std::collections::VecDeque::new())),
-            #[cfg(test)]
-            receive_error_ready: Arc::new(tokio::sync::Notify::new()),
-        });
-        let state = Arc::new(lifecycle::ServiceState::new());
-        let lease = Arc::new(NotificationLease::new(state.shutdown.clone()));
-        let receiver = NotificationReceiver {
-            network,
-            listener_count,
-            inner: inner.clone(),
-            events,
-            state: state.clone(),
-            lease,
-        };
-        Ok((
-            receiver,
-            NotificationRole { inner },
-            RunnerCleanup {
-                delivery,
-                state,
-                pending,
-                capacity_registration: engine.capacity_registration,
-            },
-        ))
-    }
-
     #[cfg(feature = "agent")]
-    pub(crate) fn validate_attached(&self, has_users: bool) -> Result<()> {
-        self.validate_acknowledgement()?;
+    pub(crate) fn validate_attached(self, has_users: bool) -> Result<ValidatedNotificationRole> {
+        self.role.validate_acknowledgement()?;
         if self.socket.is_some()
             || self.network_explicit
             || !self.listeners.is_empty()
@@ -1580,50 +1491,15 @@ impl NotificationReceiverBuilder {
         {
             return Err(Error::Config("attached notifications inherit the agent endpoint, client capability and prepared USM engine; independent socket, engine, users or client capability conflict".into()).boxed());
         }
-        if self.queue_capacity == 0
-            || self.queue_capacity > tokio::sync::Semaphore::MAX_PERMITS
-            || self.max_processing == 0
-            || self.max_processing > tokio::sync::Semaphore::MAX_PERMITS
-        {
-            return Err(Error::Config(
-                "notification queue and processing limits must be nonzero and representable".into(),
-            )
-            .boxed());
-        }
-
-        if self.max_message_size > crate::message_size::MESSAGE_SIZE_MAXIMUM {
-            return Err(
-                Error::Config("max_message_size exceeds the SNMP size range".into()).boxed(),
-            );
-        }
-        crate::transport::checked_deadline(
-            self.response_send_timeout,
-            "notification response send timeout",
-        )?;
-        if has_users && self.admission_policy.is_none() {
+        self.role.validate_queue_and_processing()?;
+        self.role.validate_response_limits()?;
+        if has_users && self.role.admission_policy.is_none() {
             return Err(Error::Config(
                 "shared USM notification role requires an explicit admission policy".into(),
             )
             .boxed());
         }
-        Ok(())
-    }
-
-    #[cfg(feature = "agent")]
-    pub(crate) fn prepare_attached(
-        self,
-        agent: &crate::agent::AgentProcessor,
-        network: &Arc<crate::transport::network::NetworkState>,
-        listener_count: usize,
-    ) -> Result<(NotificationReceiver, NotificationRole, RunnerCleanup)> {
-        self.validate_attached(agent.inner.security_context_required)?;
-        let engine = PreparedNotificationRole {
-            local_engine: agent.inner.state.local_engine.clone(),
-            security_context: agent.inner.security_context.clone(),
-            requires_policy: agent.inner.security_context_required,
-            capacity_registration: None,
-        };
-        self.prepare_role(engine, network.clone(), listener_count)
+        Ok(ValidatedNotificationRole(self.role))
     }
 
     /// Prepare and spawn the same runner on the current runtime.
@@ -1927,11 +1803,84 @@ pub(crate) struct NotificationRole {
     inner: Arc<ReceiverInner>,
 }
 
-struct PreparedNotificationRole {
-    local_engine: crate::LocalEngine,
-    security_context: crate::UsmSecurityContext,
-    requires_policy: bool,
-    capacity_registration: Option<crate::ReceiveCapacityRegistration>,
+impl ValidatedNotificationRole {
+    pub(crate) fn prepare(
+        self,
+        local_engine: crate::LocalEngine,
+        security_context: crate::UsmSecurityContext,
+        network: Arc<crate::transport::network::NetworkState>,
+        listener_count: usize,
+        capacity_registration: Option<crate::ReceiveCapacityRegistration>,
+    ) -> (NotificationReceiver, NotificationRole, RunnerCleanup) {
+        let Self(role) = self;
+        let (sender, events) = mpsc::channel(role.queue_capacity);
+        let delivery = Arc::new(Delivery::new(sender));
+        let pending = pending::PendingRegistry::new(role.max_pending_informs);
+        #[cfg(test)]
+        let udp = network.udp.first().filter(|endpoint| {
+            network.bound[..listener_count]
+                .iter()
+                .any(|bound| bound.endpoint_id == endpoint.endpoint_id())
+        });
+        let inner = Arc::new(ReceiverInner {
+            protocol: NotificationProcessor::configured(
+                local_engine,
+                security_context,
+                role.communities,
+                role.varbind_validation,
+                role.max_message_size,
+                role.decode_config,
+                role.admission_policy,
+            ),
+            #[cfg(test)]
+            udp_responder: udp.map(crate::UdpEndpoint::test_responder),
+            #[cfg(test)]
+            endpoint_id: udp.map_or(
+                network.bound[0].endpoint_id,
+                crate::UdpEndpoint::endpoint_id,
+            ),
+            delivery: delivery.clone(),
+            pending: pending.clone(),
+            acknowledgement_mode: role.acknowledgement_mode,
+            pending_inform_timeout: role.pending_inform_timeout,
+            max_processing: role.max_processing,
+            active: std::sync::atomic::AtomicUsize::new(0),
+            idle: tokio::sync::Notify::new(),
+            response_send_timeout: role.response_send_timeout,
+            #[cfg(test)]
+            response_send_gate: Mutex::new(None),
+            #[cfg(test)]
+            response_sends_started: AtomicU32::new(0),
+            #[cfg(test)]
+            response_send_errors: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            response_construction_errors: Mutex::new(std::collections::VecDeque::new()),
+            #[cfg(test)]
+            receive_errors: Arc::new(Mutex::new(std::collections::VecDeque::new())),
+            #[cfg(test)]
+            receive_error_ready: Arc::new(tokio::sync::Notify::new()),
+        });
+        let state = Arc::new(lifecycle::ServiceState::new());
+        let lease = Arc::new(NotificationLease::new(state.shutdown.clone()));
+        let receiver = NotificationReceiver {
+            network,
+            listener_count,
+            inner: inner.clone(),
+            events,
+            state: state.clone(),
+            lease,
+        };
+        (
+            receiver,
+            NotificationRole { inner },
+            RunnerCleanup {
+                delivery,
+                state,
+                pending,
+                capacity_registration,
+            },
+        )
+    }
 }
 
 struct ReceiverInner {
@@ -1963,16 +1912,13 @@ struct ReceiverInner {
 }
 
 impl ReceiverInner {
+    fn local_engine(&self) -> &crate::LocalEngine {
+        &self.protocol.inner.local_engine
+    }
+
     #[cfg(test)]
     fn publish_authoritative_boots_time(&self, pair: (u32, u32)) -> (u32, u32) {
-        self.local_engine.publish_boots_time(pair)
-    }
-}
-
-impl std::ops::Deref for ReceiverInner {
-    type Target = processor::ProcessorInner;
-    fn deref(&self) -> &Self::Target {
-        &self.protocol.inner
+        self.local_engine().publish_boots_time(pair)
     }
 }
 
@@ -1997,7 +1943,11 @@ impl NotificationReceiver {
     /// encoding.
     #[must_use]
     pub fn snmp_silent_drops(&self) -> u32 {
-        self.inner.snmp_silent_drops.load(Ordering::Relaxed)
+        self.inner
+            .local_engine()
+            .inner
+            .snmp_silent_drops
+            .load(Ordering::Relaxed)
     }
 
     /// Bind to a local address.
@@ -2061,12 +2011,12 @@ impl NotificationReceiver {
     /// Return the configured notification decode configuration.
     #[must_use]
     pub fn decode_config(&self) -> crate::DecodeConfig {
-        self.inner.decode_config
+        self.inner.protocol.inner.decode_config
     }
 
     /// Shared local engine state, independent of this receiver's endpoints.
     pub fn local_engine(&self) -> crate::LocalEngine {
-        self.inner.local_engine.clone()
+        self.inner.local_engine().clone()
     }
 
     /// Returns the local engine ID.
@@ -2076,7 +2026,7 @@ impl NotificationReceiver {
     /// with default engine settings generates a process-local ID.
     #[must_use]
     pub fn engine_id(&self) -> &[u8] {
-        &self.inner.engine_id
+        self.inner.local_engine().engine_id()
     }
 
     /// Returns the most recently sampled local engine boots value.
@@ -2087,13 +2037,22 @@ impl NotificationReceiver {
     /// persistence callback; it reads the latest shared snapshot.
     #[must_use]
     pub fn engine_boots(&self) -> u32 {
-        unpack_boots_time(self.inner.authoritative_snapshot.load(Ordering::Relaxed)).0
+        unpack_boots_time(
+            self.inner
+                .local_engine()
+                .inner
+                .authoritative_snapshot
+                .load(Ordering::Relaxed),
+        )
+        .0
     }
 
     /// Returns the usmStatsUnknownEngineIDs counter value.
     #[must_use]
     pub fn usm_unknown_engine_ids(&self) -> u32 {
         self.inner
+            .local_engine()
+            .inner
             .usm_stats
             .unknown_engine_ids
             .load(Ordering::Relaxed)
@@ -2103,6 +2062,8 @@ impl NotificationReceiver {
     #[must_use]
     pub fn usm_unknown_usernames(&self) -> u32 {
         self.inner
+            .local_engine()
+            .inner
             .usm_stats
             .unknown_usernames
             .load(Ordering::Relaxed)
@@ -2111,13 +2072,20 @@ impl NotificationReceiver {
     /// Returns the usmStatsWrongDigests counter value.
     #[must_use]
     pub fn usm_wrong_digests(&self) -> u32 {
-        self.inner.usm_stats.wrong_digests.load(Ordering::Relaxed)
+        self.inner
+            .local_engine()
+            .inner
+            .usm_stats
+            .wrong_digests
+            .load(Ordering::Relaxed)
     }
 
     /// Returns the usmStatsNotInTimeWindows counter value.
     #[must_use]
     pub fn usm_not_in_time_windows(&self) -> u32 {
         self.inner
+            .local_engine()
+            .inner
             .usm_stats
             .not_in_time_windows
             .load(Ordering::Relaxed)
@@ -2127,6 +2095,8 @@ impl NotificationReceiver {
     #[must_use]
     pub fn usm_unsupported_sec_levels(&self) -> u32 {
         self.inner
+            .local_engine()
+            .inner
             .usm_stats
             .unsupported_sec_levels
             .load(Ordering::Relaxed)
@@ -2136,6 +2106,8 @@ impl NotificationReceiver {
     #[must_use]
     pub fn usm_decryption_errors(&self) -> u32 {
         self.inner
+            .local_engine()
+            .inner
             .usm_stats
             .decryption_errors
             .load(Ordering::Relaxed)
@@ -2324,7 +2296,7 @@ mod tests {
         assert_eq!(builder.bind_addr, "0.0.0.0:162");
         assert!(builder.usm_users.is_empty());
         assert_eq!(
-            builder.varbind_validation,
+            builder.role.varbind_validation,
             NotificationVarbindValidation::Tolerant
         );
         assert_eq!(
@@ -2338,7 +2310,7 @@ mod tests {
         let builder = NotificationReceiverBuilder::new()
             .varbind_validation(NotificationVarbindValidation::Strict);
         assert_eq!(
-            builder.varbind_validation,
+            builder.role.varbind_validation,
             NotificationVarbindValidation::Strict
         );
     }
@@ -2359,19 +2331,20 @@ mod tests {
         let bound = NotificationReceiver::spawn("127.0.0.1:0").await.unwrap();
 
         for receiver in [&bound, &built] {
-            assert!(receiver.inner.authoritative_engine.is_none());
-            assert!(receiver.inner.security_context.snapshot().is_empty());
-            assert!(receiver.inner.communities.is_empty());
+            let engine = receiver.inner.local_engine();
+            let protocol = &receiver.inner.protocol.inner;
+            assert!(engine.authoritative_engine().is_none());
+            assert!(protocol.security_context.snapshot().is_empty());
+            assert!(protocol.communities.is_empty());
             assert_eq!(
-                receiver.inner.varbind_validation,
+                protocol.varbind_validation,
                 NotificationVarbindValidation::Tolerant
             );
             crate::v3::validate_engine_id(receiver.engine_id()).unwrap();
-            assert!(receiver.inner.local_engine.salt_counter().is_none());
-            assert_eq!(receiver.inner.engine_boots_base, 1);
+            assert!(engine.salt_counter().is_none());
+            assert_eq!(receiver.engine_boots(), 1);
             assert!(
-                receiver
-                    .inner
+                protocol
                     .security_context
                     .remote_engines()
                     .lock()
@@ -2379,12 +2352,12 @@ mod tests {
                     .is_empty()
             );
             assert_eq!(
-                receiver.inner.max_message_size,
+                protocol.max_message_size,
                 crate::UDP_RECEIVE_LIMITS.advertised().as_usize()
             );
-            assert_eq!(receiver.inner.decode_config, crate::DecodeConfig::default());
+            assert_eq!(receiver.decode_config(), crate::DecodeConfig::default());
             assert_eq!(receiver.snmp_silent_drops(), 0);
-            assert!(receiver.inner.admission_policy.is_none());
+            assert!(protocol.admission_policy.is_none());
             assert_eq!(
                 receiver
                     .inner
@@ -2634,9 +2607,8 @@ mod tests {
             .await
             .unwrap();
         receiver
-            .inner
-            .authoritative_engine
-            .as_ref()
+            .local_engine()
+            .authoritative_engine()
             .unwrap()
             .set_elapsed_for_test(u64::from(crate::v3::MAX_ENGINE_TIME) + 1);
 
@@ -2813,7 +2785,11 @@ mod tests {
         let rollover_published = Arc::new(std::sync::Barrier::new(2));
 
         let stale_inner = Arc::clone(&receiver.inner);
-        let stale_engine = stale_inner.authoritative_engine.as_ref().unwrap().clone();
+        let stale_engine = stale_inner
+            .local_engine()
+            .authoritative_engine()
+            .unwrap()
+            .clone();
         let stale_sampled_thread = Arc::clone(&stale_sampled);
         let rollover_published_thread = Arc::clone(&rollover_published);
         let stale = std::thread::spawn(move || {
@@ -2828,9 +2804,8 @@ mod tests {
 
         stale_sampled.wait();
         let current = receiver
-            .inner
-            .authoritative_engine
-            .as_ref()
+            .local_engine()
+            .authoritative_engine()
             .unwrap()
             .current_boots_time_at_for_test(cycle)
             .unwrap();
@@ -2846,6 +2821,8 @@ mod tests {
         assert_eq!(
             unpack_boots_time(
                 receiver
+                    .inner
+                    .local_engine()
                     .inner
                     .authoritative_snapshot
                     .load(Ordering::Relaxed)
@@ -3410,6 +3387,8 @@ mod tests {
         {
             let mut engines = receiver
                 .inner
+                .protocol
+                .inner
                 .security_context
                 .remote_engines()
                 .lock()
@@ -3432,6 +3411,8 @@ mod tests {
         // The table stayed at capacity (an old entry was evicted) and the new
         // engine is now tracked.
         let engines = receiver
+            .inner
+            .protocol
             .inner
             .security_context
             .remote_engines()
@@ -4324,9 +4305,9 @@ mod tests {
             AuthProtocol::Sha1,
         );
 
-        let earliest = receiver.inner.local_engine.current_boots_time().unwrap();
+        let earliest = receiver.inner.local_engine().current_boots_time().unwrap();
         let result = receiver.handle_v3(msg, client_addr).await.unwrap();
-        let latest = receiver.inner.local_engine.current_boots_time().unwrap();
+        let latest = receiver.inner.local_engine().current_boots_time().unwrap();
         assert!(matches!(
             result,
             Some(ReceivedNotification {

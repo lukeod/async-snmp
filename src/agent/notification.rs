@@ -1039,24 +1039,25 @@ impl super::Agent {
                     Error::Config("V3 security not configured for trap sink".into()).boxed()
                 })?;
 
-                sink.ensure_keys_derived(&self.inner.state.engine_id)?;
+                let engine = &self.inner.state.local_engine;
+                sink.ensure_keys_derived(engine.engine_id())?;
                 let derived = sink.derived_keys.read().map_err(|_| {
                     Error::Config("trap sink derived_keys lock poisoned".into()).boxed()
                 })?;
 
-                let (engine_boots, engine_time) = self.inner.state.authoritative_boots_time()?;
+                let (engine_boots, engine_time) = engine.current_boots_time()?;
 
                 let msg_id = self.next_notification_id();
                 let encoded = crate::v3::encode::encode_v3_message(
                     pdu.as_raw(),
                     msg_id,
-                    &self.inner.state.engine_id,
+                    engine.engine_id(),
                     engine_boots,
                     engine_time,
                     security,
                     derived.as_ref(),
-                    self.inner.state.local_engine.salt_counter().as_deref(),
-                    self.inner.state.local_engine.des_salt_state().as_ref(),
+                    engine.salt_counter().as_deref(),
+                    engine.des_salt_state().as_ref(),
                     Some(engine_boots),
                     false, // reportable=false for traps
                     sink.peer.receive_limits().advertised(),
@@ -1124,7 +1125,14 @@ impl super::Agent {
             security
                 .validate_and_precompute()
                 .map_err(|e| Error::Config(e.to_string().into()).boxed())?;
-            if self.inner.state.authoritative_engine.is_none() {
+            if self
+                .inner
+                .state
+                .local_engine
+                .inner
+                .authoritative_engine
+                .is_none()
+            {
                 return Err(Error::Config(
                     "authoritative engine state is required for SNMPv3 notification originators"
                         .into(),

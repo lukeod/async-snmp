@@ -1,6 +1,8 @@
 //! Concrete listener sources, with preparation independent of execution.
 use super::framing::BufferBudget;
-use super::{TcpOptions, TransportKind, UdpEndpoint, UdpEndpointBuilder, UdpRunner};
+use super::{
+    TcpOptions, TcpServiceSettings, TransportKind, UdpEndpoint, UdpEndpointBuilder, UdpRunner,
+};
 use crate::{EndpointId, Error, RequestTransport, Result};
 use std::net::SocketAddr;
 use tokio::net::{TcpListener, UdpSocket};
@@ -115,10 +117,7 @@ impl ListenerSource {
         }
     }
 
-    pub(crate) async fn prepare(
-        self,
-        ingress: super::ingress::ApplicationIngress,
-    ) -> Result<PreparedListener> {
+    pub(crate) async fn prepare(self, tcp: TcpServiceSettings) -> Result<PreparedListener> {
         match self {
             Self::Udp(builder) => {
                 let (endpoint, runner) = builder
@@ -138,8 +137,7 @@ impl ListenerSource {
             }
             Self::Session(builder) => {
                 let id = EndpointId::new();
-                let (transport, runner) =
-                    builder.ingress(ingress, id).prepare().await?.into_parts();
+                let (transport, runner) = builder.managed(tcp, id).prepare().await?.into_parts();
                 let bound = BoundListener {
                     endpoint_id: id,
                     transport: TransportKind::Tcp,
@@ -152,7 +150,7 @@ impl ListenerSource {
                 })
             }
             Self::Tcp(source) => {
-                let address = source.validate_config(&ingress.budget)?;
+                let address = source.validate_config(&tcp.budget)?;
                 let listener = match source.listener {
                     Some(listener) => listener,
                     None => {
@@ -188,7 +186,7 @@ impl ListenerSource {
                     accept_hook: source.accept_hook,
                     options: source.options,
                     observation: source.observation,
-                    ingress,
+                    tcp,
                     roles: None,
                 })
             }
@@ -290,7 +288,7 @@ pub(crate) enum PreparedListener {
         #[cfg(test)]
         accept_hook: Option<TcpAcceptHook>,
         options: TcpOptions,
-        ingress: super::ingress::ApplicationIngress,
+        tcp: TcpServiceSettings,
         roles: Option<std::sync::Arc<super::dispatch::DispatchRoles>>,
     },
 }

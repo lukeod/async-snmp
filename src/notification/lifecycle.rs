@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::v3::LocalEngineHealth;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::mpsc::{OwnedPermit, Sender};
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, DropGuard};
@@ -248,11 +249,11 @@ impl NotificationControl {
     }
     /// Current authoritative persistence health.
     pub fn health(&self) -> LocalEngineHealth {
-        *self.inner.health.borrow()
+        self.inner.local_engine().health()
     }
     /// Subscribe to bounded, coalesced persistence-health changes.
     pub fn subscribe_health(&self) -> watch::Receiver<LocalEngineHealth> {
-        self.inner.health.subscribe()
+        self.inner.local_engine().subscribe_health()
     }
     /// Overload drops charged to notification processing, TCP admission or delivery.
     /// Shared UDP dispatch charges its drops to active commands first. With

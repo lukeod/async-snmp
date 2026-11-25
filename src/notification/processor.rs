@@ -186,13 +186,6 @@ pub(super) struct ProcessorInner {
     pub(super) admission_policy: Option<Arc<dyn NotificationAdmissionPolicy>>,
 }
 
-impl std::ops::Deref for ProcessorInner {
-    type Target = crate::v3::local::LocalEngineInner;
-    fn deref(&self) -> &Self::Target {
-        &self.local_engine.inner
-    }
-}
-
 impl std::fmt::Debug for NotificationProcessor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NotificationProcessor")
@@ -586,7 +579,8 @@ impl NotificationProcessor {
                     let pdu = &scoped.pdu;
                     if !matches!(pdu.pdu_type(), PduType::TrapV2 | PduType::InformRequest)
                         || (pdu.pdu_type() == PduType::InformRequest
-                            && inbound.usm_params.engine_id != self.inner.engine_id)
+                            && inbound.usm_params.engine_id.as_ref()
+                                != self.inner.local_engine.engine_id())
                     {
                         return Ok(NotificationProcessResult::Rejected);
                     }
@@ -732,12 +726,14 @@ impl NotificationProcessor {
             .inner
             .security_context
             .users_for_input(&data, prepared.as_deref())?;
+        let engine = &self.inner.local_engine;
+        let state = &engine.inner;
         let (boots, time) = crate::v3::local::unpack_boots_time(
-            self.inner.authoritative_snapshot.load(Ordering::Relaxed),
+            state.authoritative_snapshot.load(Ordering::Relaxed),
         );
-        let clock = || self.inner.local_engine.current_boots_time();
+        let clock = || engine.current_boots_time();
         let context = V3LocalContext {
-            engine_id: &self.inner.engine_id,
+            engine_id: &state.engine_id,
             engine_boots: boots,
             engine_time: time,
             authoritative_time: Some(&clock),
@@ -746,10 +742,10 @@ impl NotificationProcessor {
             decode_config: self.inner.decode_config,
             outbound_limit: self.inner.max_message_size.min(limits.send()),
             usm_users: Some(users),
-            stats: &self.inner.usm_stats,
+            stats: &state.usm_stats,
             mpd: Some(MpdCounters {
-                invalid_msgs: &self.inner.snmp_invalid_msgs,
-                unknown_security_models: &self.inner.snmp_unknown_security_models,
+                invalid_msgs: &state.snmp_invalid_msgs,
+                unknown_security_models: &state.snmp_unknown_security_models,
             }),
             source: info.peer_addr(),
         };

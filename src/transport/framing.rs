@@ -14,6 +14,7 @@ use crate::{DecodeError, DecodeErrorKind, Error, Result};
 /// Partition a fixed total during preparation. Input retention must never consume
 /// the space needed to send a reply. The service reserves the largest configured
 /// TCP send capacity, shared by all writers, rather than one reserve per session.
+#[derive(Debug)]
 pub(crate) struct BufferBudget {
     pub(crate) inbound: Arc<Semaphore>,
     pub(crate) outbound: Arc<Semaphore>,

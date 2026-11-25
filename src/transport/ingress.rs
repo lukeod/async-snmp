@@ -1,8 +1,7 @@
 //! Bounded application admission shared by concrete endpoint readers.
-use super::{ReceivedMessage, framing::BufferPermits};
+use super::{ReceivedMessage, TcpSessionSettings, framing::BufferPermits};
 use crate::{Error, Result};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 pub(crate) struct InboundWork {
@@ -13,7 +12,7 @@ pub(crate) struct InboundWork {
     pub(crate) _buffers: Option<BufferPermits>,
 }
 #[cfg(test)]
-type AdmissionHook = Arc<dyn Fn(&ApplicationIngress, bool) + Send + Sync>;
+type AdmissionHook = Arc<dyn Fn(&Semaphore, bool) + Send + Sync>;
 
 #[derive(Clone)]
 pub(crate) struct ApplicationIngress {
@@ -23,9 +22,7 @@ pub(crate) struct ApplicationIngress {
     pub(crate) disabled: tokio_util::sync::CancellationToken,
     pub(crate) capacity: Arc<Semaphore>,
     pub(crate) budget: Arc<super::framing::BufferBudget>,
-    pub(crate) overload_timeout: Duration,
     pub(crate) drops: Arc<std::sync::atomic::AtomicU64>,
-    pub(crate) session: Option<Arc<Semaphore>>,
 }
 impl std::fmt::Debug for ApplicationIngress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -86,11 +83,14 @@ impl ApplicationIngress {
         &self,
         message: ReceivedMessage,
         buffers: BufferPermits,
+        session: &TcpSessionSettings,
         fail_fast: bool,
     ) -> Result<()> {
         let observation = message.reply.observation().clone();
         let info = message.info;
-        let result = self.deliver_tcp_inner(message, buffers, fail_fast).await;
+        let result = self
+            .deliver_tcp_inner(message, buffers, session, fail_fast)
+            .await;
         if result.is_err() {
             // Decide overload only while the role is still enabled. Closing a
             // role can race with semaphore/channel admission on a mixed session.
@@ -107,6 +107,7 @@ impl ApplicationIngress {
         &self,
         message: ReceivedMessage,
         buffers: BufferPermits,
+        session: &TcpSessionSettings,
         fail_fast: bool,
     ) -> Result<()> {
         if !self.is_enabled() {
@@ -115,7 +116,7 @@ impl ApplicationIngress {
         }
         #[cfg(test)]
         if let Some(hook) = &self.admission_hook {
-            hook(self, false);
+            hook(&session.application, false);
         }
         let target = message.info.peer_addr();
         let info = message.info;
@@ -131,11 +132,10 @@ impl ApplicationIngress {
                 }
                 .boxed()
             };
-            let session = self
-                .session
-                .as_ref()
-                .map(|limit| limit.clone().try_acquire_owned())
-                .transpose()
+            let session_slot = session
+                .application
+                .clone()
+                .try_acquire_owned()
                 .map_err(|_| overload())?;
             let admission = self
                 .capacity
@@ -148,12 +148,12 @@ impl ApplicationIngress {
             }
             #[cfg(test)]
             if let Some(hook) = &self.admission_hook {
-                hook(self, true);
+                hook(&session.application, true);
             }
             let work = InboundWork {
                 message,
                 _admission: admission,
-                _session: session,
+                _session: Some(session_slot),
                 _buffers: Some(buffers),
             };
             return self
@@ -174,18 +174,16 @@ impl ApplicationIngress {
         }
         tokio::select! { biased;
         () = self.disabled.cancelled() => { observation.disposition(info, super::MessageDisposition::Disabled); Ok(()) },
-        result = tokio::time::timeout(self.overload_timeout, async {
-            let session = if let Some(limit) = &self.session {
-                Some(tokio::select! { biased;
-                    () = self.sender.closed() => { observation.disposition(info, super::MessageDisposition::Disabled); return Ok(()); },
-                    permit = limit.clone().acquire_owned() => permit.map_err(|_| Error::Closed { target }.boxed())?,
-                })
-            } else { None };
+        result = tokio::time::timeout(session.service.overload_timeout, async {
+            let session_slot = tokio::select! { biased;
+                () = self.sender.closed() => { observation.disposition(info, super::MessageDisposition::Disabled); return Ok(()); },
+                permit = session.application.clone().acquire_owned() => permit.map_err(|_| Error::Closed { target }.boxed())?,
+            };
             let admission = tokio::select! { biased;
                 () = self.sender.closed() => { observation.disposition(info, super::MessageDisposition::Disabled); return Ok(()); },
                 permit = self.capacity.clone().acquire_owned() => permit.map_err(|_| Error::Closed { target }.boxed())?,
             };
-            let result = self.sender.send(InboundWork { message, _admission: admission, _session: session, _buffers: Some(buffers) }).await;
+            let result = self.sender.send(InboundWork { message, _admission: admission, _session: Some(session_slot), _buffers: Some(buffers) }).await;
             observation.disposition(info, if result.is_ok() { super::MessageDisposition::ApplicationQueued } else { super::MessageDisposition::Disabled }); Ok(())
         }) => result.map_err(|_| Error::Network { target, source: std::io::Error::new(std::io::ErrorKind::TimedOut, "TCP application admission overload") }.boxed())?,
         }

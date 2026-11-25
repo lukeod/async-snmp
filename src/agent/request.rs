@@ -68,12 +68,11 @@ impl AgentProcessor {
         lifecycle: RequestLifecycle,
     ) -> Result<Option<Bytes>> {
         let limits = lifecycle.endpoint_limits;
+        let state = &self.inner.state;
+        let silent_drops = &state.local_engine.inner.snmp_silent_drops;
         let version = Version::from(community_version);
-        let decoded = CommunityMessage::decode_with_target(
-            data,
-            Some(source),
-            self.inner.state.decode_config,
-        )?;
+        let decoded =
+            CommunityMessage::decode_with_target(data, Some(source), state.decode_config)?;
         let decode_anomalies = decoded.anomalies;
         let msg = decoded.value;
 
@@ -137,9 +136,9 @@ impl AgentProcessor {
                 version,
                 pdu,
                 pdu.to_response(version)?,
-                self.inner.state.max_message_size.min(limits.send),
+                state.max_message_size.min(limits.send),
                 None,
-                &self.inner.state.snmp_silent_drops,
+                silent_drops,
                 encode,
             )? {
                 crate::response_finalizer::FinalizedResponse::Candidate(_) => {}
@@ -167,9 +166,9 @@ impl AgentProcessor {
             version,
             pdu,
             response_pdu,
-            self.inner.state.max_message_size.min(limits.send),
+            state.max_message_size.min(limits.send),
             None,
-            &self.inner.state.snmp_silent_drops,
+            silent_drops,
             encode,
         )?;
         Ok(finalized.into_bytes())
@@ -205,13 +204,14 @@ impl AgentProcessor {
     ) -> Result<Option<Bytes>> {
         let limits = lifecycle.endpoint_limits;
         let state = &self.inner.state;
+        let engine = &state.local_engine.inner;
         let (engine_boots, engine_time) = state.authoritative_boots_time()?;
         let users = self
             .inner
             .security_context
             .users_for_input(&data, prepared.as_deref())?;
         let usm_ctx = V3LocalContext {
-            engine_id: &state.engine_id,
+            engine_id: &engine.engine_id,
             engine_boots,
             engine_time,
             authoritative_time: None,
@@ -220,10 +220,10 @@ impl AgentProcessor {
             decode_config: state.decode_config,
             outbound_limit: state.max_message_size.min(limits.send),
             usm_users: Some(users),
-            stats: &state.usm_stats,
+            stats: &engine.usm_stats,
             mpd: Some(MpdCounters {
-                invalid_msgs: &state.snmp_invalid_msgs,
-                unknown_security_models: &state.snmp_unknown_security_models,
+                invalid_msgs: &engine.snmp_invalid_msgs,
+                unknown_security_models: &engine.snmp_unknown_security_models,
             }),
             source,
         };
@@ -250,20 +250,20 @@ impl AgentProcessor {
         // accepts an empty contextEngineID for that context. A request naming
         // another context engine receives a snmpUnknownContexts Report.
         let ctx_engine_id = &scoped_pdu.context_engine_id;
-        if !ctx_engine_id.is_empty() && ctx_engine_id.as_ref() != state.engine_id.as_ref() {
+        if !ctx_engine_id.is_empty() && ctx_engine_id != &engine.engine_id {
             tracing::debug!(
                 target: "async_snmp::agent",
                 { snmp.source = %source, context_engine_id = %crate::format::hex::Bytes(ctx_engine_id) },
                 "scopedPDU contextEngineID does not match local engine, rejecting with snmpUnknownContexts"
             );
-            state.snmp_unknown_contexts.fetch_add(1, Ordering::Relaxed);
+            engine.snmp_unknown_contexts.fetch_add(1, Ordering::Relaxed);
 
             let report_pdu = ResponsePdu::report(
                 pdu.request_id(),
                 vec![crate::VarBind {
                     oid: snmp_unknown_contexts_oid(),
                     value: crate::Value::Counter32(
-                        state.snmp_unknown_contexts.load(Ordering::Relaxed),
+                        engine.snmp_unknown_contexts.load(Ordering::Relaxed),
                     ),
                 }],
             )?
@@ -280,7 +280,7 @@ impl AgentProcessor {
                     usm_params,
                     pdu,
                     report_pdu,
-                    state.engine_id.clone(),
+                    engine.engine_id.clone(),
                     scoped_pdu.context_name.clone(),
                     Some(&inbound.derived_keys),
                 )
