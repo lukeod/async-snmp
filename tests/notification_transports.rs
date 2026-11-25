@@ -10,6 +10,11 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
+
+#[path = "common/wildcard_udp.rs"]
+mod wildcard_udp;
+use wildcard_udp::wildcard_udp_destination;
+
 const WAIT: Duration = Duration::from_secs(3);
 fn id(value: &str) -> NotificationSinkId {
     NotificationSinkId::new(value).unwrap()
@@ -130,7 +135,7 @@ async fn shared_wildcard_udp_commands_and_notifications_use_one_port() {
         .await
         .unwrap();
     let peer = manager_endpoint
-        .handle(format!("127.0.0.2:{port}").parse().unwrap())
+        .handle(wildcard_udp_destination(port))
         .unwrap()
         .strict_source(true);
     let manager = ClientBuilder::new(Auth::v2c("public"))

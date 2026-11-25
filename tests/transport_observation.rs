@@ -9,6 +9,11 @@ use async_snmp::{
 use std::{convert::Infallible, time::Duration};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, UdpSocket};
+
+#[path = "common/wildcard_udp.rs"]
+mod wildcard_udp;
+use wildcard_udp::wildcard_udp_destination;
+
 const WAIT: Duration = Duration::from_secs(3);
 fn query() -> async_snmp::Oid {
     oid!(1, 3, 6, 1, 6, 3, 10, 2, 1, 1, 0)
@@ -86,10 +91,11 @@ async fn shared_udp_observes_commands_sink_sends_and_inform_acknowledgements_onc
         .unwrap();
     let bound = agent.bound_addresses()[0];
     let mut notifications = agent.take_notifications().unwrap();
-    let address = format!("127.0.0.2:{}", bound.local_addr.port());
-    let client = Client::builder(address, Auth::v2c("public"))
+    let destination = wildcard_udp_destination(bound.local_addr.port());
+    let client = Client::builder(destination, Auth::v2c("public"))
         .retry(Retry::none())
         .request_timeout(WAIT)
+        .strict_source(true)
         .connect()
         .await
         .unwrap();
@@ -155,7 +161,7 @@ async fn shared_udp_observes_commands_sink_sends_and_inform_acknowledgements_onc
     assert!(
         received
             .iter()
-            .any(|info| info.datagram_destination() == Some("127.0.0.2".parse().unwrap()))
+            .any(|info| info.datagram_destination() == Some(destination.ip()))
     );
     agent.shutdown().await.unwrap();
 }

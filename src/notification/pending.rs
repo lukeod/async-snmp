@@ -438,6 +438,8 @@ mod tests {
     use bytes::Bytes;
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     struct TrackedInput {
         wire: Vec<u8>,
@@ -508,6 +510,72 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tcp_manual_ack_retains_session_write_timeout() {
+        let wait = Duration::from_secs(5);
+        let write_timeout = Duration::from_secs(10);
+        let ack_timeout = Duration::from_secs(30);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = listener.local_addr().unwrap();
+        let builder = NotificationReceiver::builder()
+            .acknowledgement_mode(InformAcknowledgementMode::ApplicationControlled)
+            .pending_inform_timeout(ack_timeout)
+            .response_send_timeout(ack_timeout)
+            .session(
+                crate::TcpTransport::builder()
+                    .target(target)
+                    .write_timeout(write_timeout),
+            );
+        let (receiver, peer) = tokio::join!(builder.spawn(), listener.accept());
+        let mut receiver = receiver.unwrap();
+        let mut peer = peer.unwrap().0;
+        let session = receiver.tcp_sessions().pop().unwrap();
+        let mut prefix = [0; 1];
+        session.test_stall_write_after(prefix.len());
+
+        peer.write_all(&crate::notification::tests::build_v2c_inform(b"public"))
+            .await
+            .unwrap();
+        let event = tokio::time::timeout(wait, receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let session_id = event.receive_info.session_id().unwrap();
+        let NotificationAcknowledgement::Pending(ack) = event.inform_ack else {
+            panic!("manual Inform must be pending");
+        };
+        let acknowledgement = tokio::spawn(ack.acknowledge());
+        tokio::time::timeout(wait, peer.read_exact(&mut prefix))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefix, [0x30]);
+
+        tokio::time::pause();
+        tokio::time::advance(write_timeout).await;
+        tokio::time::resume();
+
+        let outcome = tokio::time::timeout(wait, acknowledgement)
+            .await
+            .unwrap()
+            .unwrap();
+        let InformAckOutcome::Failed(error) = outcome else {
+            panic!("expected the session write timeout, got {outcome:?}");
+        };
+        assert_eq!(error.kind(), crate::ErrorKind::Timeout);
+        assert!(
+            matches!(
+                &*error,
+                Error::SharedOperation { source } if matches!(
+                    &**source, Error::Session { session_id: failed_session, peer_addr, .. }
+                        if *failed_session == session_id && *peer_addr == target
+                )
+            ),
+            "unexpected session error: {error:?}"
+        );
+        receiver.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

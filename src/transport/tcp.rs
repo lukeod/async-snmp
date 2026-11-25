@@ -760,6 +760,11 @@ impl TcpTransport {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_stall_write_after(&self, bytes: usize) {
+        self.inner.state.stall_write_after.set(bytes).unwrap();
+    }
+
     async fn before<T>(
         &self,
         deadline: Instant,

@@ -14,14 +14,17 @@ use async_snmp::{AuthoritativeEngine, RequestTransport, TransportKind};
 ))]
 use async_snmp::{Client, Retry};
 use async_snmp::{
-    Error, ErrorKind, InformAckOutcome, InformAcknowledgementMode, ListenerSource,
-    MessageDisposition, NotificationAcknowledgement, NotificationPdu, NotificationReceiver,
-    ObservationEvent, PendingInformAck, TcpListenerSource, TcpTransport, TransportObserver, Value,
-    VarBind, Version, oid,
+    ErrorKind, InformAckOutcome, InformAcknowledgementMode, ListenerSource, MessageDisposition,
+    NotificationAcknowledgement, NotificationPdu, NotificationReceiver, ObservationEvent,
+    PendingInformAck, TcpListenerSource, TransportObserver, Value, VarBind, Version, oid,
 };
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::net::{TcpStream, UdpSocket};
+
+#[path = "common/wildcard_udp.rs"]
+mod wildcard_udp;
+use wildcard_udp::wildcard_udp_destination;
 
 const WAIT: Duration = Duration::from_secs(3);
 
@@ -111,15 +114,13 @@ async fn assert_tcp_too_big(peer: &mut TcpStream, request_id: i32) {
 #[tokio::test]
 async fn udp_manual_ack_preserves_wildcard_destination_and_close_keeps_admitted_token() {
     let mut receiver = manual().bind("0.0.0.0:0").spawn().await.unwrap();
-    let port = receiver.bound_addresses()[0].local_addr.port();
+    let destination = wildcard_udp_destination(receiver.bound_addresses()[0].local_addr.port());
     let peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    peer.send_to(&wire(17), format!("127.0.0.2:{port}"))
-        .await
-        .unwrap();
+    peer.send_to(&wire(17), destination).await.unwrap();
     let notification = event(&mut receiver).await;
     assert_eq!(
         notification.receive_info.datagram_destination(),
-        Some("127.0.0.2".parse().unwrap())
+        Some(destination.ip())
     );
     let ack = pending(notification);
     assert!(
@@ -130,10 +131,7 @@ async fn udp_manual_ack_preserves_wildcard_destination_and_close_keeps_admitted_
     receiver.close();
     assert!(matches!(ack.acknowledge().await, InformAckOutcome::Sent));
     let (bytes, source) = udp_reply(&peer).await;
-    assert_eq!(
-        source.ip(),
-        "127.0.0.2".parse::<std::net::IpAddr>().unwrap()
-    );
+    assert_eq!(source, destination);
     let response = CommunityMessage::decode(bytes, async_snmp::DecodeConfig::DEFAULT)
         .unwrap()
         .value;
@@ -329,56 +327,6 @@ async fn oversized_tcp_inform_gets_toobig_while_the_only_manual_slot_is_occupied
     let next = event(&mut receiver).await;
     assert_eq!(next.wire_identity.request_id, Some(3));
     pending(next).reject();
-    receiver.shutdown().await.unwrap();
-}
-
-#[tokio::test]
-async fn tcp_manual_ack_retains_session_write_timeout() {
-    let peer = TcpSocket::new_v4().unwrap();
-    peer.set_recv_buffer_size(4096).unwrap();
-    peer.bind("127.0.0.1:0".parse().unwrap()).unwrap();
-    let listener = peer.listen(1).unwrap();
-    let socket = TcpSocket::new_v4().unwrap();
-    socket.set_send_buffer_size(4096).unwrap();
-    let builder = manual()
-        .max_message_size(2 * 1024 * 1024)
-        .response_send_timeout(WAIT)
-        .session(
-            TcpTransport::builder()
-                .from_socket(socket)
-                .target(listener.local_addr().unwrap())
-                .write_timeout(Duration::from_millis(50)),
-        );
-    let (receiver, peer) = tokio::join!(builder.spawn(), listener.accept());
-    let mut receiver = receiver.unwrap();
-    let mut peer = peer.unwrap().0;
-    let inform = wire_with_varbinds(
-        17,
-        vec![VarBind::new(
-            oid!(1, 3, 6, 1, 4, 1, 9, 1),
-            Value::OctetString(Bytes::from(vec![0; 1024 * 1024])),
-        )],
-    );
-    // The peer sends a complete Inform and leaves the response unread. Its
-    // constrained receive window forces the writer to time out mid-frame.
-    tokio::time::timeout(WAIT, peer.write_all(&inform))
-        .await
-        .unwrap()
-        .unwrap();
-    let received = event(&mut receiver).await;
-    let session = received.receive_info.session_id().unwrap();
-    let target = peer.local_addr().unwrap();
-    let InformAckOutcome::Failed(error) = pending(received).acknowledge().await else {
-        panic!("expected the session write timeout");
-    };
-    assert_eq!(error.kind(), ErrorKind::Timeout);
-    assert!(matches!(
-        &*error,
-        Error::SharedOperation { source } if matches!(
-            &**source, Error::Session { session_id, peer_addr, .. }
-                if *session_id == session && *peer_addr == target
-        )
-    ));
     receiver.shutdown().await.unwrap();
 }
 

@@ -1469,13 +1469,7 @@ async fn partial_write_uses_original_exchange_deadline_and_closes_session() {
     .await;
     // Make the writer stall after the prefix regardless of socket buffer sizes.
     let mut prefix = [0; 3];
-    prepared
-        .transport
-        .inner
-        .state
-        .stall_write_after
-        .set(prefix.len())
-        .unwrap();
+    prepared.transport.test_stall_write_after(prefix.len());
     let running = prepared.spawn();
     let transport = running.transport();
     let exchange_timeout = Duration::from_secs(10);
