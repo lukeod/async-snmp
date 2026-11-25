@@ -38,16 +38,11 @@ pub fn lookup(oid: &Oid) -> Option<&'static str> {
 /// Parse an OID from string, supporting both dotted notation and well-known names.
 ///
 /// Accepts:
-/// - Dotted notation: "1.3.6.1.2.1.1.1.0"
+/// - Dotted notation with or without a leading dot
 /// - Well-known names: "sysDescr.0", "system", "ifTable"
 pub fn parse_oid(s: &str) -> Result<Oid, String> {
-    // First try as dotted notation
-    if s.chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        return Oid::parse(s).map_err(|e| format!("invalid OID '{}': {}", s, e));
+    if let Some(numeric) = parse_numeric_oid(s) {
+        return numeric;
     }
 
     // Try well-known names (case-insensitive)
@@ -62,6 +57,13 @@ pub fn parse_oid(s: &str) -> Result<Oid, String> {
         "unknown OID name '{}'; use dotted notation (e.g., 1.3.6.1.2.1.1.1.0)",
         s
     ))
+}
+
+pub(super) fn parse_numeric_oid(s: &str) -> Option<Result<Oid, String>> {
+    let without_leading_dot = s.strip_prefix('.').unwrap_or(s);
+    without_leading_dot
+        .starts_with(|c: char| c.is_ascii_digit())
+        .then(|| Oid::parse(s).map_err(|error| format!("invalid OID '{s}': {error}")))
 }
 
 #[cfg(test)]
@@ -82,8 +84,14 @@ mod tests {
 
     #[test]
     fn test_parse_dotted() {
-        let oid = parse_oid("1.3.6.1.2.1.1.1.0").unwrap();
-        assert_eq!(oid.arcs(), &[1, 3, 6, 1, 2, 1, 1, 1, 0]);
+        for input in ["1.3.6.1.2.1.1.1.0", ".1.3.6.1.2.1.1.1.0"] {
+            let oid = parse_oid(input).unwrap();
+            assert_eq!(oid.arcs(), &[1, 3, 6, 1, 2, 1, 1, 1, 0]);
+        }
+        for input in ["1..3", ".1..3"] {
+            let error = parse_oid(input).unwrap_err();
+            assert!(error.starts_with(&format!("invalid OID '{input}': ")));
+        }
     }
 
     #[test]

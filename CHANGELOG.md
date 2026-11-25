@@ -112,6 +112,7 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
 
 - Strict hex decoding rejects signs and non-ASCII input.
 - The builder returned by `Client::builder()` exposes `exchange_timeout()`.
+- The CLI accepts leading-dot numeric OIDs with or without a loaded MIB.
 - SNMPv3 notification receivers distinguish Informs naming stale receiver engine
   IDs from traps using sender engine IDs. Only recognized, authenticated traps
   advance remote timeliness. SNMPv3 Report eligibility follows the PDU type

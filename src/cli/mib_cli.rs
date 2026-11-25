@@ -4,6 +4,7 @@
 //! [`Mib`] from those arguments. Gated on both `cli`
 //! and `mib` features.
 
+use super::hints;
 use crate::mib_support::{self, DiagnosticConfig, Loader, Mib, source};
 use clap::Parser;
 use std::path::PathBuf;
@@ -89,21 +90,48 @@ fn load_mib_sync(
 /// Resolve an OID argument that may be a name (when MIBs are loaded) or
 /// dotted notation.
 ///
-/// Arguments starting with a digit are parsed as dotted-decimal OIDs without
-/// attempting MIB resolution. Named arguments are resolved through the MIB
-/// if one is loaded, otherwise they fall back to the static hints table.
+/// Dotted-decimal OIDs may start with a dot. Resolve names through the loaded
+/// MIB or use the static hints table when no MIB is loaded.
 pub fn resolve_oid_arg(mib: Option<&Mib>, s: &str) -> Result<crate::Oid, String> {
-    // If it starts with a digit, try dotted notation first
-    if s.chars().next().is_some_and(|c| c.is_ascii_digit()) {
-        return crate::Oid::parse(s).map_err(|e| format!("invalid OID '{}': {}", s, e));
-    }
+    let Some(mib) = mib else {
+        return hints::parse_oid(s);
+    };
+    hints::parse_numeric_oid(s).unwrap_or_else(|| {
+        mib_support::resolve_oid(mib, s).map_err(|error| format!("cannot resolve '{s}': {error}"))
+    })
+}
 
-    // Try MIB resolution if available
-    if let Some(mib) = mib {
-        return mib_support::resolve_oid(mib, s)
-            .map_err(|e| format!("cannot resolve '{}': {}", s, e));
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::oid;
 
-    // Fall back to the static hints table
-    crate::cli::hints::parse_oid(s)
+    #[test]
+    fn oid_resolution_with_optional_mib() {
+        let mib = Loader::new()
+            .source(source::memory(
+                "CLI-TEST-MIB",
+                "CLI-TEST-MIB DEFINITIONS ::= BEGIN\ncliTestNode OBJECT IDENTIFIER ::= { iso 3 }\nEND",
+            ))
+            .modules(["CLI-TEST-MIB"])
+            .load()
+            .unwrap();
+
+        for mib in [None, Some(&mib)] {
+            assert_eq!(resolve_oid_arg(mib, ".1.3").unwrap(), oid!(1, 3));
+            assert!(
+                resolve_oid_arg(mib, ".1..3")
+                    .unwrap_err()
+                    .starts_with("invalid OID '.1..3': ")
+            );
+        }
+        assert_eq!(
+            resolve_oid_arg(Some(&mib), "CLI-TEST-MIB::cliTestNode").unwrap(),
+            oid!(1, 3)
+        );
+        assert_eq!(
+            resolve_oid_arg(None, "sysDescr.0").unwrap(),
+            oid!(1, 3, 6, 1, 2, 1, 1, 1, 0)
+        );
+    }
 }
