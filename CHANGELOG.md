@@ -80,7 +80,8 @@ To upgrade from v0.18, see the [v0.19 migration guide](docs/migrations/0.19.md).
   concurrent exchanges, preserves stream framing on cancellation, and reserves
   room for replies while retaining input.
 - **Breaking.** `RequestTransport` replaces `Transport`. Send and request methods
-  take owned `Bytes`. Validators receive a `ReceivedPacket` with original bytes
+  take owned `Bytes`. Implementations provide `receive_limits()` and
+  `send_capacity()`. Validators receive a `ReceivedPacket` with original bytes
   and `ReceivedMessageInfo`. Notifications expose `receive_info` in place of
   `source`, and agent handlers can read it through `RequestContext::receive_info()`.
 - **Breaking.** The `v3::parse_discovery_response` helpers are removed. Use

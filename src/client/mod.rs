@@ -1781,6 +1781,14 @@ mod tests {
         fn is_reliable(&self) -> bool {
             true
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
+        }
     }
 
     #[derive(Clone)]
@@ -1822,6 +1830,14 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             false
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 
@@ -2151,6 +2167,14 @@ mod tests {
         fn is_reliable(&self) -> bool {
             true
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
+        }
     }
 
     fn scripted_client(
@@ -2220,6 +2244,14 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 
@@ -2305,6 +2337,10 @@ mod tests {
 
         fn send_capacity(&self) -> usize {
             self.capacity
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
         }
     }
 
@@ -2402,6 +2438,14 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 
@@ -3163,6 +3207,14 @@ mod tests {
         fn is_reliable(&self) -> bool {
             true
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
+        }
     }
 
     #[tokio::test]
@@ -3265,6 +3317,14 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 
@@ -3564,6 +3624,14 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 

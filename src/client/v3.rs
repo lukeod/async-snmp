@@ -1906,6 +1906,14 @@ mod tests {
         fn is_reliable(&self) -> bool {
             false
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
+        }
     }
 
     #[tokio::test]
@@ -2436,6 +2444,14 @@ mod tests {
         fn is_reliable(&self) -> bool {
             false
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
+        }
     }
 
     #[derive(Clone)]
@@ -2505,6 +2521,10 @@ mod tests {
 
         fn send_capacity(&self) -> usize {
             self.send_capacity
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
         }
     }
 
@@ -2613,6 +2633,14 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 
@@ -2950,6 +2978,14 @@ mod tests {
             fn is_reliable(&self) -> bool {
                 false
             }
+
+            fn receive_limits(&self) -> crate::ReceiveLimits {
+                crate::UDP_RECEIVE_LIMITS
+            }
+
+            fn send_capacity(&self) -> usize {
+                usize::MAX
+            }
         }
 
         let transport = AlwaysTimeoutTransport {
@@ -3015,6 +3051,14 @@ mod tests {
 
             fn is_reliable(&self) -> bool {
                 false
+            }
+
+            fn receive_limits(&self) -> crate::ReceiveLimits {
+                crate::UDP_RECEIVE_LIMITS
+            }
+
+            fn send_capacity(&self) -> usize {
+                usize::MAX
             }
         }
 
@@ -3085,6 +3129,14 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             false
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 
@@ -3285,6 +3337,14 @@ mod tests {
         fn is_reliable(&self) -> bool {
             false
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
+        }
     }
 
     #[tokio::test]
@@ -3431,6 +3491,14 @@ mod tests {
 
         fn is_reliable(&self) -> bool {
             false
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 
@@ -3647,6 +3715,14 @@ mod response_validation_tests {
         fn is_reliable(&self) -> bool {
             false
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
+        }
     }
 
     #[derive(Clone)]
@@ -3729,6 +3805,14 @@ mod response_validation_tests {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 

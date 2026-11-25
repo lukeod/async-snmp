@@ -1171,6 +1171,10 @@ impl RequestTransport for ScriptedTransport {
     fn receive_limits(&self) -> ReceiveLimits {
         self.0.receive_limits
     }
+
+    fn send_capacity(&self) -> usize {
+        usize::MAX
+    }
 }
 
 async fn read_ber_message(stream: &mut TcpStream) -> Result<Bytes, String> {

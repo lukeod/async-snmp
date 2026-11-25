@@ -30,6 +30,14 @@ impl RequestTransport for ContractTransport {
     fn is_reliable(&self) -> bool {
         true
     }
+
+    fn receive_limits(&self) -> ReceiveLimits {
+        UDP_RECEIVE_LIMITS
+    }
+
+    fn send_capacity(&self) -> usize {
+        usize::MAX
+    }
 }
 
 fn assert_send<T: Send>(_value: T) {}

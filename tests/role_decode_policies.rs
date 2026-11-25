@@ -107,6 +107,14 @@ impl RequestTransport for CommunityPolicyTransport {
     fn is_reliable(&self) -> bool {
         true
     }
+
+    fn receive_limits(&self) -> async_snmp::ReceiveLimits {
+        async_snmp::UDP_RECEIVE_LIMITS
+    }
+
+    fn send_capacity(&self) -> usize {
+        usize::MAX
+    }
 }
 
 fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {

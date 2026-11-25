@@ -510,6 +510,10 @@ mod tests {
         fn send_capacity(&self) -> usize {
             self.send_capacity
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
     }
 
     fn test_oids(count: u32) -> Vec<Oid> {

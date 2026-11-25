@@ -1561,6 +1561,14 @@ mod tests {
         fn is_reliable(&self) -> bool {
             true
         }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
+        }
     }
 
     #[test]

@@ -45,11 +45,19 @@ impl ExternalTransport {
             }),
         }
     }
+
+    fn check_send_capacity(&self, size: usize) -> async_snmp::Result<()> {
+        let limit = self.send_capacity();
+        if size > limit {
+            return Err(Error::OutboundMessageTooLarge { size, limit }.boxed());
+        }
+        Ok(())
+    }
 }
 
 impl RequestTransport for ExternalTransport {
-    async fn send(&self, _data: bytes::Bytes) -> async_snmp::Result<()> {
-        Ok(())
+    async fn send(&self, data: bytes::Bytes) -> async_snmp::Result<()> {
+        self.check_send_capacity(data.len())
     }
 
     async fn request_with<T, F>(
@@ -62,6 +70,7 @@ impl RequestTransport for ExternalTransport {
         T: Send,
         F: FnMut(async_snmp::ReceivedPacket) -> async_snmp::Result<Candidate<T>> + Send,
     {
+        self.check_send_capacity(data.len())?;
         self.inner.deadlines_armed.fetch_add(1, Ordering::Relaxed);
         let started = tokio::time::Instant::now();
         let deadline = registration.deadline();
@@ -94,6 +103,9 @@ impl RequestTransport for ExternalTransport {
                 }
                 .boxed());
             };
+            if data.len() > self.receive_limits().accepted() {
+                continue;
+            }
             if registration.evaluate_response_identity(&data, source == self.inner.peer)
                 == ResponseIdentity::Reject
             {
@@ -129,6 +141,14 @@ impl RequestTransport for ExternalTransport {
 
     fn is_reliable(&self) -> bool {
         true
+    }
+
+    fn receive_limits(&self) -> async_snmp::ReceiveLimits {
+        async_snmp::UDP_RECEIVE_LIMITS
+    }
+
+    fn send_capacity(&self) -> usize {
+        async_snmp::MAX_UDP_PAYLOAD
     }
 }
 
@@ -255,6 +275,14 @@ impl RequestTransport for ImmediateResponseTransport {
     fn is_reliable(&self) -> bool {
         true
     }
+
+    fn receive_limits(&self) -> async_snmp::ReceiveLimits {
+        async_snmp::UDP_RECEIVE_LIMITS
+    }
+
+    fn send_capacity(&self) -> usize {
+        usize::MAX
+    }
 }
 
 fn v2c_response(request_id: u8, community: &[u8]) -> Bytes {
@@ -359,6 +387,14 @@ impl RequestTransport for ReadyReceiveTransport {
     fn is_reliable(&self) -> bool {
         true
     }
+
+    fn receive_limits(&self) -> async_snmp::ReceiveLimits {
+        async_snmp::UDP_RECEIVE_LIMITS
+    }
+
+    fn send_capacity(&self) -> usize {
+        usize::MAX
+    }
 }
 
 #[tokio::test]
@@ -427,6 +463,14 @@ impl RequestTransport for SlowExchangeTransport {
 
     fn is_reliable(&self) -> bool {
         true
+    }
+
+    fn receive_limits(&self) -> async_snmp::ReceiveLimits {
+        async_snmp::UDP_RECEIVE_LIMITS
+    }
+
+    fn send_capacity(&self) -> usize {
+        usize::MAX
     }
 }
 
@@ -511,6 +555,10 @@ impl RequestTransport for FiniteCapacityTransport {
     fn send_capacity(&self) -> usize {
         4
     }
+
+    fn receive_limits(&self) -> async_snmp::ReceiveLimits {
+        async_snmp::UDP_RECEIVE_LIMITS
+    }
 }
 
 #[tokio::test]
@@ -571,6 +619,14 @@ impl RequestTransport for PendingSendTransport {
 
     fn is_reliable(&self) -> bool {
         true
+    }
+
+    fn receive_limits(&self) -> async_snmp::ReceiveLimits {
+        async_snmp::UDP_RECEIVE_LIMITS
+    }
+
+    fn send_capacity(&self) -> usize {
+        usize::MAX
     }
 }
 
@@ -845,6 +901,14 @@ impl RequestTransport for RegistrationPolicyProbe {
 
     fn is_reliable(&self) -> bool {
         true
+    }
+
+    fn receive_limits(&self) -> async_snmp::ReceiveLimits {
+        async_snmp::UDP_RECEIVE_LIMITS
+    }
+
+    fn send_capacity(&self) -> usize {
+        usize::MAX
     }
 }
 

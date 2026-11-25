@@ -70,7 +70,7 @@ use crate::DecodeConfig;
 use crate::ber::length::parse_ber_length;
 use crate::error::Error;
 use crate::error::Result;
-use crate::message_size::{ReceiveLimits, UDP_RECEIVE_LIMITS};
+use crate::message_size::ReceiveLimits;
 use crate::version::{CommunityVersion, Version};
 use bytes::Bytes;
 use std::collections::BTreeSet;
@@ -558,7 +558,7 @@ pub enum Candidate<T> {
 /// compiled as part of this crate's unit tests:
 ///
 /// ```compile_fail,E0046
-/// use async_snmp::{RequestRegistration, Result, RequestTransport};
+/// use async_snmp::{ReceiveLimits, RequestTransport, Result};
 /// use std::net::{Ipv4Addr, SocketAddr};
 ///
 /// struct IncompleteTransport;
@@ -575,6 +575,8 @@ pub enum Candidate<T> {
 ///     }
 ///
 ///     fn is_reliable(&self) -> bool { true }
+///     fn receive_limits(&self) -> ReceiveLimits { ReceiveLimits::tcp(8192).unwrap() }
+///     fn send_capacity(&self) -> usize { usize::MAX }
 /// }
 /// ```
 pub trait RequestTransport: Send + Sync {
@@ -688,21 +690,16 @@ pub trait RequestTransport: Send + Sync {
     /// The advertised value is wire-valid for SNMPv3. The accepted value is
     /// the hard total-input bound and may be slightly larger for bounded UDP
     /// receive-side tolerance.
-    fn receive_limits(&self) -> ReceiveLimits {
-        UDP_RECEIVE_LIMITS
-    }
+    fn receive_limits(&self) -> ReceiveLimits;
 
     /// Maximum exact encoded message size that this transport sends.
     ///
     /// This is independent of [`receive_limits`](Self::receive_limits), whose
-    /// advertised value describes what the local endpoint can receive. The
-    /// effectively unbounded default preserves the behavior of existing custom
-    /// transports. Implementors that override this with a finite limit must
-    /// enforce it in direct [`send`](Self::send) calls and in
+    /// advertised value describes what the local endpoint can receive. Use
+    /// `usize::MAX` if the transport has no smaller outbound limit. Implementors
+    /// with a finite limit must enforce it in direct [`send`](Self::send) calls and in
     /// [`request_with`](Self::request_with) before starting receive-side work.
-    fn send_capacity(&self) -> usize {
-        usize::MAX
-    }
+    fn send_capacity(&self) -> usize;
 }
 
 /// Adapt a unit-test double's scripted response stream to the full
@@ -809,7 +806,7 @@ mod cfg_test_transport_contract {
     use super::{
         Candidate, ReceivedPacket, RequestRegistration, RequestTransport, request_with_scripted,
     };
-    use crate::{DecodeError, DecodeErrorKind, Error, Result};
+    use crate::{DecodeError, DecodeErrorKind, Error, ReceiveLimits, Result, UDP_RECEIVE_LIMITS};
     use bytes::Bytes;
     use std::net::{Ipv4Addr, SocketAddr};
     use std::sync::Arc;
@@ -1115,6 +1112,14 @@ mod cfg_test_transport_contract {
 
         fn is_reliable(&self) -> bool {
             true
+        }
+
+        fn receive_limits(&self) -> crate::ReceiveLimits {
+            crate::UDP_RECEIVE_LIMITS
+        }
+
+        fn send_capacity(&self) -> usize {
+            usize::MAX
         }
     }
 
