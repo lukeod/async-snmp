@@ -614,6 +614,15 @@ impl TargetClientBuilder {
         self
     }
 
+    /// Set an optional deadline for one logical request exchange.
+    ///
+    /// See [`ClientBuilder::exchange_timeout`].
+    #[must_use]
+    pub fn exchange_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.client = self.client.exchange_timeout(timeout);
+        self
+    }
+
     /// Set the standalone-send timeout.
     #[must_use]
     pub fn send_timeout(mut self, timeout: Duration) -> Self {
@@ -1181,6 +1190,7 @@ mod tests {
             })
             .engine_cache(cache.clone())
             .target("192.168.1.1:161")
+            .exchange_timeout(Some(Duration::from_secs(12)))
             .construction_timeout(Duration::from_secs(7))
             .strict_source(true)
             .community_response_policy(CommunityResponsePolicy::AllowMismatchFromTarget)
@@ -1189,6 +1199,10 @@ mod tests {
         assert_eq!(
             builder.client.config.request_timeout,
             Duration::from_secs(10)
+        );
+        assert_eq!(
+            builder.build_config().exchange_timeout,
+            Some(Duration::from_secs(12))
         );
         assert_eq!(builder.client.config.send_timeout, Duration::from_secs(8));
         assert_eq!(
